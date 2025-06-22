@@ -1,0 +1,24 @@
+{
+  "name": "GetNewsAPI-Dev",
+  // use your compose, relative to this file
+  "dockerComposeFile": [ "../docker-compose.yml" ],
+  "service": "getnewsapi",
+  "workspaceFolder": "/app",
+  // only start the API service (and WP if you need it)
+  "runServices": [ "getnewsapi" ],
+  "shutdownAction": "stopCompose",
+  // expose API + debug port
+  "forwardPorts": [ 5001, 5678 ],
+  // install deps after container build
+  "postCreateCommand": "pip install -r requirements.txt",
+  // recommend these Python extensions
+  "extensions": [
+    "ms-python.python",
+    "ms-python.debugpy",
+    "ms-python.vscode-pylance"
+  ],
+  "settings": {
+    // Python inside container
+    "python.defaultInterpreterPath": "/usr/local/bin/python"
+  }
+}
