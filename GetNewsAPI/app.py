@@ -2,6 +2,8 @@ from flask import Flask, jsonify
 from db import get_db_connection
 from scheduler import start_scheduler
 from publish_to_wp import publish_news_to_wp
+from dotenv import load_dotenv
+
 
 app = Flask(__name__)
 

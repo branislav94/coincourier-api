@@ -13,17 +13,17 @@ BASE_SLEEP    = 2
 
 # ---- static enum ------------------------------------------------------------
 CATEGORIES = [
-    "bitcoin",        # 1
-    "ethereum",       # 2
-    "altcoins",       # 3 
-    "defi",           # 4
-    "nft",            # 5
-    "metaverse_gaming",# 6
-    "regulation",     # 7
-    "institutional",  # 8 banks, funds, ETFs
-    "markets",        # 9 price analysis, on-chain data
-    "security",       # 10 hacks, exploits, scams
-    "other"           # fallback
+    "Bitcoin",        # 1
+    "Ethereum",       # 2
+    "Altcoins",       # 3 
+    "Defi",           # 4
+    "NFT",            # 5
+    "Metaverse Gaming",# 6
+    "Regulation",     # 7
+    "Institutional",  # 8 banks, funds, ETFs
+    "Markets",        # 9 price analysis, on-chain data
+    "Security",       # 10 hacks, exploits, scams
+    "Other"           # fallback
 ]
 
 SEARCH_MODEL  = "gpt-4o-mini-search-preview-2025-03-11"
@@ -31,7 +31,7 @@ REWRITE_MODEL = "gpt-4.1-2025-04-14"
 USE_WEB_SEARCH = 1
 # -----------------------------------------------------------------------------
 GOOGLE_API_KEY = os.getenv("GOOGLE_API_KEY")   # <-- add this
-GEMINI_SEARCH_MODEL = "models/gemini-1.5-flash-latest"  # or gemini-1.5-pro-search
+GEMINI_SEARCH_MODEL = "models/gemini-2.5-flash"  # or gemini-1.5-pro-search
 GEMINI_URL = (
     f"https://generativelanguage.googleapis.com/v1beta/"
     f"{GEMINI_SEARCH_MODEL}:generateContent?key={GOOGLE_API_KEY}"
@@ -71,33 +71,40 @@ def call_openai(model: str, **payload) -> str:
     # If we get here all retries failed
     raise RuntimeError("OpenAI API repeatedly returned 429")
 
+# before: GEMINI_URL = "https://…/v1beta/models/gemini-1.5-flash-latest:generateContent?key=…"
+
 def call_gemini_search(prompt: str) -> str:
+    """
+    Ground the prompt with a live Google Search and return up to 3 bullet points.
+    Uses Gemini's generateContent + google_search tool.
+    """
     body = {
         "contents": [
-            {"role": "user", "parts": [{"text": prompt}]}
+            { "parts": [ { "text": prompt } ] }
         ],
         "tools": [
-            { "webSearch": {} }
-        ],
-        "generationConfig": {"temperature": 0.1}
+            { "google_search": {} }
+        ]
+        # you can optionally add:
+        # ,"candidateCount": 1
+        # ,"temperature": 0.1
     }
 
     for attempt in range(1, MAX_RETRIES + 1):
         r = requests.post(GEMINI_URL, json=body, timeout=45)
-
         if r.status_code == 200:
-            return r.json()["candidates"][0]["content"]["parts"][0]["text"]
-
+            return r.json()["candidates"][0]["content"]["parts"][0]["text"].strip()
         if r.status_code in (429, 503):
-            wait = BASE_SLEEP * attempt + random.uniform(0, 1)
-            print(f"⚠️  Gemini {r.status_code} – sleep {wait:.1f}s")
+            wait = BASE_SLEEP * attempt + random.random()
+            print(f"⚠️  Gemini {r.status_code} – retrying in {wait:.1f}s")
             time.sleep(wait)
             continue
-
+        # any other error
         print("❌ Gemini response:", r.text)
-        r.raise_for_status()         # an        # any other error – crash
+        r.raise_for_status()
 
-    raise RuntimeError("Gemini API repeatedly failed")
+    raise RuntimeError("Gemini search preview repeatedly failed")
+
 
 def enrich_with_search(article: dict) -> str:
     """Return ≤ 3 fresh bullet-points that complement the article."""

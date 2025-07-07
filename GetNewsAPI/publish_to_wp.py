@@ -2,7 +2,7 @@ import base64
 import mimetypes
 import os
 from datetime import datetime
-
+import re
 import requests
 import mysql.connector
 
@@ -11,7 +11,20 @@ from config import DB_CONFIG, WP_API_URL, WP_USERNAME, WP_APP_PASSWORD
 session = requests.Session()
 token = base64.b64encode(f"{WP_USERNAME}:{WP_APP_PASSWORD}".encode()).decode()
 session.headers.update({"Authorization": f"Basic {token}"})
-
+MARKET_LINKS = {
+    "Binance":        "https://www.binance.com",
+    "OKX":            "https://www.okx.com",
+    "Coinbase":       "https://www.coinbase.com",
+    "Kraken":         "https://www.kraken.com",
+    "Bitfinex":       "https://www.bitfinex.com",
+    "KuCoin":         "https://www.kucoin.com",
+    "Huobi":          "https://www.huobi.com",
+    "Bitstamp":       "https://www.bitstamp.net",
+    "Gemini":         "https://www.gemini.com",
+    "Bybit":          "https://www.bybit.com",
+    "Crypto.com":     "https://crypto.com/exchange",
+    "Gate.io":        "https://www.gate.io",
+}
 
 def slugify(text: str) -> str:
     import re
@@ -98,7 +111,17 @@ def upload_image(url: str) -> int | None:
         print(f"⚠️  Upload failed for {url}: {exc}")
         return None
 
-
+def link_markets(text: str) -> str:
+    """
+    Wrap every occurrence of a known exchange name in an <a> tag.
+    Uses word-boundary regex, case-sensitive.
+    """
+    for name, url in MARKET_LINKS.items():
+        # \b will match at word boundaries, except for names with punctuation (Crypto.com, OKX)
+        pattern = r'(?<!["\'>])\b' + re.escape(name) + r'\b'
+        replacement = f'<a href="{url}" target="_blank" rel="noopener">{name}</a>'
+        text = re.sub(pattern, replacement, text)
+    return text
 # ---------- Main publisher ---------------------------------------------------
 def publish_news_to_wp() -> None:
     news_items = fetch_unpublished()
@@ -117,19 +140,16 @@ def publish_news_to_wp() -> None:
             meta_data["original_image_url"] = item["image_url"]
 
         # --------- category ---------------------------------------------------
-        if item.get("tickers"):
-            cat_name = item["tickers"]
-        elif item.get("topics"):
-            cat_name = item["topics"]
-        else:
-            cat_name = "General"
-
+        cat_name = item.get("category") or "other"
         category_id = ensure_category(cat_name)
 
+
+        raw = item["full_text"]
+        with_links_content = link_markets(raw)
         # --------- build post -------------------------------------------------
         post_data = {
             "title": item["title"],
-            "content": item["full_text"],
+            "content": with_links_content,
             "status": "publish",
             "slug": slugify(item["title"]),
             "date": datetime.utcnow().strftime("%Y-%m-%dT%H:%M:%S"),
