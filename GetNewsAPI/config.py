@@ -28,6 +28,6 @@ WP_DB_CONFIG = {
     'user': os.getenv('WP_DB_USER'),
     'password': os.getenv('WP_DB_PASSWORD'),
     'host': os.getenv('WP_DB_HOST'),
-    'port': os.getenv('WP_DB_PORT'),
+    'port': int(os.getenv("DB_PORT", 3306)),
     'database': os.getenv('WP_DB_NAME'),
 }
