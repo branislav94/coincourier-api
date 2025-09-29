@@ -25,4 +25,4 @@ def get_stored_news():
 # Bane da ga duva
 if __name__ == '__main__':
     start_scheduler()
-    app.run(debug=True, use_reloader=False, host="0.0.0.0", port=500)
+    app.run()
