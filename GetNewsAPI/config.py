@@ -6,6 +6,12 @@ load_dotenv()  # Load environment variables from .env file
 # Crypto News API token
 CRYPTO_NEWS_TOKEN = os.getenv("CRYPTO_NEWS_TOKEN")
 
+USE_API_IMAGES = int(os.getenv("USE_API_IMAGES", "1"))
+IMAGE_MODEL   = os.getenv("IMAGE_MODEL", "gpt-image-1")
+IMAGE_QUALITY = os.getenv("IMAGE_QUALITY", "high")
+IMAGE_SIZE    = os.getenv("IMAGE_SIZE", "1024x1024") 
+
+
 # OpenAI API Key
 OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")
 

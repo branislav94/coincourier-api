@@ -1,22 +1,18 @@
+# scheduler.py
 import logging
 from apscheduler.schedulers.background import BackgroundScheduler
-from datetime import datetime
-from fetcher import fetch_all_news
-from gpt_processor import process_news_with_gpt
-from publish_to_wp import publish_news_to_wp  # Your function that calls WP REST API to insert posts
+from datetime import datetime, timedelta
 
-# Configure basic logging; you can adjust the level and format as needed.
+from fetcher import start_scheduler as start_fetcher_scheduler
+from gpt_processor import process_news_with_gpt
+from publish_to_wp import publish_news_to_wp
+
+
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
+
 
 def chained_job():
     logging.info("▶ starting chained job")
-    logging.info("Starting fetch_all_news job.")
-    try:
-        fetch_all_news()
-        logging.info("Finished fetching news successfully.")
-    except Exception as e:
-        logging.error("Error during fetch_all_news: %s", e)
-
     logging.info("Starting process_news_with_gpt job.")
     try:
         process_news_with_gpt()
@@ -31,15 +27,21 @@ def chained_job():
     except Exception as e:
         logging.error("Error during publish_news_to_wp: %s", e)
 
+        
 def start_scheduler():
+    # start fetcher (runs immediately and then every 30 min)
+    start_fetcher_scheduler()
+
+    # run processor/publisher every 30 min, but start a little later than the fetcher
     scheduler = BackgroundScheduler()
-    # Schedule the chained job to run every 12 hours, starting immediately.
     scheduler.add_job(
         chained_job,
         "interval",
-        hours=1,
-        next_run_time=datetime.now(),
-        misfire_grace_time=3600,   # tolerate up to 1 h delay
-        coalesce=True              # if multiple fires are overdue, run only once
-    )    
+        minutes=30,
+        next_run_time=datetime.now() + timedelta(minutes=3),  # ← offset so fetch finishes first
+        misfire_grace_time=3600,
+        coalesce=True,
+        max_instances=1,
+        jitter=10
+    )
     scheduler.start()
