@@ -84,17 +84,50 @@ _api = "https://cryptonews-api.com/api/v1"
 from zoneinfo import ZoneInfo  # py3.9+: for safety if you want real TZ math
 
 def _parse_hhmm(s: str) -> Tuple[int, int]:
+    """
+    Parse an 'HH:MM' time string into (hour, minute).
+
+    Args:
+        s: Time string in 'HH:MM' format.
+
+    Returns:
+        tuple[int, int]:
+            (hour, minute) as integers.
+
+    Raises:
+        ValueError:
+            If the string cannot be split into two integers.
+    """
     h, m = s.split(":")
     return int(h), int(m)
 
 def _today_utc_bounds() -> Tuple[datetime, datetime]:
+    """
+    Return the UTC day bounds for the current day.
+
+    Returns:
+        tuple[datetime, datetime]:
+            (start_utc, end_utc) where:
+            - start_utc is today's 00:00:00 UTC (tz-aware)
+            - end_utc is tomorrow's 00:00:00 UTC (tz-aware)
+    """
     # UTC day bounds
     start = datetime.utcnow().replace(hour=0, minute=0, second=0, microsecond=0, tzinfo=timezone.utc)
     end   = start + timedelta(days=1)
     return start, end
 
 def _window_utc_for_today() -> Tuple[datetime, datetime]:
-    """Return (active_start_utc, active_end_utc) for 'today', allowing wrap past midnight."""
+    """
+    Return the active publishing window bounds in UTC for today.
+
+    Uses ACTIVE_START_UTC and ACTIVE_END_UTC (HH:MM) to build a window anchored
+    to today's UTC day start. If end <= start, the window wraps past midnight
+    into the next UTC day.
+
+    Returns:
+        tuple[datetime, datetime]:
+            (active_start_utc, active_end_utc), tz-aware.
+    """
     day_start, _ = _today_utc_bounds()
     h1, m1 = _parse_hhmm(ACTIVE_START_UTC)
     h2, m2 = _parse_hhmm(ACTIVE_END_UTC)
@@ -106,6 +139,20 @@ def _window_utc_for_today() -> Tuple[datetime, datetime]:
     return active_start, active_end
 
 def _generate_even_slots(start: datetime, end: datetime, count: int) -> List[datetime]:
+    """
+    Generate `count` evenly spaced timestamps in [start, end).
+
+    Produces microsecond-stripped datetimes. If count <= 0, returns [].
+
+    Args:
+        start: Window start time (datetime).
+        end: Window end time (datetime).
+        count: Number of slots to generate.
+
+    Returns:
+        list[datetime]:
+            Evenly spaced scheduled times.
+    """
     if count <= 0:
         return []
     total = (end - start).total_seconds()
@@ -115,7 +162,20 @@ def _generate_even_slots(start: datetime, end: datetime, count: int) -> List[dat
 
 def _clean_url(url: str) -> str:
     """
-    Strip common tracking params & normalize minor variants for dedupe.
+    Normalize a URL for deduplication by removing common trackers and variants.
+
+    Normalizations:
+        - Removes typical query parameters (utm_*, fbclid, ref, src, etc.).
+        - Removes dangling '?'/'&' after stripping params.
+        - Collapses repeated slashes (excluding protocol).
+        - Trims trailing '/'.
+
+    Args:
+        url: Input URL string (possibly empty).
+
+    Returns:
+        str:
+            Canonicalized URL string.
     """
     if not url: return url
     # Remove UTM & common trackers
@@ -129,9 +189,40 @@ def _clean_url(url: str) -> str:
     return url
 
 def _hash_title(title: str) -> str:
+    """
+    Compute a stable SHA-256 hash of a normalized title string.
+
+    Normalization:
+        - strip whitespace
+        - lowercase
+
+    Args:
+        title: Article title.
+
+    Returns:
+        str:
+            Hex-encoded SHA-256 hash.
+    """
     return hashlib.sha256((title or "").strip().lower().encode("utf-8")).hexdigest()
 
 def _preblend_score(it: Dict[str, Any], now_utc: datetime) -> float:
+    """
+    Compute a quick, API-only score for ranking pulled items before GPT scoring.
+
+    Uses:
+        - publish recency (exponential decay)
+        - source prior weight
+        - ticker weight
+        - API rank_score normalization
+
+    Args:
+        it: Raw item dict from the CryptoNews API (may include date/source/tickers/rank_score).
+        now_utc: Current UTC time used for recency evaluation.
+
+    Returns:
+        float:
+            A pre-blend score in an approximate 0..1 range (not strictly bounded).
+    """
     # use only API-side signals (no GPT yet)
     try:
         pub = _parse_et_date(it.get("date", "")) if it.get("date") else now_utc
@@ -147,13 +238,38 @@ def _preblend_score(it: Dict[str, Any], now_utc: datetime) -> float:
 
 def _parse_et_date(s: str) -> datetime:
     """
-    API dates are ET (e.g., 'Fri, 05 Sep 2025 09:19:41 -0400').
-    We convert to UTC for storage/recency calc.
+    Parse a date string (typically ET with offset) into a UTC tz-aware datetime.
+
+    CryptoNews API date examples resemble RFC 2822 format with an offset
+    (e.g. 'Fri, 05 Sep 2025 09:19:41 -0400').
+
+    Args:
+        s: Date string from the API.
+
+    Returns:
+        datetime:
+            Parsed datetime converted to UTC (tz-aware).
     """
     dt = parsedate_to_datetime(s)  # tz-aware
     return dt.astimezone(timezone.utc)
 
 def _sentiment_num(val) -> float | None:
+    """
+    Normalize sentiment values into a numeric scale.
+
+    Accepts:
+        - numeric values -> float
+        - strings: 'positive'/'neutral'/'negative' -> 1.0/0.0/-1.0
+        - other/unknown -> 0.0
+        - None -> None
+
+    Args:
+        val: Sentiment value from API payload.
+
+    Returns:
+        float | None:
+            Normalized sentiment.
+    """
     if isinstance(val, (int, float)): return float(val)
     m = {"positive": 1.0, "neutral": 0.0, "negative": -1.0}
     try:    return m.get(str(val).strip().lower(), 0.0)  # fallback 0.0
@@ -162,23 +278,70 @@ def _sentiment_num(val) -> float | None:
 
 def _recency_score(published_utc: datetime, now_utc: datetime) -> float:
     """
-    Exponential decay, half-life ~6h. 1.0 when just published.
+    Compute a recency score using exponential decay.
+
+    Behavior:
+        - score is 1.0 for "now"
+        - half-life is ~6 hours
+        - values decay toward 0.0 as items get older
+
+    Args:
+        published_utc: Publication time in UTC (tz-aware expected).
+        now_utc: Current UTC time (tz-aware expected).
+
+    Returns:
+        float:
+            Recency score (0..1].
     """
     delta = max(0.0, (now_utc - published_utc).total_seconds() / 3600.0)
     half_life = 6.0
     return math.exp(-math.log(2) * (delta / half_life))
 
 def _source_weight(name: str) -> float:
+    """
+    Return a prior weight for a source name.
+
+    Args:
+        name: Source name (e.g. 'Coindesk').
+
+    Returns:
+        float:
+            Weight in roughly 0..1 range (default 0.6 if unknown).
+    """
     return SOURCE_WEIGHTS.get(name, 0.6)
 
 def _ticker_weight(tickers: List[str]) -> float:
+    """
+    Compute a lightweight ticker importance weight.
+
+    If tickers are present, returns the max known ticker weight.
+    If empty, returns a baseline 0.5.
+
+    Args:
+        tickers: List of ticker symbols (e.g. ['BTC', 'ETH']).
+
+    Returns:
+        float:
+            Weight in roughly 0.5..1.0 range.
+    """
     if not tickers: return 0.5
     return max([TICKER_WEIGHTS.get(t, 0.5) for t in tickers])
 
 def _norm_rank(rank_score: str | float | None) -> float:
     """
-    API rank_score is a string like '6.83' where higher = more important.
-    We map roughly [0..10] → [0..1]. If missing, return 0.5 baseline.
+    Normalize API rank_score into 0..1.
+
+    Expected:
+        - API rank_score often looks like '6.83' (higher = more important).
+        - mapping is roughly v/10 clamped to [0..1].
+        - missing/invalid -> 0.5 baseline.
+
+    Args:
+        rank_score: Rank score as string/float or None.
+
+    Returns:
+        float:
+            Normalized rank score in [0..1].
     """
     if rank_score in (None, ""): return 0.5
     try:
@@ -188,6 +351,22 @@ def _norm_rank(rank_score: str | float | None) -> float:
         return 0.5
 
 def _sentiment_to_float(val) -> float | None:
+    """
+    Convert sentiment representations into float.
+
+    Accepts:
+        - None/'' -> None
+        - numeric -> float
+        - strings starting with 'pos'/'neg'/'neu' -> 1.0/-1.0/0.0
+        - numeric strings -> float if parseable, else None
+
+    Args:
+        val: Sentiment-like value.
+
+    Returns:
+        float | None:
+            Normalized sentiment or None if unavailable/unparseable.
+    """
     if val is None or val == "": 
         return None
     if isinstance(val, (int, float)):
@@ -203,6 +382,19 @@ def _sentiment_to_float(val) -> float | None:
 
 
 def _get_lock(conn, name: str, timeout: int = 1) -> bool:
+    """
+    Acquire a named MySQL advisory lock using GET_LOCK.
+
+    Args:
+        conn: DB connection object providing cursor() compatible with MySQL connector.
+        name: Lock name string.
+        timeout: Seconds to wait for lock acquisition.
+
+    Returns:
+        bool:
+            True if acquired, False otherwise.
+    """
+
     cur = conn.cursor()
     cur.execute("SELECT GET_LOCK(%s,%s)", (name, timeout))
     got = (cur.fetchone() or (0,))[0] == 1
@@ -210,6 +402,16 @@ def _get_lock(conn, name: str, timeout: int = 1) -> bool:
     return got
 
 def _release_lock(conn, name: str):
+    """
+    Release a named MySQL advisory lock using RELEASE_LOCK.
+
+    Args:
+        conn: DB connection object.
+        name: Lock name string.
+
+    Returns:
+        None
+    """
     cur = conn.cursor()
     cur.execute("SELECT RELEASE_LOCK(%s)", (name,))
     _ = cur.fetchone()
@@ -218,6 +420,22 @@ def _release_lock(conn, name: str):
 
 
 def _fetch(endpoint: str, params: Dict[str, Any]) -> Dict[str, Any]:
+    """
+    Perform a GET request to the CryptoNews API with token injection.
+
+    Behavior:
+        - Adds CRYPTO_NEWS_TOKEN to params as 'token'.
+        - Returns parsed JSON dict on HTTP 200.
+        - On non-200 or exceptions, prints a short diagnostic and returns {}.
+
+    Args:
+        endpoint: Fully qualified endpoint URL.
+        params: Query params to send.
+
+    Returns:
+        dict[str, Any]:
+            Parsed JSON response or empty dict on failure.
+    """
     params = dict(params)
     params["token"] = CRYPTO_NEWS_TOKEN
     try:
@@ -232,8 +450,30 @@ def _fetch(endpoint: str, params: Dict[str, Any]) -> Dict[str, Any]:
 
 def _pull_batch() -> List[Dict[str, Any]]:
     """
-    Aggregate multiple pulls (ranked, general, multi-ticker).
-    Items are raw from API. Dedupe by news_id/url/title.
+    Pull and aggregate multiple feeds from the API into a ranked candidate pool.
+
+    Pull sources:
+        - rank-sorted items with multi-ticker filter
+        - category/general feed
+        - multi-ticker feed
+        - optional video feed if ALLOW_VIDEO is True
+
+    Dedupe strategy:
+        - by news_id
+        - by canonicalized URL
+        - by title hash
+
+    Output:
+        - Adds '_canonical_url' and '_title_hash' to each item.
+        - Sorts by _preblend_score (API-only) descending.
+        - Returns at most POOL_SIZE items.
+
+    Args:
+        None
+
+    Returns:
+        list[dict[str, Any]]:
+            Candidate items to persist/score.
     """
     pulls: List[Dict[str, Any]] = []
 
@@ -305,19 +545,52 @@ def _pull_batch() -> List[Dict[str, Any]]:
     return out[:POOL_SIZE]
 
 def _openai_chat(payload: Dict[str, Any]) -> Dict[str, Any]:
+    """
+    Call OpenAI Chat Completions and return the decoded JSON response.
+
+    Notes:
+        - Uses OPENAI_API_KEY for Bearer auth.
+        - Applies small defaults for 'gpt-5-mini*' models (reasoning_effort/temperature)
+          when not explicitly provided.
+
+    Args:
+        payload: Request payload for '/v1/chat/completions'.
+
+    Returns:
+        dict[str, Any]:
+            Parsed response JSON.
+
+    Raises:
+        requests.HTTPError:
+            If the API returns a non-2xx status (raise_for_status()).
+    """
     url = "https://api.openai.com/v1/chat/completions"
     headers = {"Authorization": f"Bearer {OPENAI_API_KEY}"}
 
     # if using GPT-5 in Chat Completions, set minimal effort for speed
     if payload.get("model", "").startswith("gpt-5-mini"):
         payload.setdefault("reasoning_effort", "minimal")
-        payload.setdefault("temperature", 1)
+        payload.setdefault("temperature", 0.7)
 
     r = _session.post(url, headers=headers, json=payload, timeout=60)
     r.raise_for_status()
     return r.json()
 def _as_str_list(value) -> str:
-    """Accept list[str] or str or None and return a clean comma-separated string."""
+    """
+    Normalize list-like or scalar values into a comma-separated string.
+
+    Accepts:
+        - None -> ''
+        - list -> joined with ', ' after stripping
+        - str/other -> str(value).strip()
+
+    Args:
+        value: Value that may be list, string, or None.
+
+    Returns:
+        str:
+            Normalized comma-separated string.
+    """
     if value is None:
         return ""
     if isinstance(value, list):
@@ -326,7 +599,22 @@ def _as_str_list(value) -> str:
     return str(value).strip()
 
 def _to_json_scalar(v):
-    """Make anything json.dumps-safe and sensible for the prompt."""
+    """
+    Convert values into JSON-friendly scalars suitable for prompt construction.
+
+    Behavior:
+        - None -> ''
+        - primitives (int/float/bool/str) -> unchanged
+        - Decimal -> float when possible, else string
+        - other objects -> string
+
+    Args:
+        v: Any value.
+
+    Returns:
+        Any:
+            JSON-serializable scalar (or string fallback).
+    """
     if v is None:
         return ""
     if isinstance(v, (int, float, bool, str)):
@@ -341,8 +629,31 @@ def _to_json_scalar(v):
 
 def ai_score_batch(items: List[Dict[str, Any]]) -> Dict[str, Dict[str, Any]]:
     """
-    Ask GPT-5 to rate importance (0..1) and flag breaking for each item.
-    Returns {canonical_url: {"gpt_importance": float, "is_breaking": int}}
+    Use GPT to score newsworthiness and detect breaking status for a batch of items.
+
+    The model is instructed to return JSON containing:
+        {url, gpt_importance, is_breaking}
+
+    Output mapping is keyed by canonical URL:
+        {
+          canonical_url: {
+            'gpt_importance': float,
+            'is_breaking': int
+          }
+        }
+
+    Args:
+        items: List of normalized item dicts (title/source/date/rank_score/topics/tickers/text/url).
+
+    Returns:
+        dict[str, dict[str, Any]]:
+            Mapping keyed by canonical URL with GPT-derived scores.
+
+    Raises:
+        RuntimeError:
+            If the model returns empty content or invalid JSON.
+        requests.HTTPError:
+            If the OpenAI API request fails.
     """
     sys = (
         "You are an editorial rater for a crypto newsroom. "
@@ -414,6 +725,25 @@ def ai_score_batch(items: List[Dict[str, Any]]) -> Dict[str, Dict[str, Any]]:
     return out
 # -------------------- Persistence --------------------------------------------
 def _insert_or_update(items: List[Dict[str, Any]], batch_id: str):
+    """
+    Upsert pulled items into the 'cryptonewsapi' table for the current fetch batch.
+
+    Writes:
+        - canonical_url normalization outputs
+        - title hash
+        - rank/event/news identifiers
+        - processed flag reset to 0 on insert
+
+    Deduping/upsert:
+        - Uses 'ON DUPLICATE KEY UPDATE' to refresh selected fields.
+
+    Args:
+        items: Raw items from the API pull (with '_canonical_url' and '_title_hash').
+        batch_id: Identifier used to group this pull/scoring cycle.
+
+    Returns:
+        None
+    """
     conn = get_db_connection()
     cur  = conn.cursor()
 
@@ -463,6 +793,19 @@ def _insert_or_update(items: List[Dict[str, Any]], batch_id: str):
     cur.close(); conn.close()
 
 def _update_scores(scored: Dict[str, Dict[str, Any]]):
+    """
+    Persist GPT scoring results to the database.
+
+    Updates 'cryptonewsapi' rows by canonical_url:
+        - gpt_importance
+        - is_breaking
+
+    Args:
+        scored: Mapping {canonical_url: {'gpt_importance': float, 'is_breaking': int}}.
+
+    Returns:
+        None
+    """
     if not scored: return
     conn = get_db_connection(); cur = conn.cursor()
     sql = """
@@ -477,8 +820,23 @@ def _update_scores(scored: Dict[str, Dict[str, Any]]):
 
 def _update_blended_scores(now_utc: datetime):
     """
-    Compute recency/source/ticker components and final_importance for items within TTL.
+    Recompute component scores and final_importance for recent backlog items.
+
+    Pulls candidates within BACKLOG_TTL_HOURS and not yet chosen_for_publish,
+    then computes:
+        - recency_score
+        - source_weight
+        - final_importance = weighted sum of GPT/rank/recency/source/ticker
+
+    Writes rounded values back to the DB.
+
+    Args:
+        now_utc: Current UTC time used for recency decay.
+
+    Returns:
+        None
     """
+
     conn = get_db_connection(); cur = conn.cursor(dictionary=True)
     cur.execute("""
       SELECT id, canonical_url, publish_date, source_name, tickers, rank_score, gpt_importance
@@ -516,6 +874,18 @@ def _update_blended_scores(now_utc: datetime):
 
 # -------------------- Selection & quota --------------------------------------
 def _today_bounds_local() -> Tuple[datetime, datetime]:
+    """
+    Compute today's local-day bounds, returned as UTC datetimes.
+
+    Uses LOCAL_TZ to define the local day start/end, then converts to UTC.
+
+    Args:
+        None
+
+    Returns:
+        tuple[datetime, datetime]:
+            (start_utc, end_utc) for today's local day.
+    """
     now_local = datetime.now(tz=LOCAL_TZ)
     start = now_local.replace(hour=0, minute=0, second=0, microsecond=0)
     end   = start + timedelta(days=1)
@@ -523,7 +893,18 @@ def _today_bounds_local() -> Tuple[datetime, datetime]:
 
 def _today_published_counts() -> Tuple[int, int]:
     """
-    returns (published_total, published_breaking) for the current UTC day
+    Count how many items were chosen for publish today (UTC day), including breaking.
+
+    Definition:
+        - chosen_today: chosen_for_publish = 1 and selected_at within today's UTC bounds
+        - breaking_today: is_breaking = 1 and chosen_for_publish = 1 and selected_at within today's UTC bounds
+
+    Args:
+        None
+
+    Returns:
+        tuple[int, int]:
+            (published_total, published_breaking)
     """
     start_utc, end_utc = _today_utc_bounds()  # ← use UTC bounds
     conn = get_db_connection(); cur = conn.cursor()
@@ -540,9 +921,27 @@ def _today_published_counts() -> Tuple[int, int]:
 
 def _plan_today_schedule():
     """
-    Fill today's schedule by assigning scheduled_for times to unscheduled items.
-    - Breaking (is_breaking=1 and final_importance >= THRESH_BREAKING_NOW) → schedule immediately (staggered).
-    - Non-breaking → fill today's UTC active slots (80%) and off-peak slots (20%), up to remaining daily quota.
+    Assign 'scheduled_for' times to eligible items to fill today's publishing plan.
+
+    Strategy:
+        1) Breaking-now:
+           - is_breaking=1 and final_importance >= THRESH_BREAKING_NOW
+           - publish_date fresh within COMPARISON_LOOKBACK_HOURS
+           - schedule immediately, staggered by a few seconds
+        2) Non-breaking:
+           - fill remaining DAILY_TARGET quota for the current UTC day
+           - allocate ACTIVE_SHARE of remaining into the active window and the rest off-peak
+           - assign evenly spaced slots, skip past times with small cushion
+           - select candidates by final_importance/publish_date and freshness (SCHEDULE_MAX_AGE_HOURS)
+
+    Side effects:
+        - Updates chosen_for_publish, selected_at, and scheduled_for in DB via _assign_schedule().
+
+    Args:
+        None
+
+    Returns:
+        None
     """
     # 1) Breaking now (staggered times so all get a slot)
     conn = get_db_connection(); cur = conn.cursor(dictionary=True)
@@ -645,8 +1044,19 @@ def _plan_today_schedule():
 
 def _assign_schedule(ids: List[int], times: List[datetime]):
     """
-    Assign scheduled_for to the given ids in order.
-    Marks chosen_for_publish=1 and sets selected_at=now.
+    Assign scheduled_for timestamps to a list of DB row ids.
+
+    Side effects:
+        - Sets chosen_for_publish = 1
+        - Sets selected_at = now
+        - Sets scheduled_for = provided timestamp
+
+    Args:
+        ids: Row IDs to update.
+        times: Scheduled publish times (UTC datetimes). Assignment is positional.
+
+    Returns:
+        None
     """
     if not ids or not times:
         return
@@ -665,6 +1075,25 @@ def _assign_schedule(ids: List[int], times: List[datetime]):
 
 
 def _select_top_k_for_batch(batch_id: str, k: int = PROCESS_PER_CYCLE):
+    """
+    Select the top-k items from a given fetch batch (by importance) and mark chosen.
+
+    Selection order:
+        - is_breaking DESC
+        - final_importance DESC
+        - publish_date DESC
+
+    Side effects:
+        - Logs selected ids.
+        - Marks them chosen via _mark_chosen().
+
+    Args:
+        batch_id: Fetch batch identifier.
+        k: Number of items to select (default PROCESS_PER_CYCLE).
+
+    Returns:
+        None
+    """
     conn = get_db_connection(); cur = conn.cursor(dictionary=True)
     cur.execute("""
         SELECT id
@@ -681,6 +1110,19 @@ def _select_top_k_for_batch(batch_id: str, k: int = PROCESS_PER_CYCLE):
 
 
 def _mark_chosen(ids: List[int], breaking: bool):
+    """
+    Mark a set of item ids as chosen_for_publish and set selected_at.
+
+    Notes:
+        - The 'breaking' parameter is currently unused by the SQL update logic.
+
+    Args:
+        ids: Row IDs to mark.
+        breaking: Flag indicating breaking selection intent (currently not applied).
+
+    Returns:
+        None
+    """
     if not ids: return
     conn = get_db_connection(); cur = conn.cursor()
     now = datetime.utcnow().strftime("%Y-%m-%d %H:%M:%S")
@@ -695,6 +1137,28 @@ def _mark_chosen(ids: List[int], breaking: bool):
 
 # -------------------- Main cycle ---------------------------------------------
 def run_fetch_cycle():
+    """
+    Run one end-to-end fetch/score/schedule cycle.
+
+    Steps:
+        - Acquire MySQL advisory lock 'news_fetcher_lock' to prevent concurrent runs.
+        - Pull a candidate batch from the API (_pull_batch).
+        - Upsert into DB (_insert_or_update) with a new fetch_batch_id.
+        - Load up to 20 items from that batch for GPT scoring.
+        - Call GPT scorer (ai_score_batch) and persist results (_update_scores).
+        - Recompute blended importance scores (_update_blended_scores).
+        - Plan/assign today's publish schedule (_plan_today_schedule).
+        - Log summary stats and release the advisory lock.
+
+    Concurrency:
+        - If lock cannot be acquired, logs and exits without doing work.
+
+    Args:
+        None
+
+    Returns:
+        None
+    """
     conn = None
     conn2 = None
     lock_acquired = False
@@ -787,6 +1251,21 @@ _scheduler = None
 _scheduler_lock = threading.Lock()
 
 def start_scheduler():
+    """
+    Start a singleton APScheduler background scheduler for periodic fetch cycles.
+
+    Behavior:
+        - Thread-safe singleton guarded by _scheduler_lock.
+        - Schedules run_fetch_cycle on an interval of RUN_EVERY_MINUTES.
+        - Runs immediately once (next_run_time = datetime.now()).
+        - Prevents overlapping runs (max_instances=1) and coalesces missed runs.
+
+    Args:
+        None
+
+    Returns:
+        None
+    """
     global _scheduler
     with _scheduler_lock:
         if _scheduler is None:
@@ -805,5 +1284,13 @@ def start_scheduler():
             print("[FETCH] Scheduler started.")
 
 def fetch_all_news():
-    """Compatibility wrapper for older scheduler. Runs one full fetch cycle now."""
+    """
+    Compatibility wrapper that triggers a single fetch cycle immediately.
+
+    Args:
+        None
+
+    Returns:
+        None
+    """
     run_fetch_cycle()

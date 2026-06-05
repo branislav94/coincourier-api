@@ -1,3 +1,16 @@
+"""
+Configuration module.
+
+Loads environment variables from a local .env file and exposes:
+- API tokens/keys
+- WordPress REST credentials
+- Image generation settings
+- MySQL connection dictionaries for the app DB and the WordPress DB
+
+All values are sourced from environment variables to avoid hardcoding secrets.
+"""
+
+
 import os
 from dotenv import load_dotenv
 

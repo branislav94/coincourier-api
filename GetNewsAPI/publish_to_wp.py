@@ -108,6 +108,19 @@ IMAGE_SOURCE = "generate"
 
 
 def slugify(text: str) -> str:
+    """
+    Convert text into a lowercase, URL-safe slug.
+
+    Replaces any run of non [a-z0-9] characters with a single '-' and trims
+    leading/trailing dashes.
+
+    Args:
+        text: Input string.
+
+    Returns:
+        str:
+            Slugified string suitable for URLs.
+    """
     import re
 
     text = text.lower().strip()
@@ -115,11 +128,41 @@ def slugify(text: str) -> str:
 
 
 def _stable_choice(key: str, options: list[str]) -> str:
+    """
+    Pick a deterministic option from a list based on a stable hash of a key.
+
+    Uses md5(key) and the first byte modulo len(options) to select an item.
+    Intended to add variation per post while staying repeatable.
+
+    Args:
+        key: Stable selection key (e.g., title + tags).
+        options: Non-empty list of candidate strings.
+
+    Returns:
+        str:
+            Selected option.
+
+    Raises:
+        ZeroDivisionError:
+            If options is empty.
+    """
     h = hashlib.md5(key.encode("utf-8")).digest()
     return options[h[0] % len(options)]
 
 
 def _get_lock(conn, name: str, timeout: int = 1) -> bool:
+    """
+    Acquire a MySQL named lock (GET_LOCK) to prevent overlapping runs.
+
+    Args:
+        conn: Open MySQL connection (mysql.connector connection).
+        name: Lock name.
+        timeout: Seconds to wait for the lock.
+
+    Returns:
+        bool:
+            True if the lock was acquired, else False.
+    """
     cur = conn.cursor()
     cur.execute("SELECT GET_LOCK(%s,%s)", (name, timeout))
     got = (cur.fetchone() or (0,))[0] == 1
@@ -127,12 +170,38 @@ def _get_lock(conn, name: str, timeout: int = 1) -> bool:
     return got
 
 def _release_lock(conn, name: str):
+    """
+    Release a MySQL named lock (RELEASE_LOCK).
+
+    Args:
+        conn: Open MySQL connection (mysql.connector connection).
+        name: Lock name.
+
+    Returns:
+        None
+    """
     cur = conn.cursor()
     cur.execute("SELECT RELEASE_LOCK(%s)", (name,))
     _ = cur.fetchone()
     cur.close()
 
 def _count_due_now() -> int:
+    """
+    Count unpublished rich articles that are due to publish now (UTC).
+
+    "Due" is defined as:
+        - rich_crpytonews.published = 0
+        - cryptonewsapi.chosen_for_publish = 1
+        - cryptonewsapi.scheduled_for is not null
+        - cryptonewsapi.scheduled_for <= UTC_TIMESTAMP()
+
+    Args:
+        None
+
+    Returns:
+        int:
+            Number of due items.
+    """
     with mysql.connector.connect(**DB_CONFIG) as conn, conn.cursor() as cur:
         cur.execute("""
             SELECT COUNT(*)
@@ -146,6 +215,16 @@ def _count_due_now() -> int:
         return int((cur.fetchone() or (0,))[0])
     
 def _mood_from_title(title: str) -> str:
+    """
+    Classify title mood as bull/bear/neutral using simple keyword heuristics.
+
+    Args:
+        title: Article title.
+
+    Returns:
+        str:
+            'bull', 'bear', or 'neutral'.
+    """
     t = title.lower()
     bull = any(w in t for w in ["surge", "rally", "jumps", "soars", "up", "gain", "bull"])
     bear = any(w in t for w in ["drops", "plunge", "falls", "down", "selloff", "bear"])
@@ -154,6 +233,19 @@ def _mood_from_title(title: str) -> str:
     return "neutral"
 
 def _subject_from_tags(tags: set[str]) -> str:
+    """
+    Choose a safe, generic image subject description based on normalized tags.
+
+    Uses deterministic choices to reduce repetition while avoiding brand logos,
+    readable text, real people, and copyrighted characters.
+
+    Args:
+        tags: Normalized lowercase tag set (e.g., {'bitcoin','markets'}).
+
+    Returns:
+        str:
+            Subject description to be embedded in the image prompt.
+    """
     # several alternates per topic to reduce repetition
     if any(t in tags for t in ("bitcoin", "btc")):
         return _stable_choice("btc:"+",".join(sorted(tags)), [
@@ -220,8 +312,28 @@ def _subject_from_tags(tags: set[str]) -> str:
 
 def build_image_prompt(title: str, hashtags: str) -> str:
     """
-    More variety: style, composition, camera, lighting, palette vary per post (deterministically).
-    Still avoids policy issues (no text/logos/real people).
+    Build a varied but policy-safe prompt for image generation.
+
+    Variation is deterministic per post using stable choices across:
+        - style family
+        - composition
+        - camera treatment
+        - lighting
+        - palette (bull/bear/neutral inferred from title)
+
+    Safety constraints are embedded to avoid:
+        - readable text
+        - logos/trademarks
+        - real people/public figures
+        - copyrighted characters
+
+    Args:
+        title: Article title (used for mood + stable key; not for brand injection).
+        hashtags: Comma-separated tags (may include '#', whitespace, etc.).
+
+    Returns:
+        str:
+            A prompt string suitable for GPT-Image generation.
     """
     # normalize tags from hashtags only (we avoid injecting brand names from titles)
     tags = {t.strip().lower() for t in re.split(r"[#,]", hashtags or "") if t.strip()}
@@ -254,6 +366,23 @@ def build_image_prompt(title: str, hashtags: str) -> str:
 
 
 def _heroize_to_1536x1024(raw_bytes: bytes) -> str | None:
+    """
+    Convert image bytes into a WordPress hero JPEG (1536x1024), saved to a temp file.
+
+    Flow:
+        - Load bytes into PIL
+        - Convert to RGB
+        - Resize to 1536x1536
+        - Center-crop to 1536x1024
+        - Save as JPEG (quality=90) to a temp file
+
+    Args:
+        raw_bytes: Input image bytes.
+
+    Returns:
+        str | None:
+            Path to the saved JPEG file, or None on failure.
+    """
     try:
         img = PILImage.open(io.BytesIO(raw_bytes)).convert("RGB")
         # upscale square → 1536x1536 then center-crop to 1536x1024
@@ -269,6 +398,22 @@ def _heroize_to_1536x1024(raw_bytes: bytes) -> str | None:
 
 
 def build_edit_prompt(title: str, hashtags: str) -> str:
+    """
+    Build a short, policy-safe prompt for image editing/restyling.
+
+    Intention: restyle a provided base photo into a chosen style family while:
+        - removing text/logos
+        - avoiding real people/public figures
+        - making the result less traceable to the source image
+
+    Args:
+        title: Article title (used only for stable style choice).
+        hashtags: Article hashtags (currently not strongly used; kept for extensibility).
+
+    Returns:
+        str:
+            Editing prompt string.
+    """
     # short + safe: restyle the *given* photo, no logos/people/text
     style = _stable_choice(title.lower() + ":style", STYLE_FAMILIES)
     return (
@@ -280,9 +425,31 @@ def build_edit_prompt(title: str, hashtags: str) -> str:
 
 def edit_image_from_url(url: str, title: str, hashtags: str) -> str | None:
     """
-    Download a base photo, send to gpt-image-1 edits with a tiny prompt,
-    return a local JPEG path (1536x1024) or None.
+    Download an image, restyle it via OpenAI image edits, and output a WP hero JPEG path.
+
+    Flow:
+        1) Download base image from url.
+        2) Save to a temp file for the SDK.
+        3) Call OpenAI images.edit with build_edit_prompt().
+        4) Decode returned image (b64_json preferred, else URL download).
+        5) Convert to 1536x1024 hero via _heroize_to_1536x1024().
+        6) Clean up temp inputs.
+
+    Args:
+        url: Source image URL to download.
+        title: Article title (prompt keying).
+        hashtags: Hashtags for prompt context.
+
+    Returns:
+        str | None:
+            Local JPEG path (1536x1024) on success, else None.
+
+    Raises:
+        requests.HTTPError:
+            If the base image download fails with a non-2xx status and not caught upstream.
+        Any exception may be caught internally and converted to None by this function.
     """
+
     try:
         # 1) download base
         r = session.get(url, timeout=20)
@@ -334,6 +501,15 @@ def edit_image_from_url(url: str, title: str, hashtags: str) -> str | None:
 
 # ---------- DB helpers -------------------------------------------------------
 def mark_news_as_published(news_url: str) -> None:
+    """
+    Mark a rich article as published in `rich_crpytonews` by news_url.
+
+    Args:
+        news_url: Primary key linking rich_crpytonews to cryptonewsapi.
+
+    Returns:
+        None
+    """
     with mysql.connector.connect(**DB_CONFIG) as conn, conn.cursor() as cur:
         cur.execute(
             "UPDATE rich_crpytonews SET published = 1 WHERE news_url = %s",
@@ -343,6 +519,20 @@ def mark_news_as_published(news_url: str) -> None:
 
 
 def _today_bounds_utc():
+    """
+    Compute today's bounds in UTC based on an assumed Europe/Belgrade local midnight.
+
+    Note:
+        This implementation uses a fixed +02:00 offset approximation.
+        If DST correctness matters, replace with zoneinfo('Europe/Belgrade').
+
+    Args:
+        None
+
+    Returns:
+        tuple[datetime, datetime]:
+            (start_utc, end_utc) for the local day converted to UTC.
+    """
     # Europe/Belgrade local midnight → UTC
     # If you already track LOCAL_TZ elsewhere, reuse that
     now = datetime.now(timezone.utc)
@@ -354,6 +544,27 @@ def _today_bounds_utc():
     return start_local, end_local
 
 def fetch_unpublished(limit: int = 10) -> list[dict]:
+    """
+    Fetch unpublished items that are due now, with a fallback ranking query.
+
+    Primary query:
+        - rich_crpytonews.published = 0
+        - cryptonewsapi.chosen_for_publish = 1
+        - cryptonewsapi.scheduled_for <= now (UTC)
+        - ordered by scheduled_for ASC
+
+    Fallback (if primary yields none):
+        - any unpublished rich_crpytonews rows
+        - ordered by breaking/final_importance/publish_date (best-effort)
+
+    Args:
+        limit: Max rows to return.
+
+    Returns:
+        list[dict]:
+            List of rows (dicts) ready for publishing.
+    """
+
     with mysql.connector.connect(**DB_CONFIG) as conn, conn.cursor(dictionary=True) as cur:
         cur.execute(
             """
@@ -394,7 +605,23 @@ def fetch_unpublished(limit: int = 10) -> list[dict]:
 # ---------- WordPress helpers ------------------------------------------------
 def ensure_category(name: str) -> int:
     """
-    Return an existing WP category-ID for *name* or create it and return its id.
+    Ensure a WordPress category exists and return its term id.
+
+    Behavior:
+        - GET /wp/v2/categories?slug=<slugified(name)>
+        - If found, returns the existing id.
+        - Otherwise POST /wp/v2/categories to create and returns new id.
+
+    Args:
+        name: Category display name.
+
+    Returns:
+        int:
+            WordPress category term id.
+
+    Raises:
+        requests.HTTPError:
+            If the WordPress REST API returns an error.
     """
     # First: try to fetch an existing term by slug
     slug = slugify(name)
@@ -414,8 +641,17 @@ def ensure_category(name: str) -> int:
 # ───────── WordPress DB helpers (new) ─────────────────────────────────────────
 def get_wp_prefix(conn) -> str:
     """
-    Detect the WP table-prefix once per run ( wp_, wp7_, etc. ).
-    We look at any table that ends with 'options'.
+    Detect the WordPress table prefix (wp_, wp7_, etc.) for the connected DB.
+
+    Looks for any table in information_schema that ends with 'options' and derives
+    the prefix by stripping 'options'. Falls back to 'wp_' if not found.
+
+    Args:
+        conn: Open MySQL connection to the WordPress database.
+
+    Returns:
+        str:
+            Detected prefix string (including trailing underscore).
     """
     cur = conn.cursor()
     cur.execute("""
@@ -433,7 +669,19 @@ def get_wp_prefix(conn) -> str:
 
 def upsert_postmeta(conn, prefix: str, post_id: int, key: str, value: str):
     """
-    INSERT a post-meta row or UPDATE it if it already exists.
+    Upsert a postmeta row into the WordPress database.
+
+    Uses INSERT ... ON DUPLICATE KEY UPDATE to set meta_value for (post_id, meta_key).
+
+    Args:
+        conn: Open MySQL connection to the WordPress database.
+        prefix: WordPress table prefix (e.g., 'wp_').
+        post_id: WordPress post id.
+        key: Meta key.
+        value: Meta value to store.
+
+    Returns:
+        None
     """
     cur = conn.cursor()
     table = f"{prefix}postmeta"
@@ -449,8 +697,22 @@ def upsert_postmeta(conn, prefix: str, post_id: int, key: str, value: str):
 
 def generate_image(title: str, hashtags: str) -> str | None:
     """
-    GPT-Image-1: 1024x1024 (low) → upscale to 1536x1536 → center-crop to 1536x1024.
-    Returns a local JPEG path or None.
+    Generate a new hero image using OpenAI Images and return a local JPEG path.
+
+    Flow:
+        - build_image_prompt(title, hashtags)
+        - client.images.generate(IMG_MODEL, prompt, IMG_SIZE, IMG_QUALITY)
+        - decode b64_json (preferred) or download from returned URL
+        - resize to 1536x1536 then center-crop to 1536x1024
+        - save to temp JPEG and return its path
+
+    Args:
+        title: Article title (prompt keying + mood inference).
+        hashtags: Hashtags string (topic extraction for prompt).
+
+    Returns:
+        str | None:
+            Local JPEG path (1536x1024) on success, else None.
     """
     prompt = build_image_prompt(title, hashtags)
 
@@ -508,6 +770,26 @@ def generate_image(title: str, hashtags: str) -> str | None:
 RETRY_STATUS = {429, 500, 502, 503, 504}
 
 def _post_with_retries(url: str, *, max_tries: int = 3, pause_s: int = 10, **kwargs) -> requests.Response:
+    """
+    POST to WordPress with retries for transient HTTP statuses.
+
+    Retries when status_code is in RETRY_STATUS: {429, 500, 502, 503, 504}.
+    Sleeps pause_s between attempts.
+
+    Args:
+        url: Target URL to POST to.
+        max_tries: Maximum attempts before failing.
+        pause_s: Sleep between retries in seconds.
+        **kwargs: Passed through to session.post().
+
+    Returns:
+        requests.Response:
+            Successful response (2xx).
+
+    Raises:
+        requests.RequestException:
+            If all retries fail or a non-retryable error occurs.
+    """
     last = None
     for attempt in range(1, max_tries + 1):
         try:
@@ -527,6 +809,29 @@ def _post_with_retries(url: str, *, max_tries: int = 3, pause_s: int = 10, **kwa
 
 
 def upload_image(url: str | None, title: str, hashtags: str, *, force_generate: bool | None = None) -> int | None:
+    """
+    Produce and upload a featured image to WordPress, returning the media id.
+
+    Selection:
+        - If force_generate is None, defaults based on USE_API_IMAGES (env/config).
+        - If using feed URL and allowed: try edit_image_from_url() first.
+        - Otherwise fall back to generate_image().
+
+    Upload:
+        - Detect MIME type from filename
+        - POST to /wp/v2/media with content bytes
+        - Return created media id
+
+    Args:
+        url: Optional source image URL from the feed.
+        title: Article title (for prompt context and deterministic styling).
+        hashtags: Hashtags (for topic context).
+        force_generate: If True, skip edits and always generate a new image.
+
+    Returns:
+        int | None:
+            WordPress media id on success, else None.
+    """
     if force_generate is None:
         force_generate = (USE_API_IMAGES == 0)
 
@@ -574,6 +879,16 @@ def upload_image(url: str | None, title: str, hashtags: str, *, force_generate: 
 
 
 def set_media_alt(media_id: int, alt_text: str) -> None:
+    """
+    Set the alt_text field for a WordPress media item via REST API.
+
+    Args:
+        media_id: WordPress media id.
+        alt_text: Desired alt text (will be truncated to 120 chars).
+
+    Returns:
+        None
+    """
     try:
         session.post(
             f"{WP_API_URL}/wp-json/wp/v2/media/{media_id}",
@@ -583,6 +898,26 @@ def set_media_alt(media_id: int, alt_text: str) -> None:
         print(f"⚠️  Could not set alt text for media {media_id}: {exc}")
 
 def ensure_term(name: str, taxonomy: str) -> int:
+    """
+    Ensure a WordPress taxonomy term exists (category or tag) and return its id.
+
+    Behavior:
+        - GET /wp/v2/<taxonomy>?slug=<slug>
+        - If found, returns id.
+        - Otherwise POST to create and returns new id.
+
+    Args:
+        name: Term display name.
+        taxonomy: 'categories' or 'tags'.
+
+    Returns:
+        int:
+            Term id.
+
+    Raises:
+        requests.HTTPError:
+            If the WordPress REST API returns an error.
+    """
     # taxonomy: "categories" or "tags"
     slug = slugify(name)
     r = session.get(f"{API_BASE}/wp-json/wp/v2/{taxonomy}", params={"slug": slug})
@@ -596,8 +931,18 @@ def ensure_term(name: str, taxonomy: str) -> int:
 
 def link_markets(text: str) -> str:
     """
-    Wrap every occurrence of a known exchange name in an <a> tag.
-    Uses word-boundary regex, case-sensitive.
+    Wrap occurrences of known exchange names with outbound <a> links.
+
+    Uses a word-boundary regex replacement per exchange in MARKET_LINKS.
+    Attempts to avoid replacing inside existing tags/attributes using a negative
+    lookbehind for quote/angle-bracket patterns.
+
+    Args:
+        text: HTML string to modify.
+
+    Returns:
+        str:
+            HTML with linked exchange names.
     """
     for name, url in MARKET_LINKS.items():
         # \b will match at word boundaries, except for names with punctuation (Crypto.com, OKX)
@@ -607,6 +952,34 @@ def link_markets(text: str) -> str:
     return text
 # ---------- Main publisher ---------------------------------------------------
 def publish_news_to_wp() -> None:
+    """
+    Publish due enriched news items to WordPress (featured image + Rank Math meta).
+
+    Concurrency:
+        - Uses MySQL named lock 'wp_publisher_lock' to prevent overlap.
+
+    Flow:
+        1) Acquire lock or exit.
+        2) Count due items (_count_due_now); exit if none.
+        3) Fetch due items (fetch_unpublished) capped by PUBLISH_BATCH_MAX.
+        4) For each item:
+            - Upload/edit/generate featured image (upload_image)
+            - Set media alt text (set_media_alt)
+            - Ensure categories exist (ensure_category)
+            - Link exchange names in HTML (link_markets)
+            - Optionally embed schema_jsonld as a <script type="application/ld+json"> block
+            - POST to /wp/v2/posts with:
+                title, content, status=publish, slug, date_gmt, categories, tags, meta
+            - On success: optionally upsert Rank Math meta into WP DB (upsert_postmeta)
+            - Mark item published in rich_crpytonews (mark_news_as_published)
+        5) Release lock in finally.
+
+    Args:
+        None
+
+    Returns:
+        None
+    """
     # single-run guard (prevents overlapping scheduler/API runs)
     lock_conn = None
     try:
@@ -640,8 +1013,15 @@ def publish_news_to_wp() -> None:
             meta_data = {}
             if featured_id:
                 set_media_alt(featured_id, item.get("seo_focus") or item["title"])
-            meta_data["_yoast_wpseo_focuskw"]  = item.get("seo_focus", "")
-            meta_data["_yoast_wpseo_metadesc"] = item.get("seo_meta", "")
+
+            # Rank Math meta keys (REST-exposed)
+            meta_data["rank_math_focus_keyword"] = item.get("seo_focus", "")
+            meta_data["rank_math_description"]    = (item.get("seo_meta") or "")[:160]
+            meta_data["rank_math_title"]          = (item.get("title") or "")[:58]
+            # Optional canonical if you ever add it:
+            if item.get("seo_canonical"):
+                meta_data["rank_math_canonical_url"] = item["seo_canonical"]
+
 
             # ---- categories ----
             cat_names = [c.strip() for c in item.get("category", "General").split(",") if c.strip()]
@@ -662,6 +1042,10 @@ def publish_news_to_wp() -> None:
             local_when = schedule_at_utc.astimezone(LOCAL_TZ)
             print(f"Publishing: {item['title']!r} — UTC {schedule_at_utc:%Y-%m-%d %H:%M:%S} "
                   f"(Local {local_when:%Y-%m-%d %H:%M:%S})")
+            
+            schema = item.get("schema_jsonld")
+            if schema:
+                with_links_content += f'\n<script type="application/ld+json">{schema}</script>\n'
 
             post_data = {
                 "title":      item["title"],
@@ -687,12 +1071,13 @@ def publish_news_to_wp() -> None:
             print(f"✅ Published WP post {post_id} at {schedule_at_utc:%Y-%m-%d %H:%M:%S}Z")
 
             # Yoast meta via DB
+            # (Optional fallback; REST meta already sets these)
             with mysql.connector.connect(**WP_DB_CONFIG) as wp_conn:
                 prefix = get_wp_prefix(wp_conn)
-                if item.get("seo_focus"):
-                    upsert_postmeta(wp_conn, prefix, post_id, '_yoast_wpseo_focuskw', item["seo_focus"])
-                if item.get("seo_meta"):
-                    upsert_postmeta(wp_conn, prefix, post_id, '_yoast_wpseo_metadesc', item["seo_meta"])
+                upsert_postmeta(wp_conn, prefix, post_id, 'rank_math_focus_keyword', item.get('seo_focus',''))
+                upsert_postmeta(wp_conn, prefix, post_id, 'rank_math_description', (item.get('seo_meta') or '')[:160])
+                upsert_postmeta(wp_conn, prefix, post_id, 'rank_math_title', (item.get('title') or '')[:58])
+
 
             mark_news_as_published(item["news_url"])
 

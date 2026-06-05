@@ -1,4 +1,17 @@
 # scheduler.py
+
+
+"""
+APScheduler orchestration.
+
+Starts the fetcher scheduler and runs a chained processor/publisher job on an interval.
+The chained job processes stored news with GPT and then publishes the results to WordPress.
+
+Side effects:
+- Spawns background scheduler threads via APScheduler.
+- Produces log output via the root logging configuration.
+"""
+
 import logging
 from apscheduler.schedulers.background import BackgroundScheduler
 from datetime import datetime, timedelta
@@ -12,6 +25,24 @@ logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(
 
 
 def chained_job():
+    """
+    Run the processing and publishing pipeline in sequence.
+
+    Executes:
+        1) `process_news_with_gpt()` to transform/prepare stored news content.
+        2) `publish_news_to_wp()` to publish prepared items to WordPress.
+
+    Behavior:
+        - Logs start/end markers for each stage.
+        - Catches and logs exceptions for each stage independently so a failure in
+          processing does not prevent the publish stage from attempting to run.
+
+    Args:
+        None
+
+    Returns:
+        None
+    """
     logging.info("▶ starting chained job")
     logging.info("Starting process_news_with_gpt job.")
     try:
@@ -29,6 +60,29 @@ def chained_job():
 
         
 def start_scheduler():
+    """
+    Start background schedulers for fetching and for the chained processing pipeline.
+
+    Starts:
+        - Fetcher scheduler: runs immediately and then every 30 minutes (implemented
+          inside `fetcher.start_scheduler`).
+        - Chained job scheduler: runs `chained_job()` every 30 minutes, with the first
+          run delayed by 3 minutes to give the fetcher time to populate data.
+
+    Scheduling details (chained job):
+        - interval: 30 minutes
+        - first run: now + 3 minutes
+        - misfire_grace_time: 3600 seconds
+        - coalesce: True (merge missed runs into one)
+        - max_instances: 1 (prevent overlap)
+        - jitter: 10 seconds
+
+    Args:
+        None
+
+    Returns:
+        None
+    """
     # start fetcher (runs immediately and then every 30 min)
     start_fetcher_scheduler()
 

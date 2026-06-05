@@ -1,0 +1,137 @@
+2025-10-04 00:01:31,944  INFO  Adding job tentatively -- it will be properly scheduled when the scheduler starts
+2025-10-04 00:01:31,945  INFO  Added job "run_fetch_cycle" to job store "default"
+2025-10-04 00:01:31,945  INFO  Scheduler started
+2025-10-04 00:01:31,945  INFO  Running job "run_fetch_cycle (trigger: interval[0:30:00], next run at: 2025-10-04 00:31:33 CEST)" (scheduled at 2025-10-04 00:01:31.943601+02:00)
+2025-10-04 00:01:31,946  INFO  Adding job tentatively -- it will be properly scheduled when the scheduler starts
+2025-10-04 00:01:31,946  INFO  Added job "chained_job" to job store "default"
+2025-10-04 00:01:31,946  INFO  Scheduler started
+2025-10-04 00:01:31,959  INFO  [31m[1mWARNING: This is a development server. Do not use it in a production deployment. Use a production WSGI server instead.[0m
+ * Running on all addresses (0.0.0.0)
+ * Running on http://127.0.0.1:500
+ * Running on http://192.168.1.5:500
+2025-10-04 00:01:31,959  INFO  [33mPress CTRL+C to quit[0m
+2025-10-04 00:01:34,714  INFO  to_score rows for batch 6a8d1b09d1d4a9ba83ba42: 10
+2025-10-04 00:01:38,600  INFO  Chosen today so far: total=0 (breaking=0)
+2025-10-04 00:01:38,600  INFO  [FETCH] Cycle complete. Pulled=10 Scored=0 Batch=6a8d1b09d1d4a9ba83ba42
+2025-10-04 00:01:38,691  INFO  Job "run_fetch_cycle (trigger: interval[0:30:00], next run at: 2025-10-04 00:31:33 CEST)" executed successfully
+2025-10-04 00:04:31,950  INFO  Running job "chained_job (trigger: interval[0:30:00], next run at: 2025-10-04 00:34:34 CEST)" (scheduled at 2025-10-04 00:04:31.946109+02:00)
+2025-10-04 00:04:31,951  INFO  ▶ starting chained job
+2025-10-04 00:04:31,952  INFO  Starting process_news_with_gpt job.
+2025-10-04 00:04:32,399  INFO  Finished processing news with GPT successfully.
+2025-10-04 00:04:32,400  INFO  Starting publish_news_to_wp job.
+2025-10-04 00:04:32,927  INFO  Finished publishing news to WordPress successfully.
+2025-10-04 00:04:32,927  INFO  Job "chained_job (trigger: interval[0:30:00], next run at: 2025-10-04 00:34:34 CEST)" executed successfully
+2025-10-04 00:31:33,900  INFO  Running job "run_fetch_cycle (trigger: interval[0:30:00], next run at: 2025-10-04 01:01:36 CEST)" (scheduled at 2025-10-04 00:31:33.895772+02:00)
+2025-10-04 00:31:36,735  INFO  to_score rows for batch 9c0914a589d2efb15557de: 10
+2025-10-04 00:31:45,797  INFO  Chosen today so far: total=1 (breaking=0)
+2025-10-04 00:31:45,797  INFO  [FETCH] Cycle complete. Pulled=10 Scored=10 Batch=9c0914a589d2efb15557de
+2025-10-04 00:31:45,889  INFO  Job "run_fetch_cycle (trigger: interval[0:30:00], next run at: 2025-10-04 01:01:36 CEST)" executed successfully
+2025-10-04 00:34:34,526  INFO  Running job "chained_job (trigger: interval[0:30:00], next run at: 2025-10-04 01:04:42 CEST)" (scheduled at 2025-10-04 00:34:34.515894+02:00)
+2025-10-04 00:34:34,527  INFO  ▶ starting chained job
+2025-10-04 00:34:34,527  INFO  Starting process_news_with_gpt job.
+2025-10-04 00:34:44,072  INFO  Finished processing news with GPT successfully.
+2025-10-04 00:34:44,072  INFO  Starting publish_news_to_wp job.
+2025-10-04 00:34:44,602  INFO  Finished publishing news to WordPress successfully.
+2025-10-04 00:34:44,603  INFO  Job "chained_job (trigger: interval[0:30:00], next run at: 2025-10-04 01:04:42 CEST)" executed successfully
+2025-10-15 19:22:44,635  INFO  Adding job tentatively -- it will be properly scheduled when the scheduler starts
+2025-10-15 19:22:44,636  INFO  Added job "run_fetch_cycle" to job store "default"
+2025-10-15 19:22:44,636  INFO  Scheduler started
+2025-10-15 19:22:44,638  INFO  Running job "run_fetch_cycle (trigger: interval[0:30:00], next run at: 2025-10-15 19:52:45 CEST)" (scheduled at 2025-10-15 19:22:44.633750+02:00)
+2025-10-15 19:22:44,639  INFO  Adding job tentatively -- it will be properly scheduled when the scheduler starts
+2025-10-15 19:22:44,640  INFO  Added job "chained_job" to job store "default"
+2025-10-15 19:22:44,640  INFO  Scheduler started
+2025-10-15 19:22:44,658  INFO  [31m[1mWARNING: This is a development server. Do not use it in a production deployment. Use a production WSGI server instead.[0m
+ * Running on all addresses (0.0.0.0)
+ * Running on http://127.0.0.1:500
+ * Running on http://192.168.1.12:500
+2025-10-15 19:22:44,658  INFO  [33mPress CTRL+C to quit[0m
+2025-10-15 19:22:57,178  INFO  to_score rows for batch 2f08f54d05fb5d4e51a435: 10
+2025-10-15 19:23:16,779  INFO  Chosen today so far: total=9 (breaking=0)
+2025-10-15 19:23:16,779  INFO  [FETCH] Cycle complete. Pulled=10 Scored=10 Batch=2f08f54d05fb5d4e51a435
+2025-10-15 19:23:16,974  INFO  Job "run_fetch_cycle (trigger: interval[0:30:00], next run at: 2025-10-15 19:52:45 CEST)" executed successfully
+2025-10-15 19:25:44,646  INFO  Running job "chained_job (trigger: interval[0:30:00], next run at: 2025-10-15 19:55:53 CEST)" (scheduled at 2025-10-15 19:25:44.639067+02:00)
+2025-10-15 19:25:44,647  INFO  ▶ starting chained job
+2025-10-15 19:25:44,647  INFO  Starting process_news_with_gpt job.
+2025-10-15 19:26:38,541  INFO  Finished processing news with GPT successfully.
+2025-10-15 19:26:38,541  INFO  Starting publish_news_to_wp job.
+2025-10-15 19:26:39,794  INFO  Finished publishing news to WordPress successfully.
+2025-10-15 19:26:39,794  INFO  Job "chained_job (trigger: interval[0:30:00], next run at: 2025-10-15 19:55:53 CEST)" executed successfully
+2025-10-15 19:31:54,563  INFO  Adding job tentatively -- it will be properly scheduled when the scheduler starts
+2025-10-15 19:31:54,563  INFO  Added job "run_fetch_cycle" to job store "default"
+2025-10-15 19:31:54,563  INFO  Scheduler started
+2025-10-15 19:31:54,564  INFO  Running job "run_fetch_cycle (trigger: interval[0:30:00], next run at: 2025-10-15 20:01:55 CEST)" (scheduled at 2025-10-15 19:31:54.562705+02:00)
+2025-10-15 19:31:54,564  INFO  Adding job tentatively -- it will be properly scheduled when the scheduler starts
+2025-10-15 19:31:54,564  INFO  Added job "chained_job" to job store "default"
+2025-10-15 19:31:54,564  INFO  Scheduler started
+2025-10-15 19:31:54,572  INFO  [31m[1mWARNING: This is a development server. Do not use it in a production deployment. Use a production WSGI server instead.[0m
+ * Running on all addresses (0.0.0.0)
+ * Running on http://127.0.0.1:500
+ * Running on http://192.168.1.12:500
+2025-10-15 19:31:54,572  INFO  [33mPress CTRL+C to quit[0m
+2025-10-15 19:31:59,093  INFO  to_score rows for batch 1720f078d222954d52abc9: 10
+2025-10-15 19:32:13,143  INFO  Chosen today so far: total=11 (breaking=0)
+2025-10-15 19:32:13,144  INFO  [FETCH] Cycle complete. Pulled=10 Scored=10 Batch=1720f078d222954d52abc9
+2025-10-15 19:32:13,380  INFO  Job "run_fetch_cycle (trigger: interval[0:30:00], next run at: 2025-10-15 20:01:55 CEST)" executed successfully
+2025-10-15 19:34:54,570  INFO  Running job "chained_job (trigger: interval[0:30:00], next run at: 2025-10-15 20:05:00 CEST)" (scheduled at 2025-10-15 19:34:54.564236+02:00)
+2025-10-15 19:34:54,571  INFO  ▶ starting chained job
+2025-10-15 19:34:54,571  INFO  Starting process_news_with_gpt job.
+2025-10-15 19:35:24,734  ERROR  OpenAI error 400: {
+  "error": {
+    "message": "Unsupported value: 'temperature' does not support 0.7 with this model. Only the default (1) value is supported.",
+    "type": "invalid_request_error",
+    "param": "temperature",
+    "code": "unsupported_value"
+  }
+}
+2025-10-15 19:35:38,504  ERROR  OpenAI error 400: {
+  "error": {
+    "message": "Unsupported value: 'temperature' does not support 0.7 with this model. Only the default (1) value is supported.",
+    "type": "invalid_request_error",
+    "param": "temperature",
+    "code": "unsupported_value"
+  }
+}
+2025-10-15 19:35:53,180  ERROR  OpenAI error 400: {
+  "error": {
+    "message": "Unsupported value: 'temperature' does not support 0.7 with this model. Only the default (1) value is supported.",
+    "type": "invalid_request_error",
+    "param": "temperature",
+    "code": "unsupported_value"
+  }
+}
+2025-10-15 19:36:09,472  INFO  Adding job tentatively -- it will be properly scheduled when the scheduler starts
+2025-10-15 19:36:09,472  INFO  Added job "run_fetch_cycle" to job store "default"
+2025-10-15 19:36:09,472  INFO  Scheduler started
+2025-10-15 19:36:09,473  INFO  Running job "run_fetch_cycle (trigger: interval[0:30:00], next run at: 2025-10-15 20:06:09 CEST)" (scheduled at 2025-10-15 19:36:09.471940+02:00)
+2025-10-15 19:36:09,473  INFO  Adding job tentatively -- it will be properly scheduled when the scheduler starts
+2025-10-15 19:36:09,473  INFO  Added job "chained_job" to job store "default"
+2025-10-15 19:36:09,473  INFO  Scheduler started
+2025-10-15 19:36:09,480  INFO  [31m[1mWARNING: This is a development server. Do not use it in a production deployment. Use a production WSGI server instead.[0m
+ * Running on all addresses (0.0.0.0)
+ * Running on http://127.0.0.1:500
+ * Running on http://192.168.1.12:500
+2025-10-15 19:36:09,480  INFO  [33mPress CTRL+C to quit[0m
+2025-10-15 19:36:14,543  INFO  to_score rows for batch 6f0241075e3c11bb59a04e: 10
+2025-10-15 19:36:25,741  INFO  Chosen today so far: total=12 (breaking=1)
+2025-10-15 19:36:25,742  INFO  [FETCH] Cycle complete. Pulled=10 Scored=10 Batch=6f0241075e3c11bb59a04e
+2025-10-15 19:36:26,071  INFO  Job "run_fetch_cycle (trigger: interval[0:30:00], next run at: 2025-10-15 20:06:09 CEST)" executed successfully
+2025-10-15 19:39:09,483  INFO  Running job "chained_job (trigger: interval[0:30:00], next run at: 2025-10-15 20:09:12 CEST)" (scheduled at 2025-10-15 19:39:09.473500+02:00)
+2025-10-15 19:39:09,484  INFO  ▶ starting chained job
+2025-10-15 19:39:09,485  INFO  Starting process_news_with_gpt job.
+2025-10-15 19:40:06,557  ERROR  OpenAI: empty/truncated content (finish_reason=length). Usage: {'prompt_tokens': 1160, 'completion_tokens': 1200, 'total_tokens': 2360, 'prompt_tokens_details': {'cached_tokens': 0, 'audio_tokens': 0}, 'completion_tokens_details': {'reasoning_tokens': 1200, 'audio_tokens': 0, 'accepted_prediction_tokens': 0, 'rejected_prediction_tokens': 0}}
+2025-10-15 19:40:23,068  INFO  SEO dump: {'seo_focus': 'ethereum foundation defi strategy', 'seo_slug': 'ethereum-foundation-defi-strategy-treasury-moves', 'seo_meta': 'Ethereum Foundation DeFi Strategy advances as 1,000 ETH is swapped via TWAP and funds flow to a Morpho vault, aligning with its updated treasury policy.'}
+2025-10-15 19:41:17,891  ERROR  OpenAI: empty/truncated content (finish_reason=length). Usage: {'prompt_tokens': 1090, 'completion_tokens': 1200, 'total_tokens': 2290, 'prompt_tokens_details': {'cached_tokens': 0, 'audio_tokens': 0}, 'completion_tokens_details': {'reasoning_tokens': 1200, 'audio_tokens': 0, 'accepted_prediction_tokens': 0, 'rejected_prediction_tokens': 0}}
+2025-10-15 19:41:34,453  INFO  SEO dump: {'seo_focus': 'bitcoin dominance', 'seo_slug': 'mit-brothers-trial-centers-on-bitcoin-dominance', 'seo_meta': 'MIT brothers’ Manhattan trial centers on bitcoin dominance as jurors assess an alleged 12-second exploit, planning, intent, and charges.'}
+2025-10-15 19:42:46,555  ERROR  OpenAI: empty/truncated content (finish_reason=length). Usage: {'prompt_tokens': 1077, 'completion_tokens': 1200, 'total_tokens': 2277, 'prompt_tokens_details': {'cached_tokens': 0, 'audio_tokens': 0}, 'completion_tokens_details': {'reasoning_tokens': 1200, 'audio_tokens': 0, 'accepted_prediction_tokens': 0, 'rejected_prediction_tokens': 0}}
+2025-10-15 19:43:09,182  INFO  SEO dump: {'seo_focus': 'bitcoin dominance', 'seo_slug': 'bitcoin-dominance-lightning-network-treasuries', 'seo_meta': 'Bitcoin dominance anchors treasury strategies on Lightning as capacity tops 10,000 BTC; B HODL and LQWD report routing-fee and yield outcomes.'}
+2025-10-15 19:43:50,985  ERROR  OpenAI: empty/truncated content (finish_reason=length). Usage: {'prompt_tokens': 1082, 'completion_tokens': 1200, 'total_tokens': 2282, 'prompt_tokens_details': {'cached_tokens': 0, 'audio_tokens': 0}, 'completion_tokens_details': {'reasoning_tokens': 1200, 'audio_tokens': 0, 'accepted_prediction_tokens': 0, 'rejected_prediction_tokens': 0}}
+2025-10-15 19:44:19,513  INFO  SEO dump: {'seo_focus': 'coinbase adds bnb to listing roadmap', 'seo_slug': 'coinbase-adds-bnb-to-listing-roadmap-standards', 'seo_meta': 'Coinbase adds BNB to listing roadmap amid debate on listing standards, launching The Blue Carpet and reaffirming zero listing fees as BNB ticks higher.'}
+2025-10-15 19:45:14,757  ERROR  OpenAI: empty/truncated content (finish_reason=length). Usage: {'prompt_tokens': 1085, 'completion_tokens': 1200, 'total_tokens': 2285, 'prompt_tokens_details': {'cached_tokens': 0, 'audio_tokens': 0}, 'completion_tokens_details': {'reasoning_tokens': 1200, 'audio_tokens': 0, 'accepted_prediction_tokens': 0, 'rejected_prediction_tokens': 0}}
+2025-10-15 19:45:31,890  INFO  SEO dump: {'seo_focus': 'bitcoin dominance', 'seo_slug': 'bitcoin-dominance-cme-solana-xrp-options-launch', 'seo_meta': 'Bitcoin dominance theme as CME launches CFTC-approved options on Solana and XRP futures, following strong demand for SOL and XRP futures in the U.S.'}
+2025-10-15 19:45:34,313  INFO  Finished processing news with GPT successfully.
+2025-10-15 19:45:34,313  INFO  Starting publish_news_to_wp job.
+2025-10-15 19:46:39,308  INFO  HTTP Request: POST https://api.openai.com/v1/images/generations "HTTP/1.1 200 OK"
+2025-10-15 19:48:13,750  INFO  HTTP Request: POST https://api.openai.com/v1/images/generations "HTTP/1.1 200 OK"
+2025-10-15 19:49:38,652  INFO  HTTP Request: POST https://api.openai.com/v1/images/generations "HTTP/1.1 200 OK"
+2025-10-15 19:50:06,290  INFO  Finished publishing news to WordPress successfully.
+2025-10-15 19:50:06,290  INFO  Job "chained_job (trigger: interval[0:30:00], next run at: 2025-10-15 20:09:12 CEST)" executed successfully
