@@ -1,4 +1,5 @@
 import base64
+import logging
 import mimetypes
 import os
 from datetime import datetime
@@ -10,9 +11,20 @@ from PIL import Image as PILImage
 from openai import OpenAI
 import hashlib, random, time
 from datetime import datetime, timedelta, timezone
-from config import DB_CONFIG, WP_DB_CONFIG, WP_API_URL, WP_USERNAME, WP_APP_PASSWORD, USE_API_IMAGES
-
-from config import DB_CONFIG, WP_DB_CONFIG, WP_API_URL, WP_USERNAME, WP_APP_PASSWORD
+from typing import Any
+from config import (
+    DB_CONFIG,
+    WP_DB_CONFIG,
+    WP_API_URL,
+    WP_USERNAME,
+    WP_APP_PASSWORD,
+    USE_API_IMAGES,
+    IMAGE_SOURCE_MODE,
+    OPENAI_IMAGE_FALLBACK,
+    STOCK_IMAGE_TIMEOUT_SECONDS,
+    PIPELINE_FRESH_START_AFTER_UTC_SQL,
+)
+from stock_images import StockImageCandidate, find_stock_image
 
 session = requests.Session()
 token = base64.b64encode(f"{WP_USERNAME}:{WP_APP_PASSWORD}".encode()).decode()
@@ -20,6 +32,8 @@ session.headers.update({
     "Authorization": f"Basic {token}",
     "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124 Safari/537.36"
 })
+
+logger = logging.getLogger(__name__)
 
 
 client = OpenAI(api_key=os.getenv("OPENAI_API_KEY"))
@@ -164,12 +178,14 @@ def _get_lock(conn, name: str, timeout: int = 1) -> bool:
             True if the lock was acquired, else False.
     """
     cur = conn.cursor()
-    cur.execute("SELECT GET_LOCK(%s,%s)", (name, timeout))
-    got = (cur.fetchone() or (0,))[0] == 1
-    cur.close()
+    try:
+        cur.execute("SELECT GET_LOCK(%s,%s)", (name, timeout))
+        got = (cur.fetchone() or (0,))[0] == 1
+    finally:
+        cur.close()
     return got
 
-def _release_lock(conn, name: str):
+def _release_lock(conn, name: str) -> bool:
     """
     Release a MySQL named lock (RELEASE_LOCK).
 
@@ -178,12 +194,22 @@ def _release_lock(conn, name: str):
         name: Lock name.
 
     Returns:
-        None
+        bool:
+            True if this connection released the lock, False otherwise.
     """
     cur = conn.cursor()
-    cur.execute("SELECT RELEASE_LOCK(%s)", (name,))
-    _ = cur.fetchone()
-    cur.close()
+    try:
+        cur.execute("SELECT RELEASE_LOCK(%s)", (name,))
+        released = (cur.fetchone() or (0,))[0]
+        return released == 1
+    finally:
+        cur.close()
+
+
+def _fresh_start_filter(alias: str = "c") -> tuple[str, tuple[str, ...]]:
+    if not PIPELINE_FRESH_START_AFTER_UTC_SQL:
+        return "", ()
+    return f" AND {alias}.insertDate >= %s", (PIPELINE_FRESH_START_AFTER_UTC_SQL,)
 
 def _count_due_now() -> int:
     """
@@ -202,8 +228,9 @@ def _count_due_now() -> int:
         int:
             Number of due items.
     """
+    fresh_start_clause, fresh_start_params = _fresh_start_filter("c")
     with mysql.connector.connect(**DB_CONFIG) as conn, conn.cursor() as cur:
-        cur.execute("""
+        cur.execute(f"""
             SELECT COUNT(*)
             FROM rich_crpytonews r
             JOIN cryptonewsapi c ON c.news_url = r.news_url
@@ -211,7 +238,8 @@ def _count_due_now() -> int:
               AND c.chosen_for_publish = 1
               AND c.scheduled_for IS NOT NULL
               AND c.scheduled_for <= UTC_TIMESTAMP()
-        """)
+              {fresh_start_clause}
+        """, fresh_start_params)
         return int((cur.fetchone() or (0,))[0])
     
 def _mood_from_title(title: str) -> str:
@@ -397,6 +425,86 @@ def _heroize_to_1536x1024(raw_bytes: bytes) -> str | None:
         return None
 
 
+def _cover_bytes_to_1536x1024(
+    raw_bytes: bytes,
+    *,
+    min_width: int = 640,
+    min_height: int = 360,
+) -> tuple[bytes, dict[str, Any]] | None:
+    """
+    Convert downloaded source/stock bytes into a 1536x1024 JPEG without distortion.
+    """
+    try:
+        img = PILImage.open(io.BytesIO(raw_bytes)).convert("RGB")
+        original_width, original_height = img.size
+        if original_width < min_width or original_height < min_height:
+            logger.info(
+                "[IMG] rejected tiny image dims=%sx%s min=%sx%s",
+                original_width,
+                original_height,
+                min_width,
+                min_height,
+            )
+            return None
+
+        ratio = original_width / max(original_height, 1)
+        if ratio < 1.0:
+            logger.info("[IMG] rejected portrait image dims=%sx%s", original_width, original_height)
+            return None
+
+        target_width, target_height = 1536, 1024
+        scale = max(target_width / original_width, target_height / original_height)
+        resized_width = max(target_width, int(round(original_width * scale)))
+        resized_height = max(target_height, int(round(original_height * scale)))
+        img = img.resize((resized_width, resized_height), PILImage.LANCZOS)
+
+        left = (resized_width - target_width) // 2
+        top = (resized_height - target_height) // 2
+        img = img.crop((left, top, left + target_width, top + target_height))
+
+        out = io.BytesIO()
+        img.save(out, format="JPEG", quality=90, optimize=True)
+        return out.getvalue(), {
+            "width": original_width,
+            "height": original_height,
+            "output_width": target_width,
+            "output_height": target_height,
+        }
+    except Exception:
+        logger.exception("[IMG] could not convert downloaded image to hero JPEG")
+        return None
+
+
+def _download_external_hero_image(url: str, provider: str) -> tuple[bytes, dict[str, Any]] | None:
+    """
+    Download an external image and convert it to the WordPress hero format.
+    """
+    try:
+        response = requests.get(
+            url,
+            timeout=STOCK_IMAGE_TIMEOUT_SECONDS,
+            headers={"User-Agent": "CryptoCourierImageSelector/1.0"},
+        )
+        response.raise_for_status()
+        converted = _cover_bytes_to_1536x1024(response.content)
+        if not converted:
+            logger.info("[IMG] %s image rejected after download url=%s", provider, url)
+            return None
+        content, dims = converted
+        logger.info(
+            "[IMG] %s image downloaded dims=%sx%s output=%sx%s",
+            provider,
+            dims.get("width"),
+            dims.get("height"),
+            dims.get("output_width"),
+            dims.get("output_height"),
+        )
+        return content, dims
+    except Exception:
+        logger.exception("[IMG] %s image download failed url=%s", provider, url)
+        return None
+
+
 def build_edit_prompt(title: str, hashtags: str) -> str:
     """
     Build a short, policy-safe prompt for image editing/restyling.
@@ -545,17 +653,13 @@ def _today_bounds_utc():
 
 def fetch_unpublished(limit: int = 10) -> list[dict]:
     """
-    Fetch unpublished items that are due now, with a fallback ranking query.
+    Fetch unpublished rich items that are due now.
 
     Primary query:
         - rich_crpytonews.published = 0
         - cryptonewsapi.chosen_for_publish = 1
         - cryptonewsapi.scheduled_for <= now (UTC)
         - ordered by scheduled_for ASC
-
-    Fallback (if primary yields none):
-        - any unpublished rich_crpytonews rows
-        - ordered by breaking/final_importance/publish_date (best-effort)
 
     Args:
         limit: Max rows to return.
@@ -565,9 +669,10 @@ def fetch_unpublished(limit: int = 10) -> list[dict]:
             List of rows (dicts) ready for publishing.
     """
 
+    fresh_start_clause, fresh_start_params = _fresh_start_filter("c")
     with mysql.connector.connect(**DB_CONFIG) as conn, conn.cursor(dictionary=True) as cur:
         cur.execute(
-            """
+            f"""
             SELECT r.*, c.scheduled_for, c.is_breaking
             FROM rich_crpytonews r
             JOIN cryptonewsapi c ON c.news_url = r.news_url
@@ -575,30 +680,17 @@ def fetch_unpublished(limit: int = 10) -> list[dict]:
               AND c.chosen_for_publish = 1
               AND c.scheduled_for IS NOT NULL
               AND c.scheduled_for <= UTC_TIMESTAMP()
+              {fresh_start_clause}
             ORDER BY c.scheduled_for ASC
             LIMIT %s
             """,
-            (limit,),  # ← this comma was missing
+            (*fresh_start_params, limit),
         )
         rows = cur.fetchall()
         if rows:
             return rows
 
-        # If you want *no* off-schedule posts, return [] here and delete the fallback block.
-        cur.execute(
-            """
-            SELECT r.*
-            FROM rich_crpytonews r
-            LEFT JOIN cryptonewsapi c ON c.news_url = r.news_url
-            WHERE r.published = 0
-            ORDER BY COALESCE(c.is_breaking, 0) DESC,
-                     COALESCE(c.final_importance, 0) DESC,
-                     r.publish_date DESC
-            LIMIT %s
-            """,
-            (limit,),
-        )
-        return cur.fetchall()
+        return []
 
 
 
@@ -808,7 +900,7 @@ def _post_with_retries(url: str, *, max_tries: int = 3, pause_s: int = 10, **kwa
                 raise
 
 
-def upload_image(url: str | None, title: str, hashtags: str, *, force_generate: bool | None = None) -> int | None:
+def _legacy_upload_image(url: str | None, title: str, hashtags: str, *, force_generate: bool | None = None) -> int | None:
     """
     Produce and upload a featured image to WordPress, returning the media id.
 
@@ -876,6 +968,237 @@ def upload_image(url: str | None, title: str, hashtags: str, *, force_generate: 
         return None
 
 
+def _read_temp_image(local_path: str) -> tuple[bytes, str]:
+    with open(local_path, "rb") as fh:
+        content = fh.read()
+    filename = os.path.basename(local_path)
+    try:
+        os.unlink(local_path)
+    except OSError:
+        pass
+    return content, filename
+
+
+def _openai_image_content(
+    url: str | None,
+    title: str,
+    hashtags: str,
+    *,
+    force_generate: bool,
+    fallback_used: bool,
+) -> tuple[bytes, str, dict[str, Any]] | None:
+    if not force_generate and url:
+        local = edit_image_from_url(url, title, hashtags)
+        if local:
+            content, filename = _read_temp_image(local)
+            logger.info("[IMG] provider selected=openai source=feed-edit fallback=%s", fallback_used)
+            return content, filename, {
+                "provider": "openai",
+                "query": "",
+                "score": None,
+                "credit_text": "",
+                "openai_fallback_used": fallback_used,
+            }
+
+    local = generate_image(title, hashtags)
+    if local:
+        content, filename = _read_temp_image(local)
+        logger.info("[IMG] provider selected=openai source=generated fallback=%s", fallback_used)
+        return content, filename, {
+            "provider": "openai",
+            "query": "",
+            "score": None,
+            "credit_text": "",
+            "openai_fallback_used": fallback_used,
+        }
+    return None
+
+
+def _source_image_content(url: str | None) -> tuple[bytes, str, dict[str, Any]] | None:
+    if not url:
+        return None
+    downloaded = _download_external_hero_image(url, "source")
+    if not downloaded:
+        logger.info("[IMG] source image rejected or unavailable")
+        return None
+    content, dims = downloaded
+    logger.info(
+        "[IMG] provider selected=source query=%r score=%.2f dims=%sx%s",
+        "",
+        1.0,
+        dims.get("width"),
+        dims.get("height"),
+    )
+    return content, "source-image.jpg", {
+        "provider": "source",
+        "query": "",
+        "score": 1.0,
+        "credit_text": "",
+        "openai_fallback_used": False,
+        "width": dims.get("width"),
+        "height": dims.get("height"),
+    }
+
+
+def _stock_image_content(article: dict[str, Any]) -> tuple[bytes, str, dict[str, Any]] | None:
+    providers: tuple[str, ...] = ("pexels", "pixabay")
+    candidate: StockImageCandidate | None = None
+
+    while providers:
+        candidate = find_stock_image(article, providers=providers)
+        if not candidate:
+            logger.info("[IMG] no stock image passed configured thresholds")
+            return None
+
+        downloaded = _download_external_hero_image(candidate.image_url, candidate.provider)
+        if downloaded:
+            break
+
+        logger.info(
+            "[IMG] accepted %s stock image could not be downloaded; trying next provider",
+            candidate.provider,
+        )
+        current_index = providers.index(candidate.provider)
+        providers = providers[current_index + 1 :]
+    else:
+        return None
+
+    content, dims = downloaded
+    logger.info(
+        "[IMG] provider selected=%s query=%r score=%.2f credit=%r dims=%sx%s",
+        candidate.provider,
+        candidate.query,
+        candidate.score,
+        candidate.credit_name,
+        dims.get("width"),
+        dims.get("height"),
+    )
+    return content, f"{candidate.provider}-stock-image.jpg", {
+        "provider": candidate.provider,
+        "query": candidate.query,
+        "score": candidate.score,
+        "threshold": candidate.threshold,
+        "credit_text": candidate.credit_text,
+        "credit_name": candidate.credit_name,
+        "credit_url": candidate.credit_url,
+        "openai_fallback_used": False,
+        "width": dims.get("width"),
+        "height": dims.get("height"),
+    }
+
+
+def upload_image(
+    url: str | None,
+    title: str,
+    hashtags: str,
+    *,
+    article: dict[str, Any] | None = None,
+    force_generate: bool | None = None,
+) -> tuple[int | None, dict[str, Any]]:
+    """
+    Select, prepare, and upload a featured image to WordPress.
+
+    Modes:
+        openai: current OpenAI edit/generation path only.
+        hybrid: source/feed image, Pexels, Pixabay, then OpenAI fallback.
+        stock: source/feed image, Pexels, Pixabay, with optional OpenAI fallback.
+        source: source/feed image, with optional OpenAI fallback.
+    """
+    if force_generate is None:
+        force_generate = (USE_API_IMAGES == 0)
+
+    mode = (IMAGE_SOURCE_MODE or "openai").strip().lower()
+    if mode not in {"openai", "hybrid", "stock", "source"}:
+        logger.warning("[IMG] unknown IMAGE_SOURCE_MODE=%r; using openai", mode)
+        mode = "openai"
+
+    image_meta: dict[str, Any] = {
+        "mode": mode,
+        "provider": None,
+        "query": "",
+        "score": None,
+        "credit_text": "",
+        "openai_fallback_used": False,
+    }
+    article_context = dict(article or {})
+    article_context.setdefault("title", title)
+    article_context.setdefault("hashtags", hashtags)
+
+    selected: tuple[bytes, str, dict[str, Any]] | None = None
+    logger.info("[IMG] image mode=%s title=%r", mode, title[:140])
+
+    if mode == "openai":
+        selected = _openai_image_content(
+            url,
+            title,
+            hashtags,
+            force_generate=force_generate,
+            fallback_used=False,
+        )
+    else:
+        selected = _source_image_content(url)
+        if not selected and mode in {"hybrid", "stock"}:
+            selected = _stock_image_content(article_context)
+
+        if not selected:
+            if OPENAI_IMAGE_FALLBACK:
+                logger.info("[IMG] using OpenAI image fallback mode=%s", mode)
+                selected = _openai_image_content(
+                    url,
+                    title,
+                    hashtags,
+                    force_generate=force_generate,
+                    fallback_used=True,
+                )
+            else:
+                logger.info("[IMG] OpenAI image fallback disabled mode=%s", mode)
+
+    if not selected:
+        print("No image available - posting without featured image.")
+        return None, image_meta
+
+    content, filename, selected_meta = selected
+    image_meta.update(selected_meta)
+
+    mime, _ = mimetypes.guess_type(filename or "image.jpg")
+    headers = {
+        "Content-Disposition": f"attachment; filename={filename or 'image.jpg'}",
+        "Content-Type": mime or "image/jpeg",
+    }
+    try:
+        media_resp = _post_with_retries(f"{API_BASE}/wp-json/wp/v2/media", headers=headers, data=content)
+        media_id = media_resp.json()["id"]
+        logger.info(
+            "[IMG] uploaded media_id=%s provider=%s mode=%s query=%r score=%s fallback=%s",
+            media_id,
+            image_meta.get("provider"),
+            mode,
+            image_meta.get("query"),
+            image_meta.get("score"),
+            image_meta.get("openai_fallback_used"),
+        )
+        return media_id, image_meta
+    except Exception as exc:
+        print(f"Upload failed for {filename}: {exc}")
+        return None, image_meta
+
+
+def set_media_details(
+    media_id: int,
+    alt_text: str,
+    *,
+    caption: str | None = None,
+    description: str | None = None,
+) -> None:
+    payload: dict[str, str] = {"alt_text": (alt_text or "")[:120]}
+    if caption:
+        payload["caption"] = caption[:500]
+    if description:
+        payload["description"] = description[:1000]
+    try:
+        session.post(f"{WP_API_URL}/wp-json/wp/v2/media/{media_id}", json=payload).raise_for_status()
+    except Exception as exc:
+        print(f"Could not set media details for media {media_id}: {exc}")
 
 
 def set_media_alt(media_id: int, alt_text: str) -> None:
@@ -982,11 +1305,26 @@ def publish_news_to_wp() -> None:
     """
     # single-run guard (prevents overlapping scheduler/API runs)
     lock_conn = None
+    lock_acquired = False
     try:
         lock_conn = mysql.connector.connect(**DB_CONFIG)
         if not _get_lock(lock_conn, "wp_publisher_lock", 1):
-            print("[WP] Another publisher instance is running; skipping.")
+            lock_holder = None
+            try:
+                cur_lock = lock_conn.cursor()
+                cur_lock.execute("SELECT IS_USED_LOCK(%s)", ("wp_publisher_lock",))
+                lock_holder = (cur_lock.fetchone() or (None,))[0]
+                cur_lock.close()
+            except Exception as exc:
+                print(f"[WP] Could not inspect advisory lock 'wp_publisher_lock': {exc}")
+            holder_suffix = f" (connection id={lock_holder})" if lock_holder else ""
+            print(f"[WP] MySQL advisory lock 'wp_publisher_lock' is held by another DB session{holder_suffix}; skipping.")
             return
+        lock_acquired = True
+        print("[WP] Acquired MySQL advisory lock 'wp_publisher_lock'.")
+
+        if PIPELINE_FRESH_START_AFTER_UTC_SQL:
+            print(f"[WP] Pipeline fresh-start cutoff active: cryptonewsapi.insertDate >= {PIPELINE_FRESH_START_AFTER_UTC_SQL}")
 
         due = _count_due_now()
         if due == 0:
@@ -1005,14 +1343,21 @@ def publish_news_to_wp() -> None:
 
         for item in news_items:
             # ---- image ----
-            featured_id = upload_image(
+            featured_id, image_meta = upload_image(
                 item.get("image_url"),
                 title=item["title"],
                 hashtags=item.get("hashtags", ""),
+                article=item,
             )
             meta_data = {}
             if featured_id:
-                set_media_alt(featured_id, item.get("seo_focus") or item["title"])
+                credit_text = image_meta.get("credit_text") or ""
+                set_media_details(
+                    featured_id,
+                    item.get("seo_focus") or item["title"],
+                    caption=credit_text or None,
+                    description=credit_text or None,
+                )
 
             # Rank Math meta keys (REST-exposed)
             meta_data["rank_math_focus_keyword"] = item.get("seo_focus", "")
@@ -1083,11 +1428,18 @@ def publish_news_to_wp() -> None:
 
     finally:
         try:
+            if lock_acquired:
+                if lock_conn and getattr(lock_conn, "is_connected", lambda: False)():
+                    if _release_lock(lock_conn, "wp_publisher_lock"):
+                        print("[WP] Released MySQL advisory lock 'wp_publisher_lock'.")
+                    else:
+                        print("[WP] RELEASE_LOCK('wp_publisher_lock') returned false; the lock may have already been released or lost with the DB connection.")
+                else:
+                    print("[WP] Could not release MySQL advisory lock 'wp_publisher_lock' because the owning DB connection is already closed.")
             if lock_conn and getattr(lock_conn, "is_connected", lambda: False)():
-                _release_lock(lock_conn, "wp_publisher_lock")
                 lock_conn.close()
-        except Exception:
-            pass
+        except Exception as exc:
+            print(f"[WP] Failed to release or close MySQL advisory lock connection for 'wp_publisher_lock': {exc}")
 
 
 

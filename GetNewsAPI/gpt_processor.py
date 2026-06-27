@@ -2,7 +2,7 @@
 import os, json, requests
 from datetime import datetime
 from db import get_db_connection
-from config import OPENAI_API_KEY
+from config import OPENAI_API_KEY, PIPELINE_FRESH_START_AFTER_UTC_SQL
 import time, random
 import requests
 from typing import Any, Dict
@@ -65,6 +65,10 @@ USE_WEB_SEARCH = 1
 REWRITE_TEMPERATURE = 1
 REWRITE_REASONING   = {"effort": "high"}
 REWRITE_VERBOSITY   = "low"   
+
+PROCESS_LOOKAHEAD_MINUTES = int(os.getenv("PROCESS_LOOKAHEAD_MINUTES", "40"))
+PROCESS_BATCH_MIN = int(os.getenv("PROCESS_BATCH_MIN", "3"))
+PROCESS_BATCH_MAX = int(os.getenv("PROCESS_BATCH_MAX", "12"))
 
 # -----------------------------------------------------------------------------
 GOOGLE_API_KEY = os.getenv("GOOGLE_API_KEY")   # <-- add this
@@ -140,15 +144,22 @@ def _count_due_within(minutes: int = 40) -> int:
         int:
             Count of due items.
     """
+    fresh_start_clause = ""
+    params: list[Any] = [minutes]
+    if PIPELINE_FRESH_START_AFTER_UTC_SQL:
+        fresh_start_clause = " AND insertDate >= %s"
+        params.append(PIPELINE_FRESH_START_AFTER_UTC_SQL)
+
     conn = get_db_connection(); cur = conn.cursor()
-    cur.execute("""
+    cur.execute(f"""
         SELECT COUNT(*)
         FROM cryptonewsapi
         WHERE processed = 0
           AND chosen_for_publish = 1
           AND scheduled_for IS NOT NULL
           AND scheduled_for <= DATE_ADD(UTC_TIMESTAMP(), INTERVAL %s MINUTE)
-    """, (minutes,))
+          {fresh_start_clause}
+    """, tuple(params))
     n = int((cur.fetchone() or (0,))[0])
     cur.close(); conn.close()
     return n
@@ -340,7 +351,9 @@ def call_openai(
     model: str,
     *,
     timeout_read: int = 300,
-    max_completion_tokens: int | None = 1200,
+    max_completion_tokens: int | None = 4096,
+    phase: str = "openai",
+    article_context: dict | None = None,
     **payload
 ) -> str:
     """
@@ -359,6 +372,8 @@ def call_openai(
         model: Model name to use.
         timeout_read: Read timeout seconds for the request.
         max_completion_tokens: Max output tokens; None disables setting it.
+        phase: Short processing phase label for diagnostics.
+        article_context: Optional article metadata to include in failure logs.
         **payload: Additional chat completions payload fields (messages, response_format, etc.).
 
     Returns:
@@ -384,13 +399,20 @@ def call_openai(
     payload["model"] = model
     payload["temperature"] = payload.get("temperature", REWRITE_TEMPERATURE)
     if model.startswith("gpt-5"):
-        payload.setdefault("reasoning_effort", "high")
+        payload.setdefault("reasoning_effort", "low")
         payload.setdefault("verbosity", REWRITE_VERBOSITY)
     if max_completion_tokens is not None:
         payload["max_completion_tokens"] = max_completion_tokens
 
     backoff = BASE_SLEEP
     did_minimal_fallback = False  # <- ensure we only nudge once
+    log_context = {
+        "phase": phase,
+        "model": model,
+        "article_id": (article_context or {}).get("id"),
+        "title": ((article_context or {}).get("title") or "")[:160],
+        "source": (article_context or {}).get("source_name"),
+    }
 
     for attempt in range(1, MAX_RETRIES + 1):
         try:
@@ -431,16 +453,24 @@ def call_openai(
 
             # If we hit output cap or got empty content, do a one-time fallback
             if (not content or not str(content).strip()) or (finish_reason == "length"):
-                logging.error("OpenAI: empty/truncated content (finish_reason=%s). Usage: %s", 
-                              finish_reason, data.get("usage"))
+                logging.error(
+                    "OpenAI empty/truncated content. context=%s finish_reason=%s "
+                    "max_completion_tokens=%s reasoning_effort=%s usage=%s",
+                    log_context,
+                    finish_reason,
+                    payload.get("max_completion_tokens"),
+                    payload.get("reasoning_effort"),
+                    data.get("usage"),
+                )
                 if not did_minimal_fallback and attempt < MAX_RETRIES:
                     did_minimal_fallback = True
                     # make the model spend fewer reasoning tokens and allow more output
-                    payload["reasoning_effort"] = "minimal"
+                    payload["reasoning_effort"] = "low"
                     payload["verbosity"] = "low"
                     # bump output budget (within your account’s per-call limits)
-                    new_cap = max(int(payload.get("max_completion_tokens", 1200) * 1.6), 1800)
-                    payload["max_completion_tokens"] = min(new_cap, 4096)  # cap it sensibly
+                    current_cap = int(payload.get("max_completion_tokens") or 0)
+                    new_cap = max(current_cap * 2, 4096)
+                    payload["max_completion_tokens"] = min(new_cap, 8192)
 
                     # optional nudge so it goes straight to JSON
                     if isinstance(payload.get("messages"), list):
@@ -449,11 +479,18 @@ def call_openai(
                                                           "Return ONLY the final JSON object now—no commentary."}
                         ]
 
+                    logging.warning(
+                        "Retrying OpenAI generation after truncation. context=%s "
+                        "max_completion_tokens=%s reasoning_effort=%s",
+                        log_context,
+                        payload.get("max_completion_tokens"),
+                        payload.get("reasoning_effort"),
+                    )
                     sleep = backoff + random.uniform(0, 1)
                     time.sleep(sleep); backoff *= 1.8
                     continue  # retry with leaner settings
                 # already tried the fallback → hard fail so caller can handle
-                raise RuntimeError("OpenAI: empty content after fallback")
+                raise RuntimeError(f"OpenAI: empty/truncated content after fallback ({log_context})")
 
             return content
             # ----------------------------------------------------------------
@@ -709,8 +746,10 @@ def classify_and_rewrite(article: dict, extra_context: str, video_url: str = "")
         messages=chat,
         response_format={"type": "json_object"},
         timeout_read=300,
-        max_completion_tokens=1800,           # give room for JSON
-        reasoning_effort="minimal",           # <<< important
+        max_completion_tokens=4096,           # give room for JSON plus GPT-5 reasoning
+        phase="rewrite",
+        article_context=article,
+        reasoning_effort="low",           # <<< important
         verbosity="low"                       # helps keep output concise
     )
 
@@ -887,7 +926,7 @@ def repair_if_needed(original_article: dict, extra_context: str, doc: dict) -> d
         - If all checks pass, returns doc unchanged
         - Otherwise asks the model to fix ONLY:
             full_text, and if needed title/seo_meta/seo_slug/image_alt
-        - Returns fixed JSON on success; on failure returns original doc.
+        - Returns fixed JSON on success; on failure raises so the article remains retryable.
 
     Args:
         original_article: Original API item dict (context only; not always used directly here).
@@ -896,7 +935,7 @@ def repair_if_needed(original_article: dict, extra_context: str, doc: dict) -> d
 
     Returns:
         dict:
-            Repaired doc if repair succeeds, else the original doc.
+            Repaired doc if repair succeeds, else the original doc when no repair is needed.
     """
 
     status = validate_readability_and_seo(doc)
@@ -930,13 +969,23 @@ def repair_if_needed(original_article: dict, extra_context: str, doc: dict) -> d
             REWRITE_MODEL,
             messages=chat,
             response_format={"type": "json_object"},
-            timeout_read=100
+            timeout_read=100,
+            max_completion_tokens=4096,
+            phase="repair",
+            article_context=original_article,
+            reasoning_effort="low",
+            verbosity="low"
         )
         fixed = json.loads(raw)
         return fixed
-    except Exception as e:
-        logging.warning("Repair failed, keeping original draft: %s", e)
-        return doc
+    except Exception:
+        logging.exception(
+            "Repair failed; article will remain retryable. article_id=%s title=%r source=%r",
+            original_article.get("id"),
+            original_article.get("title"),
+            original_article.get("source_name"),
+        )
+        raise
 
 
 def _fallback_meta(full_html: str, focus: str) -> str:
@@ -1088,6 +1137,41 @@ def mark_processed(news_url: str):
     conn.commit()
     cur.close(); conn.close()
 
+def validate_rewritten_article(doc: dict, raw: dict) -> None:
+    """
+    Ensure a generated article has the fields required before it is stored.
+
+    Args:
+        doc: Rewritten article JSON from OpenAI.
+        raw: Source DB row used only for diagnostic context.
+
+    Raises:
+        ValueError:
+            If required fields are missing or empty.
+    """
+    required = (
+        "title",
+        "full_text",
+        "category",
+        "hashtags",
+        "sentiment",
+        "seo_focus",
+        "seo_slug",
+        "seo_meta",
+        "image_alt",
+    )
+    missing = [key for key in required if doc.get(key) in (None, "")]
+    if missing:
+        raise ValueError(
+            "Generated article missing required fields "
+            f"{missing}; article_id={raw.get('id')} title={raw.get('title')!r}"
+        )
+    if not str(doc.get("full_text", "")).strip():
+        raise ValueError(
+            "Generated article has empty full_text; "
+            f"article_id={raw.get('id')} title={raw.get('title')!r}"
+        )
+
 def process_one(raw):
     """
     Process a single raw cryptonewsapi row through the GPT enrichment pipeline.
@@ -1106,7 +1190,8 @@ def process_one(raw):
         raw: DB row dict from cryptonewsapi (expects at least title/text/news_url/type fields).
 
     Returns:
-        None
+        bool:
+            True when the article was stored and marked processed, False otherwise.
     """
     try:
         extra = enrich_with_search(raw)
@@ -1122,11 +1207,19 @@ def process_one(raw):
         if video_url and video_url not in final_doc.get("full_text", ""):
             final_doc["full_text"] = re.sub(r"</p>", f"</p>\n<p>{video_url}</p>", final_doc["full_text"], count=1, flags=re.I)
 
+        validate_rewritten_article(final_doc, raw)
         logging.info("SEO dump: %s", {k: final_doc[k] for k in ("seo_focus","seo_slug","seo_meta")})
         store_rich_news(final_doc, raw)     # ✅ store first
         mark_processed(raw["news_url"])     # ✅ then mark processed
-    except Exception as exc:
-        print("⚠️ GPT pipeline failed:", exc)
+        return True
+    except Exception:
+        logging.exception(
+            "GPT pipeline failed; article remains retryable. article_id=%s title=%r source=%r",
+            raw.get("id"),
+            raw.get("title"),
+            raw.get("source_name"),
+        )
+        return False
 
 
 
@@ -1137,12 +1230,13 @@ def process_news_with_gpt(batch_size: int | None = None):
     Process a batch of due articles from cryptonewsapi into rich_crpytonews.
 
     Batch sizing:
-        - If batch_size is None, derives it from _count_due_within(40),
-          clamped to [3..12].
+        - If batch_size is None, derives it from PROCESS_LOOKAHEAD_MINUTES,
+          clamped to [PROCESS_BATCH_MIN..PROCESS_BATCH_MAX].
 
     Selection:
         - processed = 0
         - chosen_for_publish = 1
+        - when batch_size is auto-derived, scheduled within PROCESS_LOOKAHEAD_MINUTES
         - ordered by scheduled_for ASC, selected_at ASC
         - limited to batch_size
 
@@ -1152,28 +1246,66 @@ def process_news_with_gpt(batch_size: int | None = None):
         batch_size: Optional explicit batch size override.
 
     Returns:
-        None
+        dict:
+            Processing counters with attempted, succeeded, and failed counts.
     """
     
-    if batch_size is None:
-        # at least 3, at most 12 this run
-        batch_size = max(3, min(12, _count_due_within(40)))
+    use_lookahead_filter = batch_size is None
+    if use_lookahead_filter:
+        batch_size = max(
+            PROCESS_BATCH_MIN,
+            min(PROCESS_BATCH_MAX, _count_due_within(PROCESS_LOOKAHEAD_MINUTES)),
+        )
+
+    fresh_start_clause = ""
+    lookahead_clause = ""
+    params: list[Any] = []
+    if PIPELINE_FRESH_START_AFTER_UTC_SQL:
+        logging.info(
+            "Pipeline fresh-start cutoff active for processing: cryptonewsapi.insertDate >= %s",
+            PIPELINE_FRESH_START_AFTER_UTC_SQL,
+        )
+        fresh_start_clause = " AND insertDate >= %s"
+        params.append(PIPELINE_FRESH_START_AFTER_UTC_SQL)
+    if use_lookahead_filter:
+        lookahead_clause = """
+          AND scheduled_for IS NOT NULL
+          AND scheduled_for <= DATE_ADD(UTC_TIMESTAMP(), INTERVAL %s MINUTE)
+        """
+        params.append(PROCESS_LOOKAHEAD_MINUTES)
+    params.append(batch_size)
 
     conn = get_db_connection()
     cur  = conn.cursor(dictionary=True)
-    cur.execute("""
+    cur.execute(f"""
         SELECT *
         FROM cryptonewsapi
         WHERE processed = 0
           AND chosen_for_publish = 1
+          {fresh_start_clause}
+          {lookahead_clause}
         ORDER BY scheduled_for ASC, selected_at ASC
         LIMIT %s
-    """, (batch_size,))
+    """, tuple(params))
     articles = cur.fetchall()
     cur.close(); conn.close()
 
+    attempted = len(articles)
+    succeeded = 0
+    failed = 0
+
     for art in articles:
-        process_one(art)
+        if process_one(art):
+            succeeded += 1
+        else:
+            failed += 1
+
+    result = {"attempted": attempted, "succeeded": succeeded, "failed": failed}
+    if failed:
+        logging.warning("GPT processing completed with failures: %s", result)
+    else:
+        logging.info("GPT processing completed: %s", result)
+    return result
 
 
 

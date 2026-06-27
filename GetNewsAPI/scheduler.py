@@ -46,17 +46,27 @@ def chained_job():
     logging.info("▶ starting chained job")
     logging.info("Starting process_news_with_gpt job.")
     try:
-        process_news_with_gpt()
-        logging.info("Finished processing news with GPT successfully.")
-    except Exception as e:
-        logging.error("Error during process_news_with_gpt: %s", e)
+        result = process_news_with_gpt()
+        attempted = int((result or {}).get("attempted", 0))
+        succeeded = int((result or {}).get("succeeded", 0))
+        failed = int((result or {}).get("failed", 0))
+        if attempted == 0:
+            logging.info("Finished processing news with GPT: no eligible articles.")
+        elif failed == 0:
+            logging.info("Finished processing news with GPT successfully: %s", result)
+        elif succeeded == 0:
+            logging.error("Finished processing news with GPT: all attempted articles failed: %s", result)
+        else:
+            logging.warning("Finished processing news with GPT with partial failures: %s", result)
+    except Exception:
+        logging.exception("Error during process_news_with_gpt")
 
     logging.info("Starting publish_news_to_wp job.")
     try:
         publish_news_to_wp()
         logging.info("Finished publishing news to WordPress successfully.")
-    except Exception as e:
-        logging.error("Error during publish_news_to_wp: %s", e)
+    except Exception:
+        logging.exception("Error during publish_news_to_wp")
 
         
 def start_scheduler():

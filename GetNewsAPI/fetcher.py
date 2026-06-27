@@ -34,7 +34,8 @@ TARGET_MAX = 18
 BREAKING_RESERVE = 3                   # up to +3 if breaking
 BACKLOG_TTL_HOURS = 36                 # keep candidates fresh up to 36h
 
-POOL_SIZE         = 10         # only keep this many candidates per pull
+POOL_SIZE         = int(os.getenv("FETCH_POOL_SIZE", "10"))  # candidates retained per pull
+FETCH_SCORE_LIMIT = int(os.getenv("FETCH_SCORE_LIMIT", str(POOL_SIZE)))
 PROCESS_PER_CYCLE = 3    
 ALLOW_VIDEO = False
 # Pull knobs
@@ -396,12 +397,14 @@ def _get_lock(conn, name: str, timeout: int = 1) -> bool:
     """
 
     cur = conn.cursor()
-    cur.execute("SELECT GET_LOCK(%s,%s)", (name, timeout))
-    got = (cur.fetchone() or (0,))[0] == 1
-    cur.close()
+    try:
+        cur.execute("SELECT GET_LOCK(%s,%s)", (name, timeout))
+        got = (cur.fetchone() or (0,))[0] == 1
+    finally:
+        cur.close()
     return got
 
-def _release_lock(conn, name: str):
+def _release_lock(conn, name: str) -> bool:
     """
     Release a named MySQL advisory lock using RELEASE_LOCK.
 
@@ -410,12 +413,16 @@ def _release_lock(conn, name: str):
         name: Lock name string.
 
     Returns:
-        None
+        bool:
+            True if this connection released the lock, False otherwise.
     """
     cur = conn.cursor()
-    cur.execute("SELECT RELEASE_LOCK(%s)", (name,))
-    _ = cur.fetchone()
-    cur.close()
+    try:
+        cur.execute("SELECT RELEASE_LOCK(%s)", (name,))
+        released = (cur.fetchone() or (0,))[0]
+        return released == 1
+    finally:
+        cur.close()
 
 
 
@@ -569,7 +576,7 @@ def _openai_chat(payload: Dict[str, Any]) -> Dict[str, Any]:
 
     # if using GPT-5 in Chat Completions, set minimal effort for speed
     if payload.get("model", "").startswith("gpt-5-mini"):
-        payload.setdefault("reasoning_effort", "minimal")
+        payload.setdefault("reasoning_effort", "low")
         payload.setdefault("temperature", 0.7)
 
     r = _session.post(url, headers=headers, json=payload, timeout=60)
@@ -1165,15 +1172,27 @@ def run_fetch_cycle():
     try:
         conn = get_db_connection()
         if not _get_lock(conn, "news_fetcher_lock", 1):
+            lock_holder = None
+            try:
+                cur_lock = conn.cursor()
+                cur_lock.execute("SELECT IS_USED_LOCK(%s)", ("news_fetcher_lock",))
+                lock_holder = (cur_lock.fetchone() or (None,))[0]
+                cur_lock.close()
+            except Exception:
+                logging.exception("[FETCH] Could not inspect advisory lock news_fetcher_lock")
             # another instance is already running
             try:
                 if conn:
                     conn.close()
             except Exception:
                 pass
-            logging.info("[FETCH] Another fetcher instance is running; skipping.")
+            logging.info(
+                "[FETCH] MySQL advisory lock 'news_fetcher_lock' is held by another DB session%s; skipping.",
+                f" (connection id={lock_holder})" if lock_holder else "",
+            )
             return
         lock_acquired = True
+        logging.info("[FETCH] Acquired MySQL advisory lock 'news_fetcher_lock'.")
 
         batch_id = hashlib.sha1(os.urandom(8)).hexdigest()[:22]
         now_utc = datetime.utcnow().replace(tzinfo=timezone.utc)
@@ -1195,7 +1214,7 @@ def run_fetch_cycle():
             WHERE fetch_batch_id = %s
             ORDER BY publish_date DESC
             LIMIT %s
-        """, (batch_id, min(20, POOL_SIZE)))
+        """, (batch_id, min(FETCH_SCORE_LIMIT, POOL_SIZE)))
         rows = cur2.fetchall()
         cur2.close()
         conn2.close(); conn2 = None
@@ -1235,10 +1254,22 @@ def run_fetch_cycle():
 
         # only try to RELEASE_LOCK if we actually hold it and the connection is alive
         try:
-            if lock_acquired and conn and getattr(conn, "is_connected", lambda: False)():
-                _release_lock(conn, "news_fetcher_lock")
-        except Exception as e:
-            logging.warning("Lock release skipped: %s", e)
+            if lock_acquired:
+                if conn and getattr(conn, "is_connected", lambda: False)():
+                    if _release_lock(conn, "news_fetcher_lock"):
+                        logging.info("[FETCH] Released MySQL advisory lock 'news_fetcher_lock'.")
+                    else:
+                        logging.warning(
+                            "[FETCH] RELEASE_LOCK('news_fetcher_lock') returned false; "
+                            "the lock may have already been released or lost with the DB connection."
+                        )
+                else:
+                    logging.warning(
+                        "[FETCH] Could not release MySQL advisory lock 'news_fetcher_lock' "
+                        "because the owning DB connection is already closed."
+                    )
+        except Exception:
+            logging.exception("[FETCH] Failed to release MySQL advisory lock 'news_fetcher_lock'")
 
         # always try to close the primary connection
         try:

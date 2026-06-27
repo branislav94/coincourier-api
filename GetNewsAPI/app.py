@@ -1,8 +1,9 @@
+import logging
 from flask import Flask, jsonify
 from db import get_db_connection
 from scheduler import start_scheduler
 from publish_to_wp import publish_news_to_wp
-from dotenv import load_dotenv
+from config import ENABLE_APSCHEDULER, FLASK_DEBUG, PIPELINE_FRESH_START_AFTER_UTC_SQL
 
 
 app = Flask(__name__)
@@ -24,5 +25,14 @@ def get_stored_news():
     return jsonify(rows)
 # Bane da ga duva
 if __name__ == '__main__':
-    start_scheduler()
-    app.run(debug=True, use_reloader=False, host="0.0.0.0", port=500)
+    logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
+    if PIPELINE_FRESH_START_AFTER_UTC_SQL:
+        logging.info("Pipeline fresh-start mode active after UTC %s", PIPELINE_FRESH_START_AFTER_UTC_SQL)
+
+    if ENABLE_APSCHEDULER:
+        logging.info("APScheduler enabled")
+        start_scheduler()
+    else:
+        logging.info("APScheduler disabled by ENABLE_APSCHEDULER=false")
+
+    app.run(debug=FLASK_DEBUG, use_reloader=False, host="0.0.0.0", port=500)

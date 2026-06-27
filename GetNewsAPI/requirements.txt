@@ -3,4 +3,5 @@ python-dotenv
 mysql-connector-python
 apscheduler
 requests
-debugpy
+Pillow
+openai

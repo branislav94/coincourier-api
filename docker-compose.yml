@@ -1,22 +1,17 @@
-version: '3.8'
-
 services:
   getnewsapi:
     build:
       context: .
       dockerfile: Dockerfile
     container_name: getnewsapi
-    restart: unless-stopped
+    env_file:
+      - .env
+    environment:
+      PYTHONUNBUFFERED: "1"
+      TZ: Europe/Belgrade
+    ports:
+      - "5001:5000"
     volumes:
       - ./GetNewsAPI:/app
-    environment:
-      - PYTHONUNBUFFERED=1
-    depends_on:
-      - wordpress
-    ports:
-      - "5001:5001"  # 👈 map to 5001 on host
-    command:
-      python app.py
-
-
-
+    restart: unless-stopped
+    command: python app.py
