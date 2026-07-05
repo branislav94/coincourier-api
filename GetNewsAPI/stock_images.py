@@ -7,9 +7,11 @@ import os
 import re
 import time
 from dataclasses import dataclass, field
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any
 
+import mysql.connector
 import requests
 
 from config import (
@@ -24,7 +26,11 @@ from config import (
     PIXABAY_ORIENTATION,
     PIXABAY_PER_PAGE,
     STOCK_IMAGE_CACHE_HOURS,
+    STOCK_IMAGE_REUSE_CHECK_WP_HISTORY,
+    STOCK_IMAGE_REUSE_WINDOW_DAYS,
     STOCK_IMAGE_TIMEOUT_SECONDS,
+    STOCK_IMAGE_USAGE_PATH,
+    WP_DB_CONFIG,
 )
 
 
@@ -113,8 +119,19 @@ class StockImageCandidate:
     height: int | None = None
     credit_name: str = ""
     credit_url: str = ""
+    provider_asset_id: str = ""
+    asset_key: str = ""
     metadata_text: str = ""
     score_parts: dict[str, float] = field(default_factory=dict)
+
+    def __post_init__(self) -> None:
+        if self.asset_key:
+            return
+        if self.provider_asset_id:
+            self.asset_key = f"{self.provider}:{self.provider_asset_id}"
+            return
+        image_hash = hashlib.sha256((self.image_url or self.credit_url or "").encode("utf-8")).hexdigest()
+        self.asset_key = f"{self.provider}:url:{image_hash}"
 
     @property
     def credit_text(self) -> str:
@@ -200,6 +217,188 @@ def build_stock_queries(article: dict[str, Any]) -> list[str]:
 
 def _cache_root() -> Path:
     return Path(os.getenv("STOCK_IMAGE_CACHE_DIR", "/app/cache/stock_images"))
+
+
+def _usage_path() -> Path:
+    return Path(STOCK_IMAGE_USAGE_PATH)
+
+
+def _utc_now() -> datetime:
+    return datetime.now(timezone.utc).replace(microsecond=0)
+
+
+def _parse_used_at(value: str | None) -> datetime | None:
+    if not value:
+        return None
+    try:
+        parsed = datetime.fromisoformat(value.replace("Z", "+00:00"))
+        if parsed.tzinfo is None:
+            parsed = parsed.replace(tzinfo=timezone.utc)
+        return parsed.astimezone(timezone.utc)
+    except ValueError:
+        return None
+
+
+def _age_days(used_at: datetime) -> int:
+    return max(0, (_utc_now() - used_at).days)
+
+
+def _image_url_hash(image_url: str | None) -> str:
+    return hashlib.sha256((image_url or "").encode("utf-8")).hexdigest()
+
+
+def prune_stock_image_usage(entries: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    cutoff = _utc_now() - timedelta(days=STOCK_IMAGE_REUSE_WINDOW_DAYS)
+    fresh: list[dict[str, Any]] = []
+    for entry in entries:
+        used_at = _parse_used_at(str(entry.get("used_at") or ""))
+        if used_at and used_at >= cutoff:
+            fresh.append(entry)
+    return fresh
+
+
+def load_stock_image_usage() -> list[dict[str, Any]]:
+    path = _usage_path()
+    try:
+        if not path.exists():
+            return []
+        payload = json.loads(path.read_text(encoding="utf-8"))
+        if not isinstance(payload, list):
+            return []
+        return prune_stock_image_usage([entry for entry in payload if isinstance(entry, dict)])
+    except Exception:
+        logger.exception("[IMG] stock_image_usage read failed path=%s", path)
+        return []
+
+
+def _write_stock_image_usage(entries: list[dict[str, Any]]) -> None:
+    path = _usage_path()
+    try:
+        path.parent.mkdir(parents=True, exist_ok=True)
+        tmp_path = path.with_suffix(path.suffix + ".tmp")
+        tmp_path.write_text(json.dumps(entries, ensure_ascii=True, indent=2), encoding="utf-8")
+        tmp_path.replace(path)
+    except Exception:
+        logger.exception("[IMG] stock_image_usage write failed path=%s", path)
+
+
+def record_stock_image_usage(meta: dict[str, Any], post_id: int, title: str) -> None:
+    provider = str(meta.get("provider") or "").lower()
+    if provider not in {"pexels", "pixabay"}:
+        return
+    entry = {
+        "provider": provider,
+        "asset_key": meta.get("asset_key") or "",
+        "provider_asset_id": meta.get("provider_asset_id") or "",
+        "image_url_hash": meta.get("image_url_hash") or "",
+        "credit_url": meta.get("credit_url") or "",
+        "credit_name": meta.get("credit_name") or "",
+        "query": meta.get("query") or "",
+        "score": meta.get("score"),
+        "post_id": post_id,
+        "title": title,
+        "used_at": _utc_now().isoformat().replace("+00:00", "Z"),
+    }
+    entries = prune_stock_image_usage(load_stock_image_usage())
+    entries.append(entry)
+    _write_stock_image_usage(entries)
+    logger.info(
+        "[IMG] recorded stock image usage provider=%s asset_key=%s post_id=%s",
+        provider,
+        entry["asset_key"],
+        post_id,
+    )
+
+
+def _get_wp_prefix(conn) -> str:
+    cur = conn.cursor()
+    try:
+        cur.execute(
+            """
+            SELECT table_name
+            FROM information_schema.tables
+            WHERE table_schema = DATABASE()
+              AND table_name LIKE %s
+            LIMIT 1
+            """,
+            ("%options",),
+        )
+        row = cur.fetchone()
+        return row[0].replace("options", "") if row else "wp_"
+    finally:
+        cur.close()
+
+
+def load_recent_wp_stock_usage() -> list[dict[str, Any]]:
+    if not STOCK_IMAGE_REUSE_CHECK_WP_HISTORY:
+        return []
+    cutoff = (_utc_now() - timedelta(days=STOCK_IMAGE_REUSE_WINDOW_DAYS)).strftime("%Y-%m-%d %H:%M:%S")
+    try:
+        with mysql.connector.connect(**WP_DB_CONFIG) as conn:
+            prefix = _get_wp_prefix(conn)
+            posts_table = f"`{prefix}posts`"
+            cur = conn.cursor(dictionary=True)
+            try:
+                cur.execute(
+                    f"""
+                    SELECT ID, post_date_gmt, post_excerpt, post_content, guid
+                    FROM {posts_table}
+                    WHERE post_type = 'attachment'
+                      AND post_date_gmt >= %s
+                    """,
+                    (cutoff,),
+                )
+                return list(cur.fetchall())
+            finally:
+                cur.close()
+    except Exception:
+        logger.warning("[IMG] WP-history stock image reuse check failed; using local stock_image_usage only", exc_info=True)
+        return []
+
+
+def _candidate_recent_local_usage(
+    candidate: StockImageCandidate,
+    local_usage: list[dict[str, Any]],
+) -> tuple[dict[str, Any], int] | None:
+    for entry in local_usage:
+        used_at = _parse_used_at(str(entry.get("used_at") or ""))
+        if not used_at:
+            continue
+        if entry.get("asset_key") and entry.get("asset_key") == candidate.asset_key:
+            return entry, _age_days(used_at)
+        if candidate.credit_url and entry.get("credit_url") == candidate.credit_url:
+            return entry, _age_days(used_at)
+        if entry.get("image_url_hash") and entry.get("image_url_hash") == _image_url_hash(candidate.image_url):
+            return entry, _age_days(used_at)
+    return None
+
+
+def _candidate_recent_wp_usage(
+    candidate: StockImageCandidate,
+    recent_wp_usage: list[dict[str, Any]],
+) -> tuple[dict[str, Any], int] | None:
+    terms = [
+        candidate.credit_url,
+        candidate.provider_asset_id,
+        candidate.image_url,
+    ]
+    terms = [str(term) for term in terms if term]
+    for row in recent_wp_usage:
+        blob = " ".join(
+            str(row.get(key) or "")
+            for key in ("post_excerpt", "post_content", "guid")
+        )
+        if not blob:
+            continue
+        if any(term in blob for term in terms):
+            used_at = row.get("post_date_gmt")
+            if isinstance(used_at, datetime):
+                if used_at.tzinfo is None:
+                    used_at = used_at.replace(tzinfo=timezone.utc)
+                return row, _age_days(used_at.astimezone(timezone.utc))
+            parsed = _parse_used_at(str(used_at or ""))
+            return row, _age_days(parsed) if parsed else 0
+    return None
 
 
 def _cache_path(provider: str, query: str) -> Path:
@@ -386,6 +585,7 @@ def _pexels_candidates(query: str, article: dict[str, Any]) -> list[StockImageCa
                 height=photo.get("height"),
                 credit_name=str(photo.get("photographer") or ""),
                 credit_url=str(photo.get("url") or ""),
+                provider_asset_id=str(photo.get("id") or ""),
                 metadata_text=metadata_text,
                 score_parts=parts,
             )
@@ -440,6 +640,7 @@ def _pixabay_candidates(query: str, article: dict[str, Any]) -> list[StockImageC
                 height=hit.get("imageHeight"),
                 credit_name=str(hit.get("user") or ""),
                 credit_url=str(hit.get("pageURL") or ""),
+                provider_asset_id=str(hit.get("id") or ""),
                 metadata_text=metadata_text,
                 score_parts=parts,
             )
@@ -447,7 +648,14 @@ def _pixabay_candidates(query: str, article: dict[str, Any]) -> list[StockImageC
     return candidates
 
 
-def _best_for_provider(provider: str, article: dict[str, Any], queries: list[str]) -> StockImageCandidate | None:
+def _best_for_provider(
+    provider: str,
+    article: dict[str, Any],
+    queries: list[str],
+    *,
+    local_usage: list[dict[str, Any]],
+    recent_wp_usage: list[dict[str, Any]],
+) -> StockImageCandidate | None:
     search_fn = _pexels_candidates if provider == "pexels" else _pixabay_candidates
     best: StockImageCandidate | None = None
 
@@ -456,12 +664,58 @@ def _best_for_provider(provider: str, article: dict[str, Any], queries: list[str
         if not candidates:
             logger.info("[IMG] %s returned no stock candidates query=%r", provider, query)
             continue
-        candidate = candidates[0]
-        if not best or candidate.score > best.score:
-            best = candidate
-        if candidate.score >= candidate.threshold:
+        for candidate in candidates:
+            if not best or candidate.score > best.score:
+                best = candidate
+            if candidate.score < candidate.threshold:
+                logger.info(
+                    "[IMG] provider=%s rejected query=%r score=%.2f threshold=%.2f reason=%s dims=%sx%s parts=%s",
+                    provider,
+                    candidate.query,
+                    candidate.score,
+                    candidate.threshold,
+                    candidate.rejection_reason,
+                    candidate.width,
+                    candidate.height,
+                    candidate.score_parts,
+                )
+                break
+
+            recent_local = _candidate_recent_local_usage(candidate, local_usage)
+            if recent_local:
+                _entry, age_days = recent_local
+                logger.info(
+                    "[IMG] provider=%s skipped recently used stock image asset_key=%s age_days=%s query=%r score=%.2f",
+                    provider,
+                    candidate.asset_key,
+                    age_days,
+                    candidate.query,
+                    candidate.score,
+                )
+                continue
+
+            recent_wp = _candidate_recent_wp_usage(candidate, recent_wp_usage)
+            if recent_wp:
+                _row, age_days = recent_wp
+                logger.info(
+                    "[IMG] provider=%s skipped WP-history stock image credit_url=%s age_days=%s query=%r score=%.2f",
+                    provider,
+                    candidate.credit_url,
+                    age_days,
+                    candidate.query,
+                    candidate.score,
+                )
+                continue
+
             logger.info(
-                "[IMG] %s accepted query=%r score=%.2f threshold=%.2f dims=%sx%s credit=%r parts=%s",
+                "[IMG] provider=%s selected fresh stock image asset_key=%s query=%r score=%.2f",
+                provider,
+                candidate.asset_key,
+                candidate.query,
+                candidate.score,
+            )
+            logger.info(
+                "[IMG] provider=%s accepted query=%r score=%.2f threshold=%.2f dims=%sx%s credit=%r parts=%s",
                 provider,
                 candidate.query,
                 candidate.score,
@@ -472,21 +726,10 @@ def _best_for_provider(provider: str, article: dict[str, Any], queries: list[str
                 candidate.score_parts,
             )
             return candidate
-        logger.info(
-            "[IMG] %s rejected query=%r score=%.2f threshold=%.2f reason=%s dims=%sx%s parts=%s",
-            provider,
-            candidate.query,
-            candidate.score,
-            candidate.threshold,
-            candidate.rejection_reason,
-            candidate.width,
-            candidate.height,
-            candidate.score_parts,
-        )
 
     if best:
         logger.info(
-            "[IMG] %s no accepted stock image; best query=%r score=%.2f threshold=%.2f reason=%s",
+            "[IMG] provider=%s rejected best_query=%r score=%.2f threshold=%.2f reason=%s",
             provider,
             best.query,
             best.score,
@@ -502,8 +745,16 @@ def find_stock_image(
 ) -> StockImageCandidate | None:
     queries = build_stock_queries(article)
     logger.info("[IMG] stock queries=%s", queries)
+    local_usage = load_stock_image_usage()
+    recent_wp_usage = load_recent_wp_stock_usage()
     for provider in providers:
-        candidate = _best_for_provider(provider, article, queries)
+        candidate = _best_for_provider(
+            provider,
+            article,
+            queries,
+            local_usage=local_usage,
+            recent_wp_usage=recent_wp_usage,
+        )
         if candidate:
             return candidate
     return None

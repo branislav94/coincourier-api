@@ -2,7 +2,21 @@
 import os, json, requests
 from datetime import datetime
 from db import get_db_connection
-from config import OPENAI_API_KEY, PIPELINE_FRESH_START_AFTER_UTC_SQL
+from openai import OpenAI
+from config import (
+    GROK_API_KEY,
+    GROK_BASE_URL,
+    GROK_MAX_OUTPUT_TOKENS,
+    GROK_TEXT_MODEL,
+    LLM_FALLBACK_PROVIDER,
+    OPENAI_API_KEY,
+    OPENAI_MAX_OUTPUT_TOKENS,
+    OPENAI_REASONING_EFFORT,
+    OPENAI_TEXT_MODEL,
+    PIPELINE_FRESH_START_AFTER_UTC_SQL,
+    PRIMARY_LLM_PROVIDER,
+    get_grok_reasoning_effort,
+)
 import time, random
 import requests
 from typing import Any, Dict
@@ -57,7 +71,7 @@ CATEGORIES = [
 ]
 
 SEARCH_MODEL  = "gpt-4o-mini-search-preview-2025-03-11"
-REWRITE_MODEL = "gpt-5"
+REWRITE_MODEL = OPENAI_TEXT_MODEL
 USE_WEB_SEARCH = 1
 
 
@@ -346,12 +360,595 @@ def keyphrase_count(text_html: str, keyphrase: str) -> int:
     return len(re.findall(pat, body))
 
 
+SOFT_SEO_CHECKS = {
+    "sent_len_ok",
+    "transitions_ok",
+    "kw_in_intro",
+    "kw_in_title",
+    "kw_in_slug",
+    "kw_in_meta",
+    "kw_in_h2",
+    "kw_in_alt",
+    "kw_density_ok",
+    "meta_len_ok",
+    "title_len_ok",
+    "h2_ok",
+    "at_least_one_external",
+    "len_ok",
+}
+
+
+class ArticleValidationError(ValueError):
+    def __init__(self, failures: list[str], article_id: Any = None, title: str | None = None):
+        self.failures = failures
+        self.article_id = article_id
+        self.title = title
+        super().__init__(
+            "Generated article failed hard validation "
+            f"{failures}; article_id={article_id} title={title!r}"
+        )
+
+
+def split_hard_soft_failures(status: dict) -> tuple[list[str], list[str]]:
+    checks = status.get("checks", {}) if isinstance(status, dict) else {}
+    failed = [key for key, passed in checks.items() if not passed]
+    soft = [key for key in failed if key in SOFT_SEO_CHECKS]
+    hard = [key for key in failed if key not in SOFT_SEO_CHECKS]
+    return hard, soft
+
+
+def _plain_text_from_html(text_html: str) -> str:
+    text = re.sub(r"<[^>]+>", " ", text_html or "")
+    return re.sub(r"\s+", " ", text).strip()
+
+
+def _seo_slugify(text: str) -> str:
+    text = (text or "").lower().strip()
+    return re.sub(r"[^a-z0-9]+", "-", text).strip("-")
+
+
+def _clamp_slug(slug: str, max_len: int = 60) -> str:
+    slug = _seo_slugify(slug)
+    if len(slug) <= max_len:
+        return slug
+    return slug[:max_len].rsplit("-", 1)[0].strip("-") or slug[:max_len].strip("-")
+
+
+def _natural_alt_text(current_alt: str, focus: str, title: str) -> str:
+    current_alt = (current_alt or "").strip()
+    focus = (focus or "").strip()
+    if not focus:
+        return current_alt or (title or "").strip()
+    if focus.lower() in current_alt.lower():
+        return current_alt
+    base = current_alt or f"Illustration for {title}".strip()
+    suffix = f" related to {focus}"
+    if len(base) + len(suffix) <= 120:
+        return f"{base}{suffix}"
+    return f"{focus} illustration for {(title or 'crypto news').strip()}"[:120]
+
+
+def _fallback_slug(doc: dict) -> str:
+    focus = (doc.get("seo_focus") or "").strip()
+    title = (doc.get("title") or "").strip()
+    candidate = " ".join(part for part in (focus, title) if part)
+    return _clamp_slug(candidate or title or focus)
+
+
+def apply_deterministic_seo_cleanup(doc: dict, original_article: dict) -> dict:
+    cleaned = dict(doc)
+    changed: list[str] = []
+    article_id = original_article.get("id")
+    focus = (cleaned.get("seo_focus") or "").strip()
+    title = (cleaned.get("title") or original_article.get("title") or "").strip()
+
+    if title and not cleaned.get("title"):
+        cleaned["title"] = title
+        changed.append("title")
+
+    slug = (cleaned.get("seo_slug") or "").strip()
+    focus_slug = _seo_slugify(focus)
+    if not slug or (focus_slug and focus_slug not in _seo_slugify(slug)):
+        cleaned["seo_slug"] = _fallback_slug(cleaned)
+        changed.append("seo_slug")
+    else:
+        clamped_slug = _clamp_slug(slug)
+        if clamped_slug != slug:
+            cleaned["seo_slug"] = clamped_slug
+            changed.append("seo_slug")
+
+    meta = (cleaned.get("seo_meta") or "").strip()
+    if len(meta) < 145 or len(meta) > 160:
+        rebuilt = _fallback_meta(cleaned.get("full_text", ""), focus)
+        if rebuilt:
+            cleaned["seo_meta"] = rebuilt
+            changed.append("seo_meta")
+
+    alt = _natural_alt_text(cleaned.get("image_alt", ""), focus, title)
+    if alt != cleaned.get("image_alt"):
+        cleaned["image_alt"] = alt
+        changed.append("image_alt")
+
+    if changed:
+        logging.info(
+            "[AI] applied deterministic Yoast SEO cleanup article_id=%s fields=%s",
+            article_id,
+            sorted(set(changed)),
+        )
+    return cleaned
+
+
+LLM_PROVIDERS = {"grok", "openai"}
+
+
+def _normalize_provider(name: str | None, *, default: str | None = None) -> str | None:
+    provider = (name or "").strip().lower()
+    if provider in {"", "none", "false", "off", "disabled"}:
+        return default
+    if provider not in LLM_PROVIDERS:
+        logging.warning("[AI] unknown provider=%r; using provider=%s", provider, default or "none")
+        return default
+    return provider
+
+
+def _llm_provider_order() -> list[str]:
+    primary = _normalize_provider(PRIMARY_LLM_PROVIDER, default="openai") or "openai"
+    fallback = _normalize_provider(LLM_FALLBACK_PROVIDER, default=None)
+    order = [primary]
+    if fallback and fallback not in order:
+        order.append(fallback)
+    return order
+
+
+def _safe_ai_reason(exc: Exception) -> str:
+    text = str(exc)
+    for secret in (GROK_API_KEY, OPENAI_API_KEY):
+        if secret:
+            text = text.replace(secret, "[redacted]")
+    text = re.sub(r"sk-[A-Za-z0-9_-]+", "[redacted]", text)
+    text = re.sub(r"xai-[A-Za-z0-9_-]+", "[redacted]", text)
+    text = " ".join(text.split())
+    return f"{exc.__class__.__name__}: {text[:220]}"
+
+
+def _chat_content_to_text(content: Any) -> str:
+    if isinstance(content, str):
+        return content
+    if isinstance(content, list):
+        parts: list[str] = []
+        for item in content:
+            if isinstance(item, dict):
+                value = item.get("text") or item.get("content")
+                if value:
+                    parts.append(str(value))
+            elif hasattr(item, "text"):
+                parts.append(str(getattr(item, "text")))
+        return "".join(parts)
+    return "" if content is None else str(content)
+
+
+def _normalized_grok_reasoning_effort(phase: str) -> str:
+    return get_grok_reasoning_effort(phase)
+
+
+def _provider_model(provider: str, fallback_model: str) -> str:
+    if provider == "grok":
+        return GROK_TEXT_MODEL
+    return fallback_model
+
+
+def _looks_like_unsupported_reasoning(exc: Exception) -> bool:
+    text = str(exc).lower()
+    return "reasoning_effort" in text and any(
+        phrase in text for phrase in ("unsupported", "unknown", "unexpected", "extra", "unrecognized")
+    )
+
+
+def call_grok_text(
+    *,
+    timeout_read: int = 300,
+    max_completion_tokens: int | None = None,
+    phase: str = "grok",
+    article_context: dict | None = None,
+    **payload
+) -> str:
+    """
+    Call xAI/Grok through the OpenAI-compatible SDK and return text content.
+    """
+    if not GROK_API_KEY:
+        logging.warning("[AI] provider=grok unavailable phase=%s reason=missing GROK_API_KEY", phase)
+        raise RuntimeError("missing GROK_API_KEY")
+
+    request_payload = dict(payload)
+    request_payload["model"] = GROK_TEXT_MODEL
+    request_payload["temperature"] = request_payload.get("temperature", REWRITE_TEMPERATURE)
+    request_payload.pop("verbosity", None)
+    request_payload.pop("reasoning_effort", None)
+    if phase == "rewrite" and isinstance(request_payload.get("messages"), list):
+        request_payload["messages"] = list(request_payload["messages"]) + [
+            {
+                "role": "system",
+                "content": (
+                    "Important: Write the full article body, not a summary. "
+                    "full_text must contain at least 550 words after HTML tags are removed."
+                ),
+            }
+        ]
+
+    if max_completion_tokens is None:
+        max_completion_tokens = GROK_MAX_OUTPUT_TOKENS
+    if max_completion_tokens is not None:
+        request_payload["max_completion_tokens"] = max_completion_tokens
+
+    reasoning_effort = _normalized_grok_reasoning_effort(phase)
+    request_payload["reasoning_effort"] = reasoning_effort
+
+    client = OpenAI(
+        api_key=GROK_API_KEY,
+        base_url=GROK_BASE_URL,
+        timeout=timeout_read,
+    )
+    backoff = BASE_SLEEP
+    reasoning_retry_done = False
+    log_context = {
+        "phase": phase,
+        "provider": "grok",
+        "model": GROK_TEXT_MODEL,
+        "article_id": (article_context or {}).get("id"),
+        "title": ((article_context or {}).get("title") or "")[:160],
+        "source": (article_context or {}).get("source_name"),
+    }
+
+    for attempt in range(1, MAX_RETRIES + 1):
+        try:
+            response = client.chat.completions.create(**request_payload)
+        except TypeError as exc:
+            if "reasoning_effort" in request_payload and not reasoning_retry_done:
+                reasoning_retry_done = True
+                request_payload.pop("reasoning_effort", None)
+                logging.warning(
+                    "[AI] provider=grok reasoning_effort not applied phase=%s reason=%s",
+                    phase,
+                    _safe_ai_reason(exc),
+                )
+                continue
+            raise
+        except Exception as exc:
+            if (
+                "reasoning_effort" in request_payload
+                and not reasoning_retry_done
+                and _looks_like_unsupported_reasoning(exc)
+            ):
+                reasoning_retry_done = True
+                request_payload.pop("reasoning_effort", None)
+                logging.warning(
+                    "[AI] provider=grok reasoning_effort not applied phase=%s reason=%s",
+                    phase,
+                    _safe_ai_reason(exc),
+                )
+                continue
+
+            if attempt == MAX_RETRIES:
+                raise
+            sleep = backoff + random.uniform(0, 1)
+            logging.warning(
+                "[AI] provider=grok request error phase=%s reason=%s retry_in=%.1fs attempt=%d/%d",
+                phase,
+                _safe_ai_reason(exc),
+                sleep,
+                attempt,
+                MAX_RETRIES,
+            )
+            time.sleep(sleep)
+            backoff *= 1.8
+            continue
+
+        try:
+            choice = response.choices[0]
+            message = getattr(choice, "message", None)
+            content = _chat_content_to_text(getattr(message, "content", ""))
+            finish_reason = getattr(choice, "finish_reason", None)
+        except Exception as exc:
+            raise RuntimeError(f"Grok malformed response context={log_context}") from exc
+
+        if not content.strip():
+            raise RuntimeError(f"Grok empty content context={log_context}")
+        if finish_reason == "length":
+            raise RuntimeError(f"Grok truncated content context={log_context}")
+
+        logging.info(
+            "[AI] provider=grok succeeded phase=%s model=%s reasoning_effort=%s finish_reason=%s output_chars=%s",
+            phase,
+            getattr(response, "model", GROK_TEXT_MODEL),
+            request_payload.get("reasoning_effort", "not_applied"),
+            finish_reason,
+            len(content),
+        )
+        return content
+
+    raise RuntimeError("Grok API repeatedly failed")
+
+
+def _call_text_provider(
+    provider: str,
+    model: str,
+    *,
+    timeout_read: int,
+    max_completion_tokens: int | None,
+    phase: str,
+    article_context: dict | None,
+    **payload
+) -> str:
+    provider_payload = dict(payload)
+    if provider == "grok":
+        return call_grok_text(
+            timeout_read=timeout_read,
+            max_completion_tokens=max_completion_tokens or GROK_MAX_OUTPUT_TOKENS,
+            phase=phase,
+            article_context=article_context,
+            **provider_payload,
+        )
+    return call_openai(
+        model,
+        timeout_read=timeout_read,
+        max_completion_tokens=max_completion_tokens or OPENAI_MAX_OUTPUT_TOKENS,
+        phase=phase,
+        article_context=article_context,
+        **provider_payload,
+    )
+
+
+def generate_text_with_primary(
+    model: str,
+    *,
+    timeout_read: int = 300,
+    max_completion_tokens: int | None = None,
+    phase: str = "text",
+    article_context: dict | None = None,
+    **payload
+) -> str:
+    order = _llm_provider_order()
+    last_exc: Exception | None = None
+    for index, provider in enumerate(order):
+        try:
+            content = _call_text_provider(
+                provider,
+                model,
+                timeout_read=timeout_read,
+                max_completion_tokens=max_completion_tokens,
+                phase=phase,
+                article_context=article_context,
+                **payload,
+            )
+            if index > 0:
+                logging.info("[AI] provider=%s fallback succeeded phase=%s", provider, phase)
+            return content
+        except Exception as exc:
+            last_exc = exc
+            if index + 1 < len(order):
+                logging.warning(
+                    "[AI] provider=%s failed phase=%s reason=%s; trying provider=%s",
+                    provider,
+                    phase,
+                    _safe_ai_reason(exc),
+                    order[index + 1],
+                )
+                continue
+            logging.error(
+                "[AI] provider=%s failed phase=%s reason=%s; no provider fallback remaining",
+                provider,
+                phase,
+                _safe_ai_reason(exc),
+            )
+            raise
+    raise RuntimeError(f"No LLM provider succeeded phase={phase}") from last_exc
+
+
+def _should_try_same_provider_expansion(provider: str, phase: str, exc: Exception) -> bool:
+    return (
+        provider in {"grok", "openai"}
+        and phase == "rewrite"
+        and isinstance(exc, ArticleValidationError)
+        and exc.failures == ["body_under_450_words"]
+    )
+
+
+def _expand_json_with_same_provider(
+    provider: str,
+    model: str,
+    parsed: dict,
+    *,
+    validator,
+    timeout_read: int,
+    max_completion_tokens: int | None,
+    phase: str,
+    article_context: dict | None,
+    payload: dict,
+) -> dict:
+    article_id = (article_context or {}).get("id")
+    words = word_count(parsed.get("full_text", ""))
+    logging.info(
+        "[AI] provider=%s phase=%s output under hard word minimum; trying same-provider expansion article_id=%s words=%s",
+        provider,
+        phase,
+        article_id,
+        words,
+    )
+
+    base_messages = list(payload.get("messages") or [])
+    expansion_prompt = (
+        "Expand this JSON article to 550-750 words after HTML tags are removed. "
+        "Keep the same facts, title, category, seo fields, allowed links, and JSON keys. "
+        "Do not add unsupported claims. Return valid JSON only."
+    )
+    expansion_payload = dict(payload)
+    expansion_payload["messages"] = base_messages + [
+        {"role": "assistant", "content": json.dumps(parsed, ensure_ascii=False)},
+        {"role": "user", "content": expansion_prompt},
+    ]
+
+    raw = _call_text_provider(
+        provider,
+        model,
+        timeout_read=timeout_read,
+        max_completion_tokens=max_completion_tokens,
+        phase=phase,
+        article_context=article_context,
+        **expansion_payload,
+    )
+    expanded = json.loads(raw)
+    if not isinstance(expanded, dict):
+        raise RuntimeError(f"same-provider expansion returned non-object JSON provider={provider}")
+    if validator:
+        validator(expanded)
+    expanded_words = word_count(expanded.get("full_text", ""))
+    logging.info(
+        "[AI] provider=%s expansion succeeded article_id=%s words=%s",
+        provider,
+        article_id,
+        expanded_words,
+    )
+    return expanded
+
+
+def generate_json_with_provider(
+    provider: str,
+    model: str,
+    *,
+    validator=None,
+    timeout_read: int = 300,
+    max_completion_tokens: int | None = None,
+    phase: str = "json",
+    article_context: dict | None = None,
+    **payload
+) -> dict:
+    provider = _normalize_provider(provider, default="openai") or "openai"
+    raw = _call_text_provider(
+        provider,
+        model,
+        timeout_read=timeout_read,
+        max_completion_tokens=max_completion_tokens,
+        phase=phase,
+        article_context=article_context,
+        **payload,
+    )
+    try:
+        parsed = json.loads(raw)
+    except json.JSONDecodeError as exc:
+        raise RuntimeError(f"invalid JSON from provider={provider}: {exc.msg}") from exc
+    if not isinstance(parsed, dict):
+        raise RuntimeError(f"invalid JSON from provider={provider}: root is not an object")
+    if validator:
+        try:
+            validator(parsed)
+        except ArticleValidationError as validation_exc:
+            if _should_try_same_provider_expansion(provider, phase, validation_exc):
+                try:
+                    parsed = _expand_json_with_same_provider(
+                        provider,
+                        model,
+                        parsed,
+                        validator=validator,
+                        timeout_read=timeout_read,
+                        max_completion_tokens=max_completion_tokens,
+                        phase="expansion",
+                        article_context=article_context,
+                        payload=payload,
+                    )
+                except Exception as expansion_exc:
+                    logging.warning(
+                        "[AI] provider=%s expansion failed article_id=%s",
+                        provider,
+                        (article_context or {}).get("id"),
+                    )
+                    raise expansion_exc
+            else:
+                raise
+    logging.info(
+        "[AI] provider=%s succeeded phase=%s model=%s",
+        provider,
+        phase,
+        _provider_model(provider, model),
+    )
+    return parsed
+
+
+def generate_json_with_primary_provider(
+    model: str,
+    *,
+    validator=None,
+    timeout_read: int = 300,
+    max_completion_tokens: int | None = None,
+    phase: str = "json",
+    article_context: dict | None = None,
+    **payload
+) -> tuple[dict, str]:
+    order = _llm_provider_order()
+    last_exc: Exception | None = None
+    for index, provider in enumerate(order):
+        try:
+            parsed = generate_json_with_provider(
+                provider,
+                model,
+                validator=validator,
+                timeout_read=timeout_read,
+                max_completion_tokens=max_completion_tokens,
+                phase=phase,
+                article_context=article_context,
+                **payload,
+            )
+            if index > 0:
+                logging.info("[AI] provider=%s fallback succeeded phase=%s", provider, phase)
+            return parsed, provider
+        except Exception as exc:
+            last_exc = exc
+            if index + 1 < len(order):
+                logging.warning(
+                    "[AI] provider=%s failed phase=%s reason=%s; article-level fallback trying provider=%s",
+                    provider,
+                    phase,
+                    _safe_ai_reason(exc),
+                    order[index + 1],
+                )
+                continue
+            logging.error(
+                "[AI] provider=%s failed phase=%s reason=%s; no provider fallback remaining",
+                provider,
+                phase,
+                _safe_ai_reason(exc),
+            )
+            raise
+    raise RuntimeError(f"No LLM provider returned valid JSON phase={phase}") from last_exc
+
+
+def generate_json_with_primary(
+    model: str,
+    *,
+    validator=None,
+    timeout_read: int = 300,
+    max_completion_tokens: int | None = None,
+    phase: str = "json",
+    article_context: dict | None = None,
+    **payload
+) -> dict:
+    parsed, _provider_used = generate_json_with_primary_provider(
+        model,
+        validator=validator,
+        timeout_read=timeout_read,
+        max_completion_tokens=max_completion_tokens,
+        phase=phase,
+        article_context=article_context,
+        **payload,
+    )
+    return parsed
+
+
 
 def call_openai(
     model: str,
     *,
     timeout_read: int = 300,
-    max_completion_tokens: int | None = 4096,
+    max_completion_tokens: int | None = OPENAI_MAX_OUTPUT_TOKENS,
     phase: str = "openai",
     article_context: dict | None = None,
     **payload
@@ -399,7 +996,7 @@ def call_openai(
     payload["model"] = model
     payload["temperature"] = payload.get("temperature", REWRITE_TEMPERATURE)
     if model.startswith("gpt-5"):
-        payload.setdefault("reasoning_effort", "low")
+        payload.setdefault("reasoning_effort", OPENAI_REASONING_EFFORT)
         payload.setdefault("verbosity", REWRITE_VERBOSITY)
     if max_completion_tokens is not None:
         payload["max_completion_tokens"] = max_completion_tokens
@@ -465,7 +1062,7 @@ def call_openai(
                 if not did_minimal_fallback and attempt < MAX_RETRIES:
                     did_minimal_fallback = True
                     # make the model spend fewer reasoning tokens and allow more output
-                    payload["reasoning_effort"] = "low"
+                    payload["reasoning_effort"] = OPENAI_REASONING_EFFORT
                     payload["verbosity"] = "low"
                     # bump output budget (within your account’s per-call limits)
                     current_cap = int(payload.get("max_completion_tokens") or 0)
@@ -492,6 +1089,14 @@ def call_openai(
                 # already tried the fallback → hard fail so caller can handle
                 raise RuntimeError(f"OpenAI: empty/truncated content after fallback ({log_context})")
 
+            logging.info(
+                "[AI] provider=openai succeeded phase=%s model=%s reasoning_effort=%s finish_reason=%s output_chars=%s",
+                phase,
+                model,
+                payload.get("reasoning_effort"),
+                finish_reason,
+                len(content),
+            )
             return content
             # ----------------------------------------------------------------
 
@@ -595,7 +1200,7 @@ def enrich_with_search(article: dict) -> str:
 
 
 
-def classify_and_rewrite(article: dict, extra_context: str, video_url: str = "") -> dict:
+def classify_and_rewrite(article: dict, extra_context: str, video_url: str = "") -> tuple[dict, str]:
     """
     Rewrite an article into a richer English news post and return strict JSON fields.
 
@@ -617,8 +1222,8 @@ def classify_and_rewrite(article: dict, extra_context: str, video_url: str = "")
         video_url: Normalized YouTube URL to embed ('' if none).
 
     Returns:
-        dict:
-            Parsed JSON object returned by the model.
+        tuple[dict, str]:
+            Parsed JSON object returned by the model and sticky text_provider.
 
     Raises:
         json.JSONDecodeError:
@@ -655,17 +1260,21 @@ def classify_and_rewrite(article: dict, extra_context: str, video_url: str = "")
         "FORMATTING (HTML ONLY – NO MARKDOWN):\n"
         "• Return 'full_text' as clean HTML only (<p>, <h2>, <strong>, <a>, <ul><li>). No <h1>.\n"
         "• Use <strong> for emphasis. All links must be <a href=\"…\">…</a> with NO tracking parameters.\n"
+        "• Write the full article body, not a summary. Returning under 550 words is invalid.\n"
+        "• Use 8-12 paragraphs; each paragraph should usually be 2-4 sentences.\n"
+        "• Include at least two <h2> sections inside full_text.\n"
         "\n"
         "VIDEO HANDLING:\n"
         "• If a YouTube VIDEO_URL is provided (non-empty), include exactly one <p>VIDEO_URL</p> at the most natural point.\n"
         "\n"
-        "RANK MATH ON-PAGE TARGETS:\n"
+        "YOAST-STYLE ON-PAGE SEO TARGETS:\n"
         "• Focus keyword (your 'seo_focus') MUST appear in: SEO title, slug, meta description, first paragraph, at least one <h2>, and image alt.\n"
         "• Keep natural usage overall; aim ~0.8–1.5% density over the body (usually 5–10 mentions at 650–720 words).\n"
         "• Start the SEO title with the focus keyword; include a number and one soft power/positive/negative word when possible while staying factual.\n"
         "\n"
         "SEO LENGTHS:\n"
-        "• Body length: 600–800 words (aim ~650–720).\n"
+        "• Body length: 550-750 words after HTML tags are removed (aim ~650-720).\n"
+        "• full_text must be at least 550 words after HTML tags are removed; do not summarize.\n"
         "• SEO title: ≤ 58 characters (includes focus keyword).\n"
         "• Meta description: 145–160 characters (includes focus keyword or close variant; reads like a teaser).\n"
         "• Slug: ≤ 60 characters (kebab-case; includes focus keyword).\n"
@@ -690,7 +1299,7 @@ def classify_and_rewrite(article: dict, extra_context: str, video_url: str = "")
         "• If unsure between two pillars, pick the clearest single pillar rather than adding a second.\n"
         "\n"
         "SCHEMA (OPTIONAL):\n"
-        "• Provide a valid JSON-LD string for NewsArticle (Rank Math auto-detects), using the given fields.\n"
+        "• Provide a valid JSON-LD string for NewsArticle, using the given fields.\n"
         "\n"
         "SAFETY:\n"
         "• No advice, no price targets, no forward-looking statements.\n"
@@ -741,19 +1350,22 @@ def classify_and_rewrite(article: dict, extra_context: str, video_url: str = "")
         {"role": "user", "content": user_payload},
     ]
 
-    raw_json = call_openai(
+    draft, provider_used = generate_json_with_primary_provider(
         REWRITE_MODEL,
         messages=chat,
         response_format={"type": "json_object"},
         timeout_read=300,
-        max_completion_tokens=4096,           # give room for JSON plus GPT-5 reasoning
+        max_completion_tokens=None,  # provider wrapper applies provider-specific output limits
         phase="rewrite",
         article_context=article,
-        reasoning_effort="low",           # <<< important
-        verbosity="low"                       # helps keep output concise
+        validator=lambda parsed: validate_rewritten_article(parsed, article),
     )
-
-    return json.loads(raw_json)
+    logging.info(
+        "[AI] sticky text_provider=%s selected article_id=%s phase=rewrite",
+        provider_used,
+        article.get("id"),
+    )
+    return draft, provider_used
 
 
 
@@ -830,7 +1442,7 @@ def inject_video_oembed(original: dict, html: str) -> str:
 
 def validate_readability_and_seo(doc: dict) -> dict:
     """
-    Evaluate Rank Math style SEO + readability checks and return metrics + boolean checks.
+    Evaluate Yoast-style SEO + readability targets and return metrics + boolean checks.
 
     Computes:
         - word count, sentence count, % sentences <= 20 words
@@ -898,7 +1510,7 @@ def validate_readability_and_seo(doc: dict) -> dict:
         "sent_len_ok": pct_under20_ok >= 0.75,
         "transitions_ok": pct_transitions >= 0.30,
 
-        # rank-math keyword placements
+        # Yoast-style keyword placements
         "kw_in_intro": intro_ok,
         "kw_in_title": title_ok,
         "kw_in_slug": slug_ok,
@@ -917,34 +1529,46 @@ def validate_readability_and_seo(doc: dict) -> dict:
     return {"metrics": metrics, "checks": checks}
 
 
-def repair_if_needed(original_article: dict, extra_context: str, doc: dict) -> dict:
+def repair_if_needed(original_article: dict, extra_context: str, doc: dict, text_provider: str) -> dict:
     """
-    Attempt to repair a generated document that fails readability/SEO checks.
+    Attempt to repair a generated document that misses Yoast-style SEO/readability targets.
 
     Flow:
-        - Runs validate_readability_and_seo(doc)
-        - If all checks pass, returns doc unchanged
-        - Otherwise asks the model to fix ONLY:
-            full_text, and if needed title/seo_meta/seo_slug/image_alt
-        - Returns fixed JSON on success; on failure raises so the article remains retryable.
+        - Hard-validates required article fields.
+        - Runs validate_readability_and_seo(doc).
+        - If all checks pass, returns doc unchanged.
+        - Otherwise asks the article's sticky text provider to repair once.
+        - Applies deterministic cleanup for slug/meta/alt.
+        - Stores despite remaining soft Yoast-style failures.
 
     Args:
         original_article: Original API item dict (context only; not always used directly here).
         extra_context: Search-grounded bullet points used earlier (context only).
         doc: Current generated JSON to validate/repair.
+        text_provider: Sticky provider selected by the rewrite stage.
 
     Returns:
         dict:
-            Repaired doc if repair succeeds, else the original doc when no repair is needed.
+            Repaired/cleaned doc. Raises only when hard validation fails.
     """
 
+    text_provider = _normalize_provider(text_provider, default="openai") or "openai"
+    validate_rewritten_article(doc, original_article)
     status = validate_readability_and_seo(doc)
-    if all(status["checks"].values()):
+    hard_failed, soft_failed = split_hard_soft_failures(status)
+    if hard_failed:
+        logging.error(
+            "[AI] hard article validation failed article_id=%s failed_checks=%s",
+            original_article.get("id"),
+            hard_failed,
+        )
+        raise ValueError(f"Hard SEO/readability checks failed: {hard_failed}")
+    if not soft_failed:
         return doc
 
-    missing = [k for k,v in status["checks"].items() if not v]
+    missing = soft_failed
     fix_instr = (
-        "You are repairing JSON for Rank Math on-page SEO and readability.\n"
+        "You are repairing JSON for Yoast-style SEO/readability targets.\n"
         "Fix ONLY: 'full_text' (structure, transitions, length) and, if needed, 'title', 'seo_meta', 'seo_slug', 'image_alt'.\n"
         f"Failed checks: {', '.join(missing)}.\n"
         "Rules:\n"
@@ -960,32 +1584,63 @@ def repair_if_needed(original_article: dict, extra_context: str, doc: dict) -> d
 
 
     chat = [
-        {"role": "system", "content": "You repair JSON for SEO/readability; do not add new facts. VERBOSITY: medium."},
+        {"role": "system", "content": "You repair JSON for SEO/readability; do not add new facts. VERBOSITY: low."},
         {"role": "user", "content": json.dumps(doc, ensure_ascii=False)},
         {"role": "user", "content": fix_instr},
     ]
+    def _validate_repair(parsed: dict) -> None:
+        validate_rewritten_article(parsed, original_article)
+
+    candidate = doc
     try:
-        raw = call_openai(
+        candidate = generate_json_with_provider(
+            text_provider,
             REWRITE_MODEL,
             messages=chat,
             response_format={"type": "json_object"},
             timeout_read=100,
-            max_completion_tokens=4096,
+            max_completion_tokens=None,
             phase="repair",
             article_context=original_article,
-            reasoning_effort="low",
-            verbosity="low"
+            validator=_validate_repair,
         )
-        fixed = json.loads(raw)
-        return fixed
+    except ArticleValidationError as exc:
+        logging.warning(
+            "[AI] provider=%s repair output failed hard validation; keeping pre-repair draft article_id=%s failed_checks=%s",
+            text_provider,
+            original_article.get("id"),
+            exc.failures,
+        )
     except Exception:
-        logging.exception(
-            "Repair failed; article will remain retryable. article_id=%s title=%r source=%r",
+        logging.warning(
+            "[AI] provider=%s repair attempt failed; using original hard-valid article article_id=%s title=%r source=%r",
+            text_provider,
             original_article.get("id"),
             original_article.get("title"),
             original_article.get("source_name"),
+            exc_info=True,
         )
-        raise
+
+    validate_rewritten_article(candidate, original_article)
+    candidate = apply_deterministic_seo_cleanup(candidate, original_article)
+    validate_rewritten_article(candidate, original_article)
+
+    final_status = validate_readability_and_seo(candidate)
+    hard_after, soft_after = split_hard_soft_failures(final_status)
+    if hard_after:
+        logging.error(
+            "[AI] hard article validation failed article_id=%s failed_checks=%s",
+            original_article.get("id"),
+            hard_after,
+        )
+        raise ValueError(f"Hard SEO/readability checks failed after cleanup: {hard_after}")
+    if soft_after:
+        logging.warning(
+            "[AI] soft Yoast SEO checks still failed after repair; storing article article_id=%s failed_checks=%s",
+            original_article.get("id"),
+            soft_after,
+        )
+    return candidate
 
 
 def _fallback_meta(full_html: str, focus: str) -> str:
@@ -1137,18 +1792,7 @@ def mark_processed(news_url: str):
     conn.commit()
     cur.close(); conn.close()
 
-def validate_rewritten_article(doc: dict, raw: dict) -> None:
-    """
-    Ensure a generated article has the fields required before it is stored.
-
-    Args:
-        doc: Rewritten article JSON from OpenAI.
-        raw: Source DB row used only for diagnostic context.
-
-    Raises:
-        ValueError:
-            If required fields are missing or empty.
-    """
+def hard_article_validation_failures(doc: dict, raw: dict) -> list[str]:
     required = (
         "title",
         "full_text",
@@ -1160,17 +1804,46 @@ def validate_rewritten_article(doc: dict, raw: dict) -> None:
         "seo_meta",
         "image_alt",
     )
-    missing = [key for key in required if doc.get(key) in (None, "")]
-    if missing:
-        raise ValueError(
-            "Generated article missing required fields "
-            f"{missing}; article_id={raw.get('id')} title={raw.get('title')!r}"
+    failures = [f"missing_{key}" for key in required if doc.get(key) in (None, "")]
+    full_text = str(doc.get("full_text") or "").strip()
+    if not full_text:
+        failures.append("empty_full_text")
+    else:
+        if not re.search(r"<p\b[^>]*>.*?</p>", full_text, flags=re.I | re.S):
+            failures.append("missing_paragraph")
+        if word_count(full_text) < 450:
+            failures.append("body_under_450_words")
+
+    title = str(doc.get("title") or "").strip()
+    if not title:
+        failures.append("empty_title")
+    if not _seo_slugify(str(doc.get("seo_slug") or "")):
+        failures.append("empty_seo_slug")
+    if not str(doc.get("seo_meta") or "").strip():
+        failures.append("empty_seo_meta")
+    return sorted(set(failures))
+
+
+def validate_rewritten_article(doc: dict, raw: dict) -> None:
+    """
+    Ensure a generated article has the fields required before it is stored.
+
+    Args:
+        doc: Rewritten article JSON from the configured AI provider.
+        raw: Source DB row used only for diagnostic context.
+
+    Raises:
+        ValueError:
+            If required fields are missing or empty.
+    """
+    failures = hard_article_validation_failures(doc, raw)
+    if failures:
+        logging.error(
+            "[AI] hard article validation failed article_id=%s failed_checks=%s",
+            raw.get("id"),
+            failures,
         )
-    if not str(doc.get("full_text", "")).strip():
-        raise ValueError(
-            "Generated article has empty full_text; "
-            f"article_id={raw.get('id')} title={raw.get('title')!r}"
-        )
+        raise ArticleValidationError(failures, raw.get("id"), raw.get("title"))
 
 def process_one(raw):
     """
@@ -1196,8 +1869,8 @@ def process_one(raw):
     try:
         extra = enrich_with_search(raw)
         video_url = _maybe_video_url(raw)
-        draft = classify_and_rewrite(raw, extra, video_url)
-        final_doc = repair_if_needed(raw, extra, draft)
+        draft, text_provider = classify_and_rewrite(raw, extra, video_url)
+        final_doc = repair_if_needed(raw, extra, draft, text_provider)
 
         if not final_doc.get("schema_jsonld"):
             sj = build_news_schema_jsonld(final_doc, raw)

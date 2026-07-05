@@ -14,17 +14,28 @@ from datetime import datetime, timedelta, timezone
 from typing import Any
 from config import (
     DB_CONFIG,
-    WP_DB_CONFIG,
-    WP_API_URL,
-    WP_USERNAME,
-    WP_APP_PASSWORD,
-    USE_API_IMAGES,
+    GROK_API_KEY,
+    GROK_BASE_URL,
+    GROK_IMAGE_ASPECT_RATIO,
+    GROK_IMAGE_MODEL,
+    GROK_IMAGE_RESOLUTION,
+    IMAGE_FALLBACK_PROVIDER,
+    IMAGE_SOURCE_PRIORITY,
     IMAGE_SOURCE_MODE,
+    OPENAI_IMAGE_MODEL,
     OPENAI_IMAGE_FALLBACK,
-    STOCK_IMAGE_TIMEOUT_SECONDS,
     PIPELINE_FRESH_START_AFTER_UTC_SQL,
+    PRIMARY_IMAGE_PROVIDER,
+    STOCK_IMAGE_TIMEOUT_SECONDS,
+    USE_API_IMAGES,
+    USE_SOURCE_IMAGES,
+    WP_API_URL,
+    WP_APP_PASSWORD,
+    WP_DB_CONFIG,
+    WP_USERNAME,
 )
 from stock_images import StockImageCandidate, find_stock_image
+from stock_images import record_stock_image_usage
 
 session = requests.Session()
 token = base64.b64encode(f"{WP_USERNAME}:{WP_APP_PASSWORD}".encode()).decode()
@@ -112,7 +123,7 @@ MARKET_LINKS = {
 API_BASE = WP_API_URL.rstrip("/")
 
 
-IMG_MODEL   = os.getenv("IMAGE_MODEL", "gpt-image-1")
+IMG_MODEL   = OPENAI_IMAGE_MODEL
 IMG_SIZE    = os.getenv("IMAGE_SIZE", "1024x1024")   # input square
 IMG_QUALITY = os.getenv("IMAGE_QUALITY", "high")      # low | medium | high
 IMAGE_SOURCE = "generate"
@@ -531,6 +542,14 @@ def build_edit_prompt(title: str, hashtags: str) -> str:
     )
 
 
+def _source_images_enabled() -> bool:
+    return bool(USE_SOURCE_IMAGES)
+
+
+def _log_source_images_disabled() -> None:
+    logger.info("[IMG] source images disabled by USE_SOURCE_IMAGES=false; skipping source image")
+
+
 def edit_image_from_url(url: str, title: str, hashtags: str) -> str | None:
     """
     Download an image, restyle it via OpenAI image edits, and output a WP hero JPEG path.
@@ -558,6 +577,10 @@ def edit_image_from_url(url: str, title: str, hashtags: str) -> str | None:
         Any exception may be caught internally and converted to None by this function.
     """
 
+    if not _source_images_enabled():
+        _log_source_images_disabled()
+        return None
+
     try:
         # 1) download base
         r = session.get(url, timeout=20)
@@ -574,11 +597,11 @@ def edit_image_from_url(url: str, title: str, hashtags: str) -> str | None:
         prompt = build_edit_prompt(title, hashtags)
         with open(tmp_in_path, "rb") as f:
             resp = client.images.edit(
-                model=os.getenv("IMAGE_MODEL", "gpt-image-1"),
+                model=IMG_MODEL,
                 image=f,
                 prompt=prompt,
-                size=os.getenv("IMAGE_SIZE", "1024x1024"),
-                quality=os.getenv("IMAGE_QUALITY", "high"),
+                size=IMG_SIZE,
+                quality=IMG_QUALITY,
                 n=1,
             )
 
@@ -828,7 +851,11 @@ def generate_image(title: str, hashtags: str) -> str | None:
         if getattr(d, "b64_json", None):
             raw_bytes = base64.b64decode(d.b64_json)
         elif getattr(d, "url", None):
-            r = session.get(d.url, timeout=20)
+            r = requests.get(
+                d.url,
+                timeout=20,
+                headers={"User-Agent": "CryptoCourierImageSelector/1.0"},
+            )
             r.raise_for_status()
             raw_bytes = r.content
         else:
@@ -857,6 +884,160 @@ def generate_image(title: str, hashtags: str) -> str | None:
     except Exception as e:
         print(f"⚠️  GPT-Image-1 post-process failed: {e}")
         return None
+
+
+IMAGE_PROVIDERS = {"grok", "openai"}
+
+
+def _safe_img_reason(exc: Exception) -> str:
+    text = str(exc)
+    for secret in (GROK_API_KEY, os.getenv("OPENAI_API_KEY")):
+        if secret:
+            text = text.replace(secret, "[redacted]")
+    text = re.sub(r"sk-[A-Za-z0-9_-]+", "[redacted]", text)
+    text = re.sub(r"xai-[A-Za-z0-9_-]+", "[redacted]", text)
+    return f"{exc.__class__.__name__}: {' '.join(text.split())[:220]}"
+
+
+def _normalize_image_provider(name: str | None, *, default: str = "openai") -> str:
+    provider = (name or "").strip().lower()
+    if provider not in IMAGE_PROVIDERS:
+        logger.warning("[IMG] unknown image provider=%r; using provider=%s", provider, default)
+        return default
+    return provider
+
+
+def _image_result_bytes(resp: Any, provider: str) -> bytes | None:
+    try:
+        data0 = resp.data[0]
+        if getattr(data0, "b64_json", None):
+            return base64.b64decode(data0.b64_json)
+        if getattr(data0, "url", None):
+            r = requests.get(
+                data0.url,
+                timeout=STOCK_IMAGE_TIMEOUT_SECONDS,
+                headers={"User-Agent": "CryptoCourierImageSelector/1.0"},
+            )
+            r.raise_for_status()
+            return r.content
+    except Exception as exc:
+        logger.warning("[IMG] provider=%s image decode/download failed reason=%s", provider, _safe_img_reason(exc))
+        return None
+    logger.warning("[IMG] provider=%s image response had no url or b64_json", provider)
+    return None
+
+
+def _grok_image_request(prompt: str):
+    client_grok = OpenAI(
+        api_key=GROK_API_KEY,
+        base_url=GROK_BASE_URL,
+        timeout=120,
+    )
+    extra_body = {}
+    if GROK_IMAGE_ASPECT_RATIO:
+        extra_body["aspect_ratio"] = GROK_IMAGE_ASPECT_RATIO
+    if GROK_IMAGE_RESOLUTION:
+        extra_body["resolution"] = GROK_IMAGE_RESOLUTION
+
+    request_payload: dict[str, Any] = {
+        "model": GROK_IMAGE_MODEL,
+        "prompt": prompt,
+        "n": 1,
+    }
+    if extra_body:
+        request_payload["extra_body"] = extra_body
+
+    try:
+        return client_grok.images.generate(**request_payload)
+    except TypeError as exc:
+        if extra_body:
+            logger.warning(
+                "[IMG] provider=grok-image aspect/resolution not applied reason=%s",
+                _safe_img_reason(exc),
+            )
+            request_payload.pop("extra_body", None)
+            return client_grok.images.generate(**request_payload)
+        raise
+    except Exception as exc:
+        if extra_body and any(key in str(exc).lower() for key in ("aspect_ratio", "resolution", "extra_body")):
+            logger.warning(
+                "[IMG] provider=grok-image aspect/resolution not applied reason=%s",
+                _safe_img_reason(exc),
+            )
+            request_payload.pop("extra_body", None)
+            return client_grok.images.generate(**request_payload)
+        raise
+
+
+def _grok_image_content(title: str, hashtags: str) -> tuple[bytes, str, dict[str, Any]] | None:
+    if not GROK_API_KEY:
+        logger.warning("[IMG] provider=grok-image unavailable reason=missing GROK_API_KEY")
+        return None
+
+    prompt = build_image_prompt(title, hashtags)
+    try:
+        resp = _grok_image_request(prompt)
+    except Exception as exc:
+        logger.warning("[IMG] provider=grok-image failed reason=%s", _safe_img_reason(exc))
+        return None
+
+    raw_bytes = _image_result_bytes(resp, "grok-image")
+    if not raw_bytes:
+        return None
+
+    local = _heroize_to_1536x1024(raw_bytes)
+    if not local:
+        logger.warning("[IMG] provider=grok-image failed reason=post_process_failed")
+        return None
+
+    content, filename = _read_temp_image(local)
+    logger.info(
+        "[IMG] provider=grok-image selected model=%s fallback=False aspect_ratio=%s resolution=%s",
+        GROK_IMAGE_MODEL,
+        GROK_IMAGE_ASPECT_RATIO,
+        GROK_IMAGE_RESOLUTION,
+    )
+    return content, filename, {
+        "provider": "grok-image",
+        "query": "",
+        "score": None,
+        "credit_text": "",
+        "openai_fallback_used": False,
+        "image_model": GROK_IMAGE_MODEL,
+    }
+
+
+def _openai_fallback_enabled() -> bool:
+    return (
+        OPENAI_IMAGE_FALLBACK
+        and _normalize_image_provider(IMAGE_FALLBACK_PROVIDER, default="openai") == "openai"
+    )
+
+
+def _generated_image_content(
+    provider: str,
+    title: str,
+    hashtags: str,
+    *,
+    fallback_used: bool,
+) -> tuple[bytes, str, dict[str, Any]] | None:
+    provider = _normalize_image_provider(provider, default="openai")
+    if provider == "grok":
+        selected = _grok_image_content(title, hashtags)
+        if selected:
+            content, filename, meta = selected
+            meta["openai_fallback_used"] = False
+            return content, filename, meta
+        return None
+
+    selected = _openai_image_content(
+        None,
+        title,
+        hashtags,
+        force_generate=True,
+        fallback_used=fallback_used,
+    )
+    return selected
 
 
 RETRY_STATUS = {429, 500, 502, 503, 504}
@@ -928,9 +1109,10 @@ def _legacy_upload_image(url: str | None, title: str, hashtags: str, *, force_ge
         force_generate = (USE_API_IMAGES == 0)
 
     content, filename = None, None
+    source_edit_skipped = bool(not force_generate and url and not _source_images_enabled())
 
     # A) If we’re allowed to use the feed URL, try EDITS first
-    if not force_generate and url:
+    if not force_generate and url and _source_images_enabled():
         local = edit_image_from_url(url, title, hashtags)
         if local:
             with open(local, "rb") as fh:
@@ -939,6 +1121,9 @@ def _legacy_upload_image(url: str | None, title: str, hashtags: str, *, force_ge
             try: os.unlink(local)
             except OSError: pass
             print("[IMG] Edited feed photo via gpt-image-1 (1024→1536x1024).")
+
+    if source_edit_skipped:
+        _log_source_images_disabled()
 
     # B) If no content yet, fall back to GENERATION
     if content is None:
@@ -986,35 +1171,44 @@ def _openai_image_content(
     *,
     force_generate: bool,
     fallback_used: bool,
+    allow_source_edit: bool = False,
 ) -> tuple[bytes, str, dict[str, Any]] | None:
-    if not force_generate and url:
+    source_edit_allowed = allow_source_edit and _source_images_enabled()
+    if source_edit_allowed and not force_generate and url:
         local = edit_image_from_url(url, title, hashtags)
         if local:
             content, filename = _read_temp_image(local)
-            logger.info("[IMG] provider selected=openai source=feed-edit fallback=%s", fallback_used)
+            logger.info("[IMG] provider=openai selected fallback=%s source_edit=True", fallback_used)
             return content, filename, {
                 "provider": "openai",
                 "query": "",
                 "score": None,
                 "credit_text": "",
                 "openai_fallback_used": fallback_used,
+                "source_edit": True,
             }
+    elif allow_source_edit and not force_generate and url:
+        _log_source_images_disabled()
 
     local = generate_image(title, hashtags)
     if local:
         content, filename = _read_temp_image(local)
-        logger.info("[IMG] provider selected=openai source=generated fallback=%s", fallback_used)
+        logger.info("[IMG] provider=openai selected fallback=%s source_edit=False", fallback_used)
         return content, filename, {
             "provider": "openai",
             "query": "",
             "score": None,
             "credit_text": "",
             "openai_fallback_used": fallback_used,
+            "source_edit": False,
         }
     return None
 
 
 def _source_image_content(url: str | None) -> tuple[bytes, str, dict[str, Any]] | None:
+    if not _source_images_enabled():
+        _log_source_images_disabled()
+        return None
     if not url:
         return None
     downloaded = _download_external_hero_image(url, "source")
@@ -1038,6 +1232,13 @@ def _source_image_content(url: str | None) -> tuple[bytes, str, dict[str, Any]] 
         "width": dims.get("width"),
         "height": dims.get("height"),
     }
+
+
+def _maybe_source_image_content(url: str | None) -> tuple[bytes, str, dict[str, Any]] | None:
+    if not _source_images_enabled():
+        _log_source_images_disabled()
+        return None
+    return _source_image_content(url)
 
 
 def _stock_image_content(article: dict[str, Any]) -> tuple[bytes, str, dict[str, Any]] | None:
@@ -1081,6 +1282,9 @@ def _stock_image_content(article: dict[str, Any]) -> tuple[bytes, str, dict[str,
         "credit_text": candidate.credit_text,
         "credit_name": candidate.credit_name,
         "credit_url": candidate.credit_url,
+        "provider_asset_id": candidate.provider_asset_id,
+        "asset_key": candidate.asset_key,
+        "image_url_hash": hashlib.sha256(candidate.image_url.encode("utf-8")).hexdigest(),
         "openai_fallback_used": False,
         "width": dims.get("width"),
         "height": dims.get("height"),
@@ -1099,21 +1303,27 @@ def upload_image(
     Select, prepare, and upload a featured image to WordPress.
 
     Modes:
-        openai: current OpenAI edit/generation path only.
-        hybrid: source/feed image, Pexels, Pixabay, then OpenAI fallback.
-        stock: source/feed image, Pexels, Pixabay, with optional OpenAI fallback.
+        openai: OpenAI image generation only.
+        hybrid: priority-driven stock/source/generated selection with fallback.
+        stock: Pexels/Pixabay with optional OpenAI fallback.
         source: source/feed image, with optional OpenAI fallback.
     """
     if force_generate is None:
         force_generate = (USE_API_IMAGES == 0)
 
-    mode = (IMAGE_SOURCE_MODE or "openai").strip().lower()
+    mode = (IMAGE_SOURCE_MODE or "hybrid").strip().lower()
     if mode not in {"openai", "hybrid", "stock", "source"}:
-        logger.warning("[IMG] unknown IMAGE_SOURCE_MODE=%r; using openai", mode)
-        mode = "openai"
+        logger.warning("[IMG] unknown IMAGE_SOURCE_MODE=%r; using hybrid", mode)
+        mode = "hybrid"
+
+    priority = (IMAGE_SOURCE_PRIORITY or "stock_first").strip().lower()
+    if priority not in {"stock_first", "source_first", "openai_only", "grok_only"}:
+        logger.warning("[IMG] unknown IMAGE_SOURCE_PRIORITY=%r; using stock_first", priority)
+        priority = "stock_first"
 
     image_meta: dict[str, Any] = {
         "mode": mode,
+        "priority": priority,
         "provider": None,
         "query": "",
         "score": None,
@@ -1124,34 +1334,76 @@ def upload_image(
     article_context.setdefault("title", title)
     article_context.setdefault("hashtags", hashtags)
 
+    primary_generated_provider = _normalize_image_provider(PRIMARY_IMAGE_PROVIDER, default="grok")
+    fallback_generated_provider = _normalize_image_provider(IMAGE_FALLBACK_PROVIDER, default="openai")
     selected: tuple[bytes, str, dict[str, Any]] | None = None
-    logger.info("[IMG] image mode=%s title=%r", mode, title[:140])
+    logger.info(
+        "[IMG] mode=%s priority=%s use_source_images=%s primary=%s fallback=%s",
+        mode,
+        priority,
+        _source_images_enabled(),
+        primary_generated_provider,
+        fallback_generated_provider,
+    )
 
-    if mode == "openai":
-        selected = _openai_image_content(
-            url,
-            title,
-            hashtags,
-            force_generate=force_generate,
-            fallback_used=False,
-        )
+    if mode == "openai" or priority == "openai_only":
+        selected = _generated_image_content("openai", title, hashtags, fallback_used=False)
+    elif priority == "grok_only":
+        selected = _generated_image_content("grok", title, hashtags, fallback_used=False)
+        if not selected and _openai_fallback_enabled():
+            logger.info("[IMG] provider=grok-image failed; trying provider=openai")
+            selected = _generated_image_content("openai", title, hashtags, fallback_used=True)
+    elif mode == "source":
+        selected = _maybe_source_image_content(url)
+        if not selected and _openai_fallback_enabled():
+            logger.info("[IMG] provider=source failed; trying provider=openai")
+            selected = _generated_image_content("openai", title, hashtags, fallback_used=True)
+    elif mode == "stock":
+        if priority == "source_first":
+            selected = _maybe_source_image_content(url)
+        if not selected:
+            selected = _stock_image_content(article_context)
+        if not selected and _openai_fallback_enabled():
+            logger.info("[IMG] provider=stock failed; trying provider=openai")
+            selected = _generated_image_content("openai", title, hashtags, fallback_used=True)
     else:
-        selected = _source_image_content(url)
-        if not selected and mode in {"hybrid", "stock"}:
+        if priority == "source_first":
+            selected = _maybe_source_image_content(url)
+
+        if not selected:
             selected = _stock_image_content(article_context)
 
         if not selected:
-            if OPENAI_IMAGE_FALLBACK:
-                logger.info("[IMG] using OpenAI image fallback mode=%s", mode)
-                selected = _openai_image_content(
-                    url,
-                    title,
-                    hashtags,
-                    force_generate=force_generate,
-                    fallback_used=True,
-                )
+            logger.info(
+                "[IMG] stock image unavailable; trying provider=%s",
+                "grok-image" if primary_generated_provider == "grok" else primary_generated_provider,
+            )
+            logger.info(
+                "[IMG] no fresh stock image passed thresholds; continuing to generated image provider=%s",
+                "grok-image" if primary_generated_provider == "grok" else primary_generated_provider,
+            )
+            selected = _generated_image_content(
+                primary_generated_provider,
+                title,
+                hashtags,
+                fallback_used=False,
+            )
+
+        if not selected and USE_SOURCE_IMAGES and priority == "stock_first":
+            selected = _maybe_source_image_content(url)
+
+        if not selected and _openai_fallback_enabled() and primary_generated_provider != "openai":
+            if primary_generated_provider == "grok":
+                logger.info("[IMG] provider=grok-image failed; trying provider=openai")
             else:
-                logger.info("[IMG] OpenAI image fallback disabled mode=%s", mode)
+                logger.info(
+                    "[IMG] provider=%s failed; trying provider=openai",
+                    primary_generated_provider,
+                )
+            selected = _generated_image_content("openai", title, hashtags, fallback_used=True)
+
+        if not selected and not _openai_fallback_enabled():
+            logger.info("[IMG] OpenAI image fallback disabled mode=%s priority=%s", mode, priority)
 
     if not selected:
         print("No image available - posting without featured image.")
@@ -1276,7 +1528,7 @@ def link_markets(text: str) -> str:
 # ---------- Main publisher ---------------------------------------------------
 def publish_news_to_wp() -> None:
     """
-    Publish due enriched news items to WordPress (featured image + Rank Math meta).
+    Publish due enriched news items to WordPress (featured image + Yoast SEO meta).
 
     Concurrency:
         - Uses MySQL named lock 'wp_publisher_lock' to prevent overlap.
@@ -1292,8 +1544,8 @@ def publish_news_to_wp() -> None:
             - Link exchange names in HTML (link_markets)
             - Optionally embed schema_jsonld as a <script type="application/ld+json"> block
             - POST to /wp/v2/posts with:
-                title, content, status=publish, slug, date_gmt, categories, tags, meta
-            - On success: optionally upsert Rank Math meta into WP DB (upsert_postmeta)
+                title, content, status=publish, slug, date_gmt, categories, tags
+            - On success: upsert Yoast SEO postmeta into WP DB (upsert_postmeta)
             - Mark item published in rich_crpytonews (mark_news_as_published)
         5) Release lock in finally.
 
@@ -1349,7 +1601,6 @@ def publish_news_to_wp() -> None:
                 hashtags=item.get("hashtags", ""),
                 article=item,
             )
-            meta_data = {}
             if featured_id:
                 credit_text = image_meta.get("credit_text") or ""
                 set_media_details(
@@ -1358,15 +1609,6 @@ def publish_news_to_wp() -> None:
                     caption=credit_text or None,
                     description=credit_text or None,
                 )
-
-            # Rank Math meta keys (REST-exposed)
-            meta_data["rank_math_focus_keyword"] = item.get("seo_focus", "")
-            meta_data["rank_math_description"]    = (item.get("seo_meta") or "")[:160]
-            meta_data["rank_math_title"]          = (item.get("title") or "")[:58]
-            # Optional canonical if you ever add it:
-            if item.get("seo_canonical"):
-                meta_data["rank_math_canonical_url"] = item["seo_canonical"]
-
 
             # ---- categories ----
             cat_names = [c.strip() for c in item.get("category", "General").split(",") if c.strip()]
@@ -1401,7 +1643,6 @@ def publish_news_to_wp() -> None:
                 "categories": category_ids,
                 # ✅ proper tags taxonomy
                 "tags": [ensure_term(t.strip(), "tags") for t in item.get("hashtags", "").split(",") if t.strip()],
-                "meta": meta_data,
             }
             if featured_id:
                 post_data["featured_media"] = featured_id
@@ -1414,14 +1655,17 @@ def publish_news_to_wp() -> None:
             body = resp.json()
             post_id = body["id"]
             print(f"✅ Published WP post {post_id} at {schedule_at_utc:%Y-%m-%d %H:%M:%S}Z")
+            if featured_id:
+                record_stock_image_usage(image_meta, post_id, item["title"])
 
-            # Yoast meta via DB
-            # (Optional fallback; REST meta already sets these)
+            # Yoast SEO postmeta via DB. Do not rely on plugin REST meta exposure.
             with mysql.connector.connect(**WP_DB_CONFIG) as wp_conn:
                 prefix = get_wp_prefix(wp_conn)
-                upsert_postmeta(wp_conn, prefix, post_id, 'rank_math_focus_keyword', item.get('seo_focus',''))
-                upsert_postmeta(wp_conn, prefix, post_id, 'rank_math_description', (item.get('seo_meta') or '')[:160])
-                upsert_postmeta(wp_conn, prefix, post_id, 'rank_math_title', (item.get('title') or '')[:58])
+                upsert_postmeta(wp_conn, prefix, post_id, "_yoast_wpseo_focuskw", item.get("seo_focus", ""))
+                upsert_postmeta(wp_conn, prefix, post_id, "_yoast_wpseo_metadesc", (item.get("seo_meta") or "")[:160])
+                upsert_postmeta(wp_conn, prefix, post_id, "_yoast_wpseo_title", (item.get("title") or "")[:58])
+                if item.get("seo_canonical"):
+                    upsert_postmeta(wp_conn, prefix, post_id, "_yoast_wpseo_canonical", item["seo_canonical"])
 
 
             mark_news_as_published(item["news_url"])
