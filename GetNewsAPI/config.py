@@ -126,6 +126,35 @@ GROK_IMAGE_RESOLUTION = os.getenv("GROK_IMAGE_RESOLUTION", "1k")
 
 OPENAI_IMAGE_FALLBACK = _env_bool("OPENAI_IMAGE_FALLBACK", True)
 
+IMAGE_SEARCH_ENGINE = os.getenv("IMAGE_SEARCH_ENGINE", "v1").strip().lower()
+if IMAGE_SEARCH_ENGINE not in {"v1", "v2"}:
+    raise ValueError("IMAGE_SEARCH_ENGINE must be v1 or v2")
+
+IMAGE_SEARCH_PROVIDERS = tuple(
+    provider.strip().lower()
+    for provider in os.getenv(
+        "IMAGE_SEARCH_PROVIDERS",
+        "pexels,pixabay,openverse",
+    ).split(",")
+    if provider.strip()
+)
+IMAGE_SEARCH_RESULTS_PER_QUERY = int(os.getenv("IMAGE_SEARCH_RESULTS_PER_QUERY", "10"))
+IMAGE_GLOBAL_CANDIDATE_LIMIT = int(os.getenv("IMAGE_GLOBAL_CANDIDATE_LIMIT", "50"))
+IMAGE_MIN_WIDTH = int(os.getenv("IMAGE_MIN_WIDTH", "1200"))
+IMAGE_MIN_HEIGHT = int(os.getenv("IMAGE_MIN_HEIGHT", "675"))
+IMAGE_PROVIDER_TIMEOUT_SECONDS = int(os.getenv("IMAGE_PROVIDER_TIMEOUT_SECONDS", "10"))
+IMAGE_PROVIDER_MAX_RETRIES = int(os.getenv("IMAGE_PROVIDER_MAX_RETRIES", "1"))
+IMAGE_LICENSE_ALLOWLIST = tuple(
+    license_name.strip().lower()
+    for license_name in os.getenv("IMAGE_LICENSE_ALLOWLIST", "cc0,pdm,cc-by").split(",")
+    if license_name.strip()
+)
+IMAGE_GENERATION_ONLY_AFTER_SEARCH_EXHAUSTED = _env_bool(
+    "IMAGE_GENERATION_ONLY_AFTER_SEARCH_EXHAUSTED",
+    True,
+)
+IMAGE_GENERATION_ON_PROVIDER_ERROR = _env_bool("IMAGE_GENERATION_ON_PROVIDER_ERROR", False)
+
 PEXELS_ENABLED = _env_bool("PEXELS_ENABLED", True)
 PEXELS_API_KEY = os.getenv("PEXELS_API_KEY")
 PEXELS_ORIENTATION = os.getenv("PEXELS_ORIENTATION", "landscape")
@@ -137,6 +166,12 @@ PIXABAY_API_KEY = os.getenv("PIXABAY_API_KEY")
 PIXABAY_ORIENTATION = os.getenv("PIXABAY_ORIENTATION", "horizontal")
 PIXABAY_PER_PAGE = int(os.getenv("PIXABAY_PER_PAGE", "10"))
 PIXABAY_MIN_SCORE = float(os.getenv("PIXABAY_MIN_SCORE", "0.78"))
+
+OPENVERSE_ENABLED = _env_bool("OPENVERSE_ENABLED", True)
+OPENVERSE_CLIENT_ID = os.getenv("OPENVERSE_CLIENT_ID")
+OPENVERSE_CLIENT_SECRET = os.getenv("OPENVERSE_CLIENT_SECRET")
+OPENVERSE_MIN_SCORE = float(os.getenv("OPENVERSE_MIN_SCORE", "0.70"))
+OPENVERSE_PER_PAGE = int(os.getenv("OPENVERSE_PER_PAGE", "10"))
 
 STOCK_IMAGE_TIMEOUT_SECONDS = int(os.getenv("STOCK_IMAGE_TIMEOUT_SECONDS", "10"))
 STOCK_IMAGE_CACHE_HOURS = int(os.getenv("STOCK_IMAGE_CACHE_HOURS", "24"))

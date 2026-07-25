@@ -20,6 +20,11 @@ from config import (
     GROK_IMAGE_MODEL,
     GROK_IMAGE_RESOLUTION,
     IMAGE_FALLBACK_PROVIDER,
+    IMAGE_GENERATION_ONLY_AFTER_SEARCH_EXHAUSTED,
+    IMAGE_GENERATION_ON_PROVIDER_ERROR,
+    IMAGE_MIN_HEIGHT,
+    IMAGE_MIN_WIDTH,
+    IMAGE_SEARCH_ENGINE,
     IMAGE_SOURCE_PRIORITY,
     IMAGE_SOURCE_MODE,
     OPENAI_IMAGE_MODEL,
@@ -35,7 +40,8 @@ from config import (
     WP_USERNAME,
 )
 from stock_images import StockImageCandidate, find_stock_image
-from stock_images import record_stock_image_usage
+from image_search import search_images
+from image_search.reuse import record_image_usage
 
 session = requests.Session()
 token = base64.b64encode(f"{WP_USERNAME}:{WP_APP_PASSWORD}".encode()).decode()
@@ -1241,7 +1247,7 @@ def _maybe_source_image_content(url: str | None) -> tuple[bytes, str, dict[str, 
     return _source_image_content(url)
 
 
-def _stock_image_content(article: dict[str, Any]) -> tuple[bytes, str, dict[str, Any]] | None:
+def _stock_image_content_v1(article: dict[str, Any]) -> tuple[bytes, str, dict[str, Any]] | None:
     providers: tuple[str, ...] = ("pexels", "pixabay")
     candidate: StockImageCandidate | None = None
 
@@ -1291,6 +1297,94 @@ def _stock_image_content(article: dict[str, Any]) -> tuple[bytes, str, dict[str,
     }
 
 
+def _stock_image_content_v2(
+    article: dict[str, Any],
+) -> tuple[tuple[bytes, str, dict[str, Any]] | None, bool]:
+    prepared_images: dict[int, tuple[bytes, dict[str, Any]]] = {}
+
+    def prepare_hero(candidate: Any, downloaded: Any) -> bool:
+        converted = _cover_bytes_to_1536x1024(
+            downloaded.content,
+            min_width=IMAGE_MIN_WIDTH,
+            min_height=IMAGE_MIN_HEIGHT,
+        )
+        if not converted:
+            return False
+        prepared_images[id(candidate)] = converted
+        return True
+
+    result = search_images(article, post_download_validator=prepare_hero)
+    candidate = result.candidate
+    downloaded = result.downloaded
+    if not candidate or not downloaded:
+        return None, result.all_available_providers_exhausted
+
+    converted = prepared_images.get(id(candidate))
+    if not converted:
+        logger.error("[IMG-V2] selected image missing prepared hero asset_key=%s", candidate.asset_key)
+        return None, False
+    content, dims = converted
+    return (content, f"{candidate.provider}-search-image.jpg", {
+        "provider": candidate.provider,
+        "asset_id": candidate.asset_id,
+        "asset_key": candidate.asset_key,
+        "image_url": candidate.usable_url,
+        "image_url_hash": candidate.url_hash,
+        "canonical_source": candidate.canonical_source,
+        "source_page_url": candidate.source_page_url,
+        "creator_name": candidate.creator_name,
+        "creator_url": candidate.creator_url,
+        "license_name": candidate.license_name,
+        "license_version": candidate.license_version,
+        "license_url": candidate.license_url,
+        "attribution_text": candidate.attribution_text,
+        "credit_text": candidate.attribution_text,
+        "credit_name": candidate.creator_name,
+        "credit_url": candidate.source_page_url,
+        "provider_asset_id": candidate.asset_id,
+        "content_sha256": downloaded.content_sha256,
+        "perceptual_hash": downloaded.perceptual_hash,
+        "query": candidate.query,
+        "score": candidate.final_score,
+        "threshold": candidate.provider_threshold,
+        "openai_fallback_used": False,
+        "width": dims.get("width"),
+        "height": dims.get("height"),
+    }), False
+
+
+def _search_stock_image_content(
+    article: dict[str, Any],
+) -> tuple[tuple[bytes, str, dict[str, Any]] | None, bool]:
+    if IMAGE_SEARCH_ENGINE == "v2":
+        return _stock_image_content_v2(article)
+    return _stock_image_content_v1(article), True
+
+
+def _stock_image_content(article: dict[str, Any]) -> tuple[bytes, str, dict[str, Any]] | None:
+    selected, _exhausted = _search_stock_image_content(article)
+    return selected
+
+
+def _generation_allowed_after_search(search_exhausted: bool) -> bool:
+    if IMAGE_SEARCH_ENGINE != "v2" or not IMAGE_GENERATION_ONLY_AFTER_SEARCH_EXHAUSTED:
+        return True
+    if search_exhausted:
+        logger.info(
+            "[IMG-V2] all available search providers exhausted; continuing to generated image fallback"
+        )
+        return True
+    if IMAGE_GENERATION_ON_PROVIDER_ERROR:
+        logger.warning(
+            "[IMG-V2] search was not confirmed exhausted; generation allowed by IMAGE_GENERATION_ON_PROVIDER_ERROR=true"
+        )
+        return True
+    logger.warning(
+        "[IMG-V2] search was not confirmed exhausted because a provider was unavailable; skipping generated image fallback"
+    )
+    return False
+
+
 def upload_image(
     url: str | None,
     title: str,
@@ -1337,6 +1431,8 @@ def upload_image(
     primary_generated_provider = _normalize_image_provider(PRIMARY_IMAGE_PROVIDER, default="grok")
     fallback_generated_provider = _normalize_image_provider(IMAGE_FALLBACK_PROVIDER, default="openai")
     selected: tuple[bytes, str, dict[str, Any]] | None = None
+    search_exhausted = True
+    generation_allowed = True
     logger.info(
         "[IMG] mode=%s priority=%s use_source_images=%s primary=%s fallback=%s",
         mode,
@@ -1362,8 +1458,10 @@ def upload_image(
         if priority == "source_first":
             selected = _maybe_source_image_content(url)
         if not selected:
-            selected = _stock_image_content(article_context)
-        if not selected and _openai_fallback_enabled():
+            selected, search_exhausted = _search_stock_image_content(article_context)
+        if not selected:
+            generation_allowed = _generation_allowed_after_search(search_exhausted)
+        if not selected and generation_allowed and _openai_fallback_enabled():
             logger.info("[IMG] provider=stock failed; trying provider=openai")
             selected = _generated_image_content("openai", title, hashtags, fallback_used=True)
     else:
@@ -1371,9 +1469,12 @@ def upload_image(
             selected = _maybe_source_image_content(url)
 
         if not selected:
-            selected = _stock_image_content(article_context)
+            selected, search_exhausted = _search_stock_image_content(article_context)
 
         if not selected:
+            generation_allowed = _generation_allowed_after_search(search_exhausted)
+
+        if not selected and generation_allowed:
             logger.info(
                 "[IMG] stock image unavailable; trying provider=%s",
                 "grok-image" if primary_generated_provider == "grok" else primary_generated_provider,
@@ -1392,7 +1493,12 @@ def upload_image(
         if not selected and USE_SOURCE_IMAGES and priority == "stock_first":
             selected = _maybe_source_image_content(url)
 
-        if not selected and _openai_fallback_enabled() and primary_generated_provider != "openai":
+        if (
+            not selected
+            and generation_allowed
+            and _openai_fallback_enabled()
+            and primary_generated_provider != "openai"
+        ):
             if primary_generated_provider == "grok":
                 logger.info("[IMG] provider=grok-image failed; trying provider=openai")
             else:
@@ -1428,6 +1534,13 @@ def upload_image(
             image_meta.get("query"),
             image_meta.get("score"),
             image_meta.get("openai_fallback_used"),
+        )
+        credit_text = image_meta.get("credit_text") or ""
+        set_media_details(
+            media_id,
+            article_context.get("seo_focus") or title,
+            caption=credit_text or None,
+            description=credit_text or None,
         )
         return media_id, image_meta
     except Exception as exc:
@@ -1601,15 +1714,6 @@ def publish_news_to_wp() -> None:
                 hashtags=item.get("hashtags", ""),
                 article=item,
             )
-            if featured_id:
-                credit_text = image_meta.get("credit_text") or ""
-                set_media_details(
-                    featured_id,
-                    item.get("seo_focus") or item["title"],
-                    caption=credit_text or None,
-                    description=credit_text or None,
-                )
-
             # ---- categories ----
             cat_names = [c.strip() for c in item.get("category", "General").split(",") if c.strip()]
             category_ids = [ensure_category(name) for name in cat_names]
@@ -1656,7 +1760,7 @@ def publish_news_to_wp() -> None:
             post_id = body["id"]
             print(f"✅ Published WP post {post_id} at {schedule_at_utc:%Y-%m-%d %H:%M:%S}Z")
             if featured_id:
-                record_stock_image_usage(image_meta, post_id, item["title"])
+                record_image_usage(image_meta, post_id, item["title"])
 
             # Yoast SEO postmeta via DB. Do not rely on plugin REST meta exposure.
             with mysql.connector.connect(**WP_DB_CONFIG) as wp_conn:

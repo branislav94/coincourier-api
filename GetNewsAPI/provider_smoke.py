@@ -11,6 +11,12 @@ from config import (
     GROK_REASONING_EFFORT,
     GROK_TEXT_MODEL,
     IMAGE_FALLBACK_PROVIDER,
+    IMAGE_GENERATION_ONLY_AFTER_SEARCH_EXHAUSTED,
+    IMAGE_GENERATION_ON_PROVIDER_ERROR,
+    IMAGE_GLOBAL_CANDIDATE_LIMIT,
+    IMAGE_LICENSE_ALLOWLIST,
+    IMAGE_SEARCH_ENGINE,
+    IMAGE_SEARCH_PROVIDERS,
     IMAGE_SOURCE_MODE,
     IMAGE_SOURCE_PRIORITY,
     OPENAI_IMAGE_FALLBACK,
@@ -47,6 +53,11 @@ def _expected_image_flow() -> str:
     primary = _provider_label(PRIMARY_IMAGE_PROVIDER)
     fallback = _provider_label(IMAGE_FALLBACK_PROVIDER)
     openai_fallback = OPENAI_IMAGE_FALLBACK and fallback == "openai"
+    search_providers = (
+        list(IMAGE_SEARCH_PROVIDERS)
+        if IMAGE_SEARCH_ENGINE == "v2"
+        else ["pexels", "pixabay"]
+    )
 
     if mode == "openai" or priority == "openai_only":
         return "openai"
@@ -61,10 +72,10 @@ def _expected_image_flow() -> str:
         generated.append("openai")
 
     if priority == "source_first" and USE_SOURCE_IMAGES:
-        return " -> ".join(["source", "pexels", "pixabay", *generated])
+        return " -> ".join(["source", *search_providers, *generated])
     if priority == "stock_first" and USE_SOURCE_IMAGES:
-        return " -> ".join(["pexels", "pixabay", primary, "source", *generated[1:]])
-    return " -> ".join(["pexels", "pixabay", *generated])
+        return " -> ".join([*search_providers, primary, "source", *generated[1:]])
+    return " -> ".join([*search_providers, *generated])
 
 
 def _run_grok_text_smoke() -> None:
@@ -129,6 +140,18 @@ def main() -> None:
     print(f"use-source-images={_bool_text(USE_SOURCE_IMAGES)}")
     print(f"image-fallback-provider={IMAGE_FALLBACK_PROVIDER}")
     print(f"openai-image-fallback={_bool_text(OPENAI_IMAGE_FALLBACK)}")
+    print(f"image-search-engine={IMAGE_SEARCH_ENGINE}")
+    print(f"image-search-providers={','.join(IMAGE_SEARCH_PROVIDERS)}")
+    print(f"image-license-allowlist={','.join(IMAGE_LICENSE_ALLOWLIST)}")
+    print(f"image-global-candidate-limit={IMAGE_GLOBAL_CANDIDATE_LIMIT}")
+    print(
+        "image-generation-only-after-search-exhausted="
+        f"{_bool_text(IMAGE_GENERATION_ONLY_AFTER_SEARCH_EXHAUSTED)}"
+    )
+    print(
+        "image-generation-on-provider-error="
+        f"{_bool_text(IMAGE_GENERATION_ON_PROVIDER_ERROR)}"
+    )
     print(f"expected-image-flow={_expected_image_flow()}")
     print(f"stock-image-reuse-window-days={STOCK_IMAGE_REUSE_WINDOW_DAYS}")
     print(f"stock-image-usage-path={STOCK_IMAGE_USAGE_PATH}")
