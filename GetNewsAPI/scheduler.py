@@ -13,15 +13,22 @@ Side effects:
 """
 
 import logging
+import threading
 from apscheduler.schedulers.background import BackgroundScheduler
 from datetime import datetime, timedelta
 
 from fetcher import start_scheduler as start_fetcher_scheduler
+from fetcher import stop_scheduler as stop_fetcher_scheduler
 from gpt_processor import process_news_with_gpt
 from publish_to_wp import publish_news_to_wp
 
 
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
+
+
+_scheduler = None
+_fetch_scheduler = None
+_scheduler_lock = threading.Lock()
 
 
 def chained_job():
@@ -91,21 +98,56 @@ def start_scheduler():
         None
 
     Returns:
-        None
+        tuple:
+            References to the fetch and chained schedulers.
     """
-    # start fetcher (runs immediately and then every 30 min)
-    start_fetcher_scheduler()
+    global _scheduler, _fetch_scheduler
 
-    # run processor/publisher every 30 min, but start a little later than the fetcher
-    scheduler = BackgroundScheduler()
-    scheduler.add_job(
-        chained_job,
-        "interval",
-        minutes=30,
-        next_run_time=datetime.now() + timedelta(minutes=3),  # ← offset so fetch finishes first
-        misfire_grace_time=3600,
-        coalesce=True,
-        max_instances=1,
-        jitter=10
-    )
-    scheduler.start()
+    with _scheduler_lock:
+        if _scheduler is not None:
+            return _fetch_scheduler, _scheduler
+
+        fetch_scheduler = None
+        scheduler = None
+        try:
+            fetch_scheduler = start_fetcher_scheduler()
+            # Run processor/publisher every 30 min, offset so fetch finishes first.
+            scheduler = BackgroundScheduler()
+            scheduler.add_job(
+                chained_job,
+                "interval",
+                minutes=30,
+                next_run_time=datetime.now() + timedelta(minutes=3),
+                misfire_grace_time=3600,
+                coalesce=True,
+                max_instances=1,
+                jitter=10
+            )
+            scheduler.start()
+        except Exception:
+            try:
+                if scheduler is not None and scheduler.running:
+                    scheduler.shutdown(wait=False)
+            finally:
+                stop_fetcher_scheduler(wait=False)
+            raise
+
+        _fetch_scheduler = fetch_scheduler
+        _scheduler = scheduler
+        return _fetch_scheduler, _scheduler
+
+
+def stop_scheduler(wait: bool = False) -> None:
+    """Stop both scheduler instances and clear their process-local references."""
+    global _scheduler, _fetch_scheduler
+
+    with _scheduler_lock:
+        scheduler = _scheduler
+        _scheduler = None
+        _fetch_scheduler = None
+
+    try:
+        if scheduler is not None and scheduler.running:
+            scheduler.shutdown(wait=wait)
+    finally:
+        stop_fetcher_scheduler(wait=wait)

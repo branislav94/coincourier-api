@@ -1295,7 +1295,8 @@ def start_scheduler():
         None
 
     Returns:
-        None
+        apscheduler.schedulers.background.BackgroundScheduler:
+            The process-local scheduler reference.
     """
     global _scheduler
     with _scheduler_lock:
@@ -1313,6 +1314,19 @@ def start_scheduler():
             )
             _scheduler.start()
             print("[FETCH] Scheduler started.")
+        return _scheduler
+
+
+def stop_scheduler(wait: bool = False) -> None:
+    """Stop the process-local fetch scheduler and clear its singleton reference."""
+    global _scheduler
+
+    with _scheduler_lock:
+        scheduler = _scheduler
+        _scheduler = None
+
+    if scheduler is not None and scheduler.running:
+        scheduler.shutdown(wait=wait)
 
 def fetch_all_news():
     """
