@@ -23,3 +23,11 @@ services:
     restart: unless-stopped
 
     command: python app.py
+
+    networks:
+      - dokploy-network
+
+networks:
+  dokploy-network:
+    external: true
+    name: dokploy-network
