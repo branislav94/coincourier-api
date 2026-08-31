@@ -272,20 +272,45 @@ and representative mocked request/response fixtures before implementation.
   and pipeline behavior is intended to remain unchanged.
 - Commit boundary: one isolated FastAPI parity commit after tests pass.
 
-### Phase 1: Publisher models and WordPress adapter
+### Phase 1: Publisher models and WordPress adapter (implemented)
 
-- Files created: `publishing/models.py`, `base.py`, `registry.py`, and focused
-  `publishing/wordpress/` modules plus tests.
-- Files modified: `publish_to_wp.py` becomes a thin compatibility wrapper;
-  configuration changes only if target-neutral constructor wiring needs it.
-- Compatibility wrappers: `publish_news_to_wp()` retains its signature and result.
-- Tests: golden WordPress payloads, media attribution, taxonomy, Yoast, and wrapper
-  parity using mocks.
-- Rollout switch: internal `WORDPRESS_ADAPTER_V2=false` during shadow comparison.
-- Rollback: switch off the adapter and use the preserved legacy function body.
+- Actual package tree:
+
+  ```text
+  publishing/
+      __init__.py
+      models.py
+      base.py
+      wordpress/
+          __init__.py
+          client.py
+          publisher.py
+          media.py
+          taxonomy.py
+          seo.py
+  ```
+
+- `publish_to_wp.py` is a thin compatibility alias that preserves
+  `publish_news_to_wp()`, `slugify()`, and existing image-helper patch surfaces.
+- The generic boundary contains only `PublicationArticle`, `PublicationImage`,
+  `PublicationContext`, `PublicationResult`, and the synchronous `Publisher`
+  protocol. WordPress remains the sole configured target; no registry or service
+  was added.
+- WordPress authentication/retries, media transport/metadata, taxonomy, post
+  payload creation, Yoast writes, and the current batch publisher are separated
+  without changing their observable ordering or failure behavior.
+- Advisory locking, due-row SQL, image selection coordination, usage recording,
+  and the final application `published=1` update remain in the extracted
+  WordPress publisher until Phase 2 introduces transaction-owning services.
+- Characterization tests cover wrapper/caller compatibility, WordPress payloads,
+  authentication, retries, media attribution, taxonomy, Yoast SQL, locking, and
+  application published-state behavior with mocks only.
+- Rollout switch: none; this is the existing path after a behavior-preserving
+  extraction.
+- Rollback: restore the pre-extraction `publish_to_wp.py` implementation and
+  remove the Phase 1 package/tests.
 - Risk: accidental payload or exception translation drift.
 - Behavior change: none; the same WordPress requests and database transitions.
-- Commit boundary: models/interface, then adapter modules, then wrapper wiring.
 
 ### Phase 2: PublishingService and durable publication state
 
