@@ -179,6 +179,13 @@ STOCK_IMAGE_REUSE_WINDOW_DAYS = int(os.getenv("STOCK_IMAGE_REUSE_WINDOW_DAYS", "
 STOCK_IMAGE_USAGE_PATH = os.getenv("STOCK_IMAGE_USAGE_PATH", "/app/cache/stock_image_usage.json")
 STOCK_IMAGE_REUSE_CHECK_WP_HISTORY = _env_bool("STOCK_IMAGE_REUSE_CHECK_WP_HISTORY", True)
 
+# Additive durable-state rollout controls. Apply maintenance/migrations Phase 2
+# before enabling these in an environment with an existing database.
+PROCESS_DURABLE_CLAIMS_ENABLED = _env_bool("PROCESS_DURABLE_CLAIMS_ENABLED", False)
+PROCESS_CLAIM_TIMEOUT_MINUTES = int(os.getenv("PROCESS_CLAIM_TIMEOUT_MINUTES", "30"))
+PUBLISH_DURABLE_STATE_ENABLED = _env_bool("PUBLISH_DURABLE_STATE_ENABLED", False)
+PUBLISH_CLAIM_TIMEOUT_MINUTES = int(os.getenv("PUBLISH_CLAIM_TIMEOUT_MINUTES", "30"))
+
 # WordPress REST API credentials
 WP_API_URL = os.getenv("WP_API_URL")
 WP_USERNAME = os.getenv("WP_USERNAME")

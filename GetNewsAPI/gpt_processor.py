@@ -14,9 +14,13 @@ from config import (
     OPENAI_REASONING_EFFORT,
     OPENAI_TEXT_MODEL,
     PIPELINE_FRESH_START_AFTER_UTC_SQL,
+    PROCESS_CLAIM_TIMEOUT_MINUTES,
+    PROCESS_DURABLE_CLAIMS_ENABLED,
     PRIMARY_LLM_PROVIDER,
     get_grok_reasoning_effort,
 )
+from repositories.raw_news import RawNewsRepository
+from repositories.state import claim_prefix, safe_error_message
 import time, random
 import requests
 from typing import Any, Dict
@@ -1714,35 +1718,54 @@ def store_rich_news(record: dict, original: dict) -> None:
 
     conn = get_db_connection()
     cur  = conn.cursor()
-    cur.execute(
-        """
-        INSERT INTO rich_crpytonews
-          (news_url, title, full_text, publish_date,
-           source_name, category, hashtags, sentiment,
-           tickers, image_url,
-           seo_focus, seo_slug, seo_meta)
-        VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s)
-        ON DUPLICATE KEY UPDATE
-          seo_focus = VALUES(seo_focus),
-          seo_slug  = VALUES(seo_slug),
-          seo_meta  = VALUES(seo_meta)
-        """,
-        (
-            original["news_url"],
-            record["title"],
-            record["full_text"],
-            datetime.utcnow().strftime("%Y-%m-%d %H:%M:%S"),
-            original.get("source_name", ""),
-            record["category"],
-            record["hashtags"],
-            record["sentiment"],
-            ", ".join(original.get("tickers", [])),
-            original.get("image_url", ""),
-            record["seo_focus"],
-            record["seo_slug"],
-            record["seo_meta"],
-        ),
+    values = (
+        original["news_url"],
+        record["title"],
+        record["full_text"],
+        datetime.utcnow().strftime("%Y-%m-%d %H:%M:%S"),
+        original.get("source_name", ""),
+        record["category"],
+        record["hashtags"],
+        record["sentiment"],
+        ", ".join(original.get("tickers", [])),
+        original.get("image_url", ""),
+        record["seo_focus"],
+        record["seo_slug"],
+        record["seo_meta"],
     )
+    if PROCESS_DURABLE_CLAIMS_ENABLED:
+        cur.execute(
+            """
+            INSERT INTO rich_crpytonews
+              (news_url, raw_article_id, title, full_text, publish_date,
+               source_name, category, hashtags, sentiment,
+               tickers, image_url,
+               seo_focus, seo_slug, seo_meta)
+            VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s)
+            ON DUPLICATE KEY UPDATE
+              raw_article_id = COALESCE(raw_article_id, VALUES(raw_article_id)),
+              seo_focus = VALUES(seo_focus),
+              seo_slug  = VALUES(seo_slug),
+              seo_meta  = VALUES(seo_meta)
+            """,
+            (values[0], original["id"], *values[1:]),
+        )
+    else:
+        cur.execute(
+            """
+            INSERT INTO rich_crpytonews
+              (news_url, title, full_text, publish_date,
+               source_name, category, hashtags, sentiment,
+               tickers, image_url,
+               seo_focus, seo_slug, seo_meta)
+            VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s)
+            ON DUPLICATE KEY UPDATE
+              seo_focus = VALUES(seo_focus),
+              seo_slug  = VALUES(seo_slug),
+              seo_meta  = VALUES(seo_meta)
+            """,
+            values,
+        )
     conn.commit()
     cur.close()
     conn.close()
@@ -1845,7 +1868,7 @@ def validate_rewritten_article(doc: dict, raw: dict) -> None:
         )
         raise ArticleValidationError(failures, raw.get("id"), raw.get("title"))
 
-def process_one(raw):
+def process_one(raw, *, mark_complete=True, on_error=None):
     """
     Process a single raw cryptonewsapi row through the GPT enrichment pipeline.
 
@@ -1883,15 +1906,18 @@ def process_one(raw):
         validate_rewritten_article(final_doc, raw)
         logging.info("SEO dump: %s", {k: final_doc[k] for k in ("seo_focus","seo_slug","seo_meta")})
         store_rich_news(final_doc, raw)     # ✅ store first
-        mark_processed(raw["news_url"])     # ✅ then mark processed
+        if mark_complete:
+            mark_processed(raw["news_url"])     # ✅ then mark processed
         return True
-    except Exception:
+    except Exception as exc:
         logging.exception(
             "GPT pipeline failed; article remains retryable. article_id=%s title=%r source=%r",
             raw.get("id"),
             raw.get("title"),
             raw.get("source_name"),
         )
+        if on_error is not None:
+            on_error(exc)
         return False
 
 
@@ -1928,6 +1954,12 @@ def process_news_with_gpt(batch_size: int | None = None):
         batch_size = max(
             PROCESS_BATCH_MIN,
             min(PROCESS_BATCH_MAX, _count_due_within(PROCESS_LOOKAHEAD_MINUTES)),
+        )
+
+    if PROCESS_DURABLE_CLAIMS_ENABLED:
+        return _process_news_with_durable_claims(
+            int(batch_size),
+            use_lookahead_filter=use_lookahead_filter,
         )
 
     fresh_start_clause = ""
@@ -1975,6 +2007,97 @@ def process_news_with_gpt(batch_size: int | None = None):
 
     result = {"attempted": attempted, "succeeded": succeeded, "failed": failed}
     if failed:
+        logging.warning("GPT processing completed with failures: %s", result)
+    else:
+        logging.info("GPT processing completed: %s", result)
+    return result
+
+
+def _process_news_with_durable_claims(
+    batch_size: int,
+    *,
+    use_lookahead_filter: bool,
+) -> dict[str, int]:
+    """Run claimed work after the claim transaction has been committed."""
+    repository = RawNewsRepository()
+    result = {"attempted": 0, "succeeded": 0, "failed": 0}
+
+    for _ in range(max(0, batch_size)):
+        claim = repository.claim_next(
+            timeout_minutes=PROCESS_CLAIM_TIMEOUT_MINUTES,
+            lookahead_minutes=(PROCESS_LOOKAHEAD_MINUTES if use_lookahead_filter else None),
+            fresh_start_after=PIPELINE_FRESH_START_AFTER_UTC_SQL,
+        )
+        if claim is None:
+            break
+
+        raw_id = int(claim.article["id"])
+        result["attempted"] += 1
+        logging.info(
+            "[PROCESS-CLAIM] raw_article_id=%s attempt=%s claim=%s decision=%s",
+            raw_id,
+            claim.attempt,
+            claim_prefix(claim.token),
+            "reclaimed-expired" if claim.recovered else "claimed",
+        )
+        captured_error: list[Exception] = []
+        try:
+            succeeded = process_one(
+                claim.article,
+                mark_complete=False,
+                on_error=captured_error.append,
+            )
+            if succeeded:
+                if not repository.complete(raw_id, claim.token):
+                    raise RuntimeError("processing claim ownership was lost before completion")
+                result["succeeded"] += 1
+                logging.info(
+                    "[PROCESS-CLAIM] raw_article_id=%s attempt=%s claim=%s decision=completed",
+                    raw_id,
+                    claim.attempt,
+                    claim_prefix(claim.token),
+                )
+                continue
+
+            error = captured_error[0] if captured_error else RuntimeError("processing did not complete")
+            repository.fail(
+                raw_id,
+                claim.token,
+                safe_error_message(error, "processing"),
+            )
+            result["failed"] += 1
+            logging.warning(
+                "[PROCESS-CLAIM] raw_article_id=%s attempt=%s claim=%s decision=retryable error_type=%s",
+                raw_id,
+                claim.attempt,
+                claim_prefix(claim.token),
+                type(error).__name__,
+            )
+        except Exception as exc:
+            repository.fail(
+                raw_id,
+                claim.token,
+                safe_error_message(exc, "processing"),
+            )
+            result["failed"] += 1
+            logging.exception(
+                "[PROCESS-CLAIM] raw_article_id=%s attempt=%s claim=%s decision=retryable",
+                raw_id,
+                claim.attempt,
+                claim_prefix(claim.token),
+            )
+        except BaseException:
+            try:
+                repository.release_interrupted(raw_id, claim.token)
+            except Exception:
+                logging.exception(
+                    "[PROCESS-CLAIM] raw_article_id=%s claim=%s decision=release-failed",
+                    raw_id,
+                    claim_prefix(claim.token),
+                )
+            raise
+
+    if result["failed"]:
         logging.warning("GPT processing completed with failures: %s", result)
     else:
         logging.info("GPT processing completed: %s", result)

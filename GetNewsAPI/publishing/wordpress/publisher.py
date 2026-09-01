@@ -30,6 +30,8 @@ from config import (
     OPENAI_IMAGE_FALLBACK,
     PIPELINE_FRESH_START_AFTER_UTC_SQL,
     PRIMARY_IMAGE_PROVIDER,
+    PUBLISH_CLAIM_TIMEOUT_MINUTES,
+    PUBLISH_DURABLE_STATE_ENABLED,
     STOCK_IMAGE_TIMEOUT_SECONDS,
     USE_API_IMAGES,
     USE_SOURCE_IMAGES,
@@ -45,8 +47,11 @@ from publishing.models import (
     PublicationImage,
     PublicationResult,
 )
+from publishing.service import PublishingService, publication_key_prefix
+from repositories.publication import PublicationRepository
 from publishing.wordpress import client as wordpress_client
 from publishing.wordpress import media as wordpress_media
+from publishing.wordpress import persistence as wordpress_persistence
 from publishing.wordpress import seo as wordpress_seo
 from publishing.wordpress import taxonomy as wordpress_taxonomy
 
@@ -1496,12 +1501,155 @@ def link_markets(text: str) -> str:
 class WordPressPublisher:
     """Publish one prepared article through the current WordPress behavior."""
 
+    def reconcile(
+        self,
+        article: PublicationArticle,
+        context: PublicationContext,
+    ) -> PublicationResult | None:
+        if not context.publication_key:
+            return None
+
+        source = None
+        with mysql.connector.connect(**WP_DB_CONFIG) as wp_conn:
+            existing = None
+            if context.existing_external_id is not None:
+                existing = wordpress_persistence.find_post_by_id(
+                    wp_conn,
+                    context.existing_external_id,
+                )
+                source = "local"
+                decision = "reconcile-local-id"
+                if existing is None:
+                    logger.error(
+                        "[WP-IDEMPOTENCY] rich_article_id=%s publication_key=%s "
+                        "existing_wp_post_id=%s decision=local-id-missing",
+                        context.rich_article_id,
+                        publication_key_prefix(context.publication_key),
+                        context.existing_external_id,
+                    )
+                    return PublicationResult(
+                        success=False,
+                        external_id=context.existing_external_id,
+                        error="saved WordPress post ID no longer exists",
+                    )
+                existing_key = existing.get("publication_key")
+                if existing_key and existing_key != context.publication_key:
+                    logger.error(
+                        "[WP-IDEMPOTENCY] rich_article_id=%s publication_key=%s "
+                        "existing_wp_post_id=%s decision=local-id-key-mismatch",
+                        context.rich_article_id,
+                        publication_key_prefix(context.publication_key),
+                        context.existing_external_id,
+                    )
+                    return PublicationResult(
+                        success=False,
+                        external_id=context.existing_external_id,
+                        error="saved WordPress post ID has a different publication identity",
+                    )
+            else:
+                existing = wordpress_persistence.find_post_by_publication_key(
+                    wp_conn,
+                    context.publication_key,
+                )
+                decision = "reconcile-publication-key"
+                source = "wp-meta"
+                if existing is None:
+                    logger.info(
+                        "[WP-IDEMPOTENCY] rich_article_id=%s publication_key=%s "
+                        "existing_wp_post_id=none decision=create",
+                        context.rich_article_id,
+                        publication_key_prefix(context.publication_key),
+                    )
+                    return None
+
+            post_id = int(existing["ID"])
+            post_url = existing.get("guid")
+            logger.info(
+                "[WP-IDEMPOTENCY] rich_article_id=%s publication_key=%s "
+                "existing_wp_post_id=%s decision=%s",
+                context.rich_article_id,
+                publication_key_prefix(context.publication_key),
+                post_id,
+                decision,
+            )
+            self._write_publication_identity(wp_conn, post_id, context)
+            if context.persist_external_state is not None:
+                context.persist_external_state(post_id, post_url)
+            self._write_yoast(wp_conn, post_id, article)
+
+        logger.info(
+            "[WP-RECONCILE] rich_article_id=%s wp_post_id=%s source=%s decision=complete",
+            context.rich_article_id,
+            post_id,
+            source,
+        )
+        return PublicationResult(
+            success=True,
+            external_id=post_id,
+            external_url=post_url,
+            reconciled=True,
+        )
+
+    def external_media_exists(self, external_id: int) -> bool:
+        with mysql.connector.connect(**WP_DB_CONFIG) as wp_conn:
+            return wordpress_persistence.media_exists(wp_conn, external_id)
+
+    def find_external_media(self, publication_key: str) -> int | None:
+        with mysql.connector.connect(**WP_DB_CONFIG) as wp_conn:
+            found = wordpress_persistence.find_media_by_publication_key(
+                wp_conn,
+                publication_key,
+            )
+        return int(found["ID"]) if found else None
+
+    def persist_external_media_identity(self, external_id: int, publication_key: str) -> None:
+        with mysql.connector.connect(**WP_DB_CONFIG) as wp_conn:
+            wordpress_persistence.write_media_publication_key(
+                wp_conn,
+                external_id,
+                publication_key,
+            )
+
+    @staticmethod
+    def _write_publication_identity(
+        wp_conn: Any,
+        post_id: int,
+        context: PublicationContext,
+    ) -> None:
+        if not context.publication_key:
+            return
+        wordpress_persistence.write_publication_metadata(
+            wp_conn,
+            post_id,
+            {
+                wordpress_persistence.PUBLICATION_KEY_META: context.publication_key,
+                wordpress_persistence.RAW_ARTICLE_ID_META: context.raw_article_id,
+                wordpress_persistence.RICH_ARTICLE_ID_META: context.rich_article_id,
+                wordpress_persistence.SOURCE_URL_META: context.source_url,
+            },
+        )
+
+    @staticmethod
+    def _write_yoast(wp_conn: Any, post_id: int, article: PublicationArticle) -> None:
+        write_yoast_metadata(
+            wp_conn,
+            post_id,
+            focus_keyword=article.seo_focus,
+            description=article.seo_description or "",
+            title=article.title or "",
+            canonical_url=article.canonical_url,
+        )
+
     def publish(
         self,
         article: PublicationArticle,
         image: PublicationImage | None,
         context: PublicationContext,
     ) -> PublicationResult:
+        reconciled = self.reconcile(article, context)
+        if reconciled is not None:
+            return reconciled
+
         cat_names = [
             category.strip()
             for category in article.categories.split(",")
@@ -1556,22 +1704,42 @@ class WordPressPublisher:
             print("❌ Error publishing post:", error_text)
             return PublicationResult(success=False, error=error_text)
 
-        post_id = response.json()["id"]
+        response_payload = response.json()
+        post_id = response_payload["id"]
+        post_url = response_payload.get("link")
         print(f"✅ Published WP post {post_id} at {schedule_at_utc:%Y-%m-%d %H:%M:%S}Z")
+
+        identity_error = None
+        if context.publication_key:
+            try:
+                with mysql.connector.connect(**WP_DB_CONFIG) as wp_conn:
+                    self._write_publication_identity(wp_conn, post_id, context)
+            except Exception as exc:
+                identity_error = exc
+        local_state_error = None
+        if context.persist_external_state is not None:
+            try:
+                context.persist_external_state(post_id, post_url)
+            except Exception as exc:
+                local_state_error = exc
+        if identity_error is not None:
+            raise identity_error
+        if local_state_error is not None:
+            raise local_state_error
+
         if image:
             record_image_usage(image.metadata, post_id, article.title)
 
         with mysql.connector.connect(**WP_DB_CONFIG) as wp_conn:
-            write_yoast_metadata(
-                wp_conn,
-                post_id,
-                focus_keyword=article.seo_focus,
-                description=article.seo_description or "",
-                title=article.title or "",
-                canonical_url=article.canonical_url,
-            )
+            self._write_yoast(wp_conn, post_id, article)
 
-        return PublicationResult(success=True, external_id=post_id)
+        return PublicationResult(
+            success=True,
+            external_id=post_id,
+            external_url=post_url,
+            media_external_id=(image.external_id if image else None),
+            created=True,
+        )
 
 
 # ---------- Main publisher ---------------------------------------------------
@@ -1634,6 +1802,29 @@ def publish_news_to_wp() -> None:
 
         # cap per-run (env with sensible default)
         batch_cap = int(os.getenv("PUBLISH_BATCH_MAX", "10"))
+        if PUBLISH_DURABLE_STATE_ENABLED:
+            repository = PublicationRepository()
+
+            def prepare_image(item: dict[str, Any]) -> tuple[int | None, dict[str, Any]]:
+                return upload_image(
+                    item.get("image_url"),
+                    title=item["title"],
+                    hashtags=item.get("hashtags", ""),
+                    article=item,
+                )
+
+            service = PublishingService(
+                repository,
+                WordPressPublisher(),
+                prepare_image,
+                claim_timeout_minutes=PUBLISH_CLAIM_TIMEOUT_MINUTES,
+                fresh_start_after=PIPELINE_FRESH_START_AFTER_UTC_SQL,
+            )
+            durable_result = service.publish_due(min(due, batch_cap))
+            if durable_result["attempted"] == 0:
+                print("No new news items to publish.")
+            return
+
         news_items = fetch_unpublished(limit=min(due, batch_cap))
         if not news_items:
             print("No new news items to publish.")

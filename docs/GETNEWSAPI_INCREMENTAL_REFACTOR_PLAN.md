@@ -314,19 +314,38 @@ and representative mocked request/response fixtures before implementation.
 
 ### Phase 2: PublishingService and durable publication state
 
-- Files created: `publishing/service.py`, `repositories/publication.py`, a focused
-  publication-state migration, and reconciliation tests/jobs.
-- Files modified: publisher wrapper and task/scheduler wiring call the service.
-- Compatibility wrappers: `publish_news_to_wp()` delegates to WordPress through
-  the service while preserving callers.
-- Tests: atomic claims, concurrent claim rejection, idempotent retry, external-ID
-  persistence, crash recovery, reconciliation, and structured logs.
-- Rollout switch: `PUBLISHING_SERVICE_V2=false`, enabled first in shadow/claim-only
-  mode and then for a small publication cohort.
-- Rollback: disable service routing; preserve new state for diagnosis.
-- Risk: claim deadlocks or incorrect reconciliation after partial target success.
-- Behavior change: intentional idempotency and recoverable publication attempts.
-- Commit boundary: schema/repository, claims, reconciliation, then wiring.
+**IMPLEMENTED BUT DISABLED**
+
+- `RawNewsRepository` and `PublicationRepository` use short `SELECT ... FOR
+  UPDATE` transactions to assign cryptographically random owner tokens. The
+  transaction commits before LLM, image, or WordPress work; owner-token updates
+  complete or release the row, and timed-out claims can be recovered.
+- `PublishingService` owns claim, durable `coincourier:<rich-id>:<raw-id>`
+  identity, local state, media recovery, adapter invocation, and completion.
+  WordPress-specific lookup and metadata SQL remain in the WordPress adapter.
+- The manual MariaDB 10.4 migration is versioned under
+  `maintenance/migrations/`. URL/raw-identity and uniqueness preflights are
+  reviewed before indexes are created; no migration runs at application startup.
+- WordPress reconciliation checks local `wp_post_id`, then
+  `_coincourier_publication_key`. New post identity is written to WordPress and
+  attempted in the application DB before image-usage recording and Yoast writes.
+  Media IDs are similarly validated or recovered through attachment metadata.
+- `publish_to_wp.publish_news_to_wp()` retains `wp_publisher_lock`; `app.py`,
+  `tasks.py`, and `scheduler.py` retain their existing public calls.
+- Rollout switches are `PROCESS_DURABLE_CLAIMS_ENABLED=false` and
+  `PUBLISH_DURABLE_STATE_ENABLED=false` by source default. Apply and verify all
+  migration steps before enabling either switch.
+- Rollback disables both switches and releases active claims with
+  `005_phase2_rollback_state.sql`; additive columns, IDs, and reconciliation
+  evidence remain in place.
+- Verification: 41 focused mocked/static Phase 2 tests and 128 discovered tests
+  pass. No disposable MariaDB integration environment exists, so DDL execution
+  remains an operator pre-deployment check.
+- Remaining risk: REST post creation and the first durable write span two
+  databases. Writing WP identity first and local ID second recovers either
+  single-write failure, but a hard process kill in the instruction-sized gap
+  immediately after HTTP 201 cannot be made atomic without a WordPress-side
+  idempotent create endpoint or registered create-time metadata.
 
 ### Phase 3: Payload CMS adapter
 
@@ -343,10 +362,11 @@ and representative mocked request/response fixtures before implementation.
 - Behavior change: only explicitly configured deployments publish to Payload.
 - Commit boundary: schema decision record, client, adapter, then opt-in wiring.
 
-### Phase 4: Repositories needed by claims and publication state
+### Phase 4: Additional repository extraction if justified
 
-- Files created: `repositories/raw_news.py` and `rich_articles.py` only for cohesive
-  claim/state operations not already covered by publication repository.
+- Phase 2 already introduced the transaction-owning `RawNewsRepository` and
+  `PublicationRepository`. Add `rich_articles.py` only if generated-article
+  persistence gains a cohesive transaction boundary beyond its current caller.
 - Files modified: the narrow call sites whose transactions move into repositories.
 - Compatibility wrappers: old helper functions delegate until all current callers
   are proven.

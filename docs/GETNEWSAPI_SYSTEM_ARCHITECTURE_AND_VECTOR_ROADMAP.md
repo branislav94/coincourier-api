@@ -17,6 +17,10 @@ Status labels used throughout this document:
 
 Repository evidence is authoritative only for the checked-in code and schema artifacts. No database, WordPress, CryptoNews, or model-provider connection was made for this audit. The checked-in SQL dump is older than the runtime code, so any statement about a newer runtime column is an inference from SQL issued by the application, not a claim that the production schema was inspected.
 
+Phase 2 durable claims and WordPress reconciliation are now **IMPLEMENTED BUT
+DISABLED**. Their additive migration is manual and both source-default feature
+flags remain false until an operator applies and verifies it.
+
 ## 1. Purpose and scope
 
 **CURRENT**
@@ -179,14 +183,14 @@ The daily counter counts selected rows, not successfully published posts (`fetch
 
 **CURRENT**
 
-Automatic batch size is the number due within the lookahead, clamped to `PROCESS_BATCH_MIN..PROCESS_BATCH_MAX` (`gpt_processor.py:144-179` and 1926-1931). Eligible rows are unprocessed, chosen, optionally within the fresh-start cutoff, and due within the lookahead; order is `scheduled_for`, then `selected_at` (`gpt_processor.py:1933-1964`). There is no processing advisory lock or transactional row claim.
+Automatic batch size is the number due within the lookahead, clamped to `PROCESS_BATCH_MIN..PROCESS_BATCH_MAX`. The source-default legacy path retains its existing eligible-row query and has no processing advisory lock or transactional claim. When `PROCESS_DURABLE_CLAIMS_ENABLED=true` after migration, `RawNewsRepository` selects the same eligible order under `FOR UPDATE`, assigns an owner token, and commits before LLM work. Claims expire after `PROCESS_CLAIM_TIMEOUT_MINUTES`.
 
 For each row (`gpt_processor.py:1848-1895`):
 
 1. Gemini search grounding requests up to three recent facts when the code constant is enabled (`gpt_processor.py:1121-1198`).
 2. The rewrite tries the configured primary LLM and then the configured fallback (`gpt_processor.py:876-921`). Defaults are Grok then OpenAI (`config.py:65-70`, `config.py:105-109`).
 3. The provider that produced the valid rewrite becomes sticky for repair (`gpt_processor.py:1353-1368`, `gpt_processor.py:1532-1625`). A short body may first receive same-provider expansion (`gpt_processor.py:747-811`).
-4. On failure, the row remains `processed=0` and is retryable (`gpt_processor.py:1888-1895`).
+4. On legacy-path failure, the row remains `processed=0`. On the durable path it also becomes `processing_status='retryable'`, clears its claim, and stores a bounded error class; success still sets `processed=1`.
 
 Provider HTTP calls use bounded retry/backoff. Grok retries up to seven times with jitter (`gpt_processor.py:591-669`); OpenAI handles network/transient statuses and malformed/truncated output (`gpt_processor.py:947-1115`); Gemini retries only 429/503 (`gpt_processor.py:1159-1172`).
 
@@ -208,7 +212,7 @@ The prompt examples repeatedly use `bitcoin dominance` as the SEO-focus example 
 
 Important persistence properties:
 
-- There is no `raw_article_id` foreign key in the insert; raw and rich rows join by `news_url`.
+- The legacy path still joins raw/rich by unique `news_url`. After migration, the durable path also writes `raw_article_id`; preflight proves that the URL backfill maps each rich row to one raw row before a unique index is added. No foreign key is inferred.
 - There is no check by raw ID, provider news ID, title, slug, event, or content similarity.
 - Rich insertion commits before raw `processed=1` is committed through a separate connection (`gpt_processor.py:1745-1748`, `gpt_processor.py:1776-1793`, `gpt_processor.py:1883-1887`).
 - A crash between those commits leaves a rich row with the raw row retryable. URL uniqueness prevents a second rich row for that same URL, but the expensive rewrite can repeat.
@@ -250,7 +254,7 @@ Openverse requests CC0, PDM, and CC BY works and normalizes work title, creator,
 
 ## 13. Image reuse, licensing and attribution
 
-**CURRENT**
+**CURRENT default; durable path IMPLEMENTED BUT DISABLED**
 
 Stock reuse is tracked in a local JSON file and checked for a configurable rolling window. V2-compatible usage records include provider asset/canonical/source identities, URL/content/perceptual hashes, creator/license attribution, post ID, title, and time (`image_search/reuse.py:86-121`). That common recorder is called after a successful post for stock images in either engine (`publish_to_wp.py:1759-1763`). Consequently, a V1 run can emit `[IMG-V2] recorded image usage`; the prefix does not prove that V2 search ran.
 
@@ -264,30 +268,33 @@ V1 checks local usage and recent WordPress attachments. V2 adds canonical identi
 
 The publisher takes the `wp_publisher_lock` advisory lock (`publish_to_wp.py:1642-1690`), counts due rich rows, and fetches up to `PUBLISH_BATCH_MAX` rows where the joined raw row is chosen, scheduled, due, and within any fresh-start cutoff (`publish_to_wp.py:226-260`, `publish_to_wp.py:683-722`, `publish_to_wp.py:1691-1704`).
 
-For each row it:
+The default-off legacy path preserves the Phase 1 order. With
+`PUBLISH_DURABLE_STATE_ENABLED=true` after migration, the same advisory lock
+wraps `PublishingService`, which claims one due rich row at a time before any
+external work. For a new post it:
 
 1. selects/generates and uploads media before creating the post;
 2. ensures categories and tags through WordPress REST;
 3. modifies article HTML with market/category links;
 4. posts immediately with title, content, slug, current `date_gmt`, terms, and optional featured media (`publish_to_wp.py:1709-1754`);
-5. on HTTP 201, records stock-image usage, writes Yoast values directly to the WordPress DB, then sets `rich_crpytonews.published=1` (`publish_to_wp.py:1754-1775`).
+5. on HTTP 201, writes CoinCourier identity postmeta and attempts to persist the local `wp_post_id` before image-usage and Yoast writes, then completes both `publish_status='published'` and legacy `published=1`.
 
-Media upload has transient HTTP retries (`publish_to_wp.py:1049-1087`); post creation uses one direct `session.post`. The publisher does not query WordPress by raw ID, rich ID, source URL, exact title, slug, or idempotency key. It does not persist `wp_post_id` in the application DB.
+The durable adapter checks a saved local `wp_post_id`, then direct WordPress postmeta for `_coincourier_publication_key`; it never uses title or slug as identity. It persists post/raw/rich/source metadata and can recover media by `_coincourier_media_publication_key` before image selection.
 
-**Critical idempotency gap:** after WordPress creates a post, any lost response, process crash, image-usage failure, WP DB metadata failure, or app-DB update failure can leave `rich_crpytonews.published=0`. The next run will create another post because no durable post ID or reconciliation key exists. The advisory lock prevents simultaneous publisher runs; it does not make one publication attempt crash-idempotent. An error before post creation can also leave orphaned media.
+The durable path recovers a post when either the WordPress identity write or local ID write survives a later failure, including Yoast or local completion failure. The two writes cannot be atomic with REST creation: a hard kill immediately after HTTP 201 but before either durable write remains a narrow residual gap. The default legacy path retains its former duplicate risk until migration and explicit enablement.
 
 ## 15. Database tables and state transitions
 
 **CURRENT - schema evidence limitation**
 
-The checked-in dump was generated against MariaDB 10.4 in April 2025 (`crypto_news_db.sql:1-8`). It lists only basic columns plus a unique `news_url` on each table (`crypto_news_db.sql:30-44`, `crypto_news_db.sql:70-84`, `crypto_news_db.sql:110-120`). Runtime SQL proves that the deployed schema must contain additional columns, but no current DDL or migration history is in the repository.
+The checked-in dump was generated against MariaDB 10.4 in April 2025 (`crypto_news_db.sql:1-8`). It lists only basic columns plus a unique `news_url` on each table. Phase 2 adds the repository's first versioned manual migration sequence under `maintenance/migrations/`; it is not evidence that any deployed schema has been migrated.
 
 **Runtime columns inferred from code**
 
 | Table | Key runtime fields used by code |
 |---|---|
-| `cryptonewsapi` | `id`, `news_url`, `canonical_url`, `title`, `full_text`, `publish_date`, source/topics/tickers/image, `news_id`, `event_id`, `rank_score`, `title_hash`, `fetch_batch_id`, `gpt_importance`, `is_breaking`, `recency_score`, `source_weight`, `final_importance`, `chosen_for_publish`, `selected_at`, `scheduled_for`, `processed`, `insertDate` |
-| `rich_crpytonews` | `id`, `news_url`, title/body, processing-time `publish_date`, source/category/hashtags/sentiment/tickers/image, `seo_focus`, `seo_slug`, `seo_meta`, `published`, `insertDate`; code may read `schema_jsonld` but does not write it |
+| `cryptonewsapi` | Existing runtime fields plus additive `processing_status`, claim token/time, attempt count, and safe last error after Phase 2 migration; `processed` remains |
+| `rich_crpytonews` | Existing runtime fields plus `raw_article_id`, publication claim state, `publication_key`, WP post/media IDs and metadata, external URL/timestamps after Phase 2 migration; `published` remains |
 
 ```mermaid
 stateDiagram-v2
@@ -304,7 +311,7 @@ stateDiagram-v2
     WPPostCreated --> PublishDue: crash before published flag (duplicate risk)
 ```
 
-The rich/raw relationship is a URL join, not a declared foreign key in the repository artifact. Published WordPress identity is not represented in the app schema.
+Before migration the rich/raw relationship remains a URL join. The additive migration backfills and uniquely indexes `raw_article_id` only after collision preflight, and adds local WordPress identity without removing legacy fields.
 
 ## 16. Scheduler, cron and advisory locks
 
@@ -334,7 +341,7 @@ Both local and CLI chained modes isolate processing failure from publishing (`sc
 | Image search/generation failure | post can proceed without featured image |
 | Media metadata failure | swallowed; post proceeds, attribution may be missing |
 | WP post non-201 | row remains unpublished; uploaded media can be orphaned |
-| WP post created, later step fails | row can remain unpublished and create a duplicate on retry |
+| WP post created, later step fails | durable path reconciles by local ID or WP publication meta; default legacy path retains duplicate risk |
 
 **CURRENT - fresh-start and backlog**
 
@@ -915,9 +922,9 @@ No test should make a live provider, WordPress, or production DB call by default
 - Compare selected-unprocessed, processed-without-published-rich, unpublished rich, and publish-ready counts using the reviewed dry-run queries; do not run the apply script without replacing the cutoff and changing its default rollback intentionally.
 - Treat "processing succeeded" and "publishing succeeded" as stage summaries, not proof that every intended row was handled.
 - For a suspected duplicate, collect raw/rich/WP IDs, provider news/event IDs, source/canonical URLs, source timestamps, content hashes, and decision records before deleting or unpublishing anything.
-- For a post visible in WordPress but `published=0`, do not rerun publication blindly. Current code cannot reconcile it safely; inspect WP IDs/title/slug/source manually first.
+- For a post visible in WordPress but `published=0`, enable no new behavior until Phase 2 migrations are verified. Once the durable path owns the row, reconcile only by saved WP ID or CoinCourier publication key, never title/slug.
 
-**PLANNED vector/idempotency checks**
+**PLANNED vector checks; IMPLEMENTED BUT DISABLED idempotency checks**
 
 - Monitor active embedding version coverage and dead/retry jobs.
 - Verify `VECTOR_ENABLED`, duplicate mode, policy version, and dimension/schema agreement at startup.

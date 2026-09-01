@@ -4,7 +4,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass, field
 from datetime import datetime
-from typing import Any, Mapping
+from typing import Any, Callable, Mapping
 
 
 @dataclass(frozen=True)
@@ -44,10 +44,20 @@ class PublicationImage:
 @dataclass(frozen=True)
 class PublicationContext:
     published_at_utc: datetime
+    publication_key: str | None = None
+    raw_article_id: int | None = None
+    rich_article_id: int | None = None
+    source_url: str | None = None
+    existing_external_id: int | None = None
+    persist_external_state: Callable[[int, str | None], None] | None = None
 
 
 @dataclass(frozen=True)
 class PublicationResult:
     success: bool
     external_id: int | None = None
+    external_url: str | None = None
+    media_external_id: int | None = None
+    created: bool = False
+    reconciled: bool = False
     error: str | None = None
