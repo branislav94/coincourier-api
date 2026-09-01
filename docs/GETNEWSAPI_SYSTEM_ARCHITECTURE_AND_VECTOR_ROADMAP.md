@@ -621,9 +621,14 @@ Calculate topic/entity saturation from both raw source labels and generated SEO 
 
 ## 23. MariaDB vector architecture
 
-**PLANNED**
+**PHASE 6A IMPLEMENTED LOCALLY; DISABLED AND NOT DEPLOYED**
 
-MariaDB 11.8 native `VECTOR` is the recommended store, conditional on a deployment preflight proving the actual server is 11.8 and supports the intended distance/index syntax. The repository's old 10.4 dump is not a production-version check, and compose does not declare a DB server.
+Phase 6A adds an optional, separate MariaDB service and database named
+`coincourier_vectors`. The reproducible local service uses `mariadb:11.8`, binds
+only to `127.0.0.1:13309`, and was verified against MariaDB 11.8.9. It does not
+alter or share the application database. `VECTOR_ENABLED=false` is the source
+default, and no fetch, process, publish, image, or duplicate path imports the
+vector store or opens its connection.
 
 At approximately 30 posts/day and 4-6 vectors/article, the mathematical range is about 43,800-65,700 vectors/year and the five-vector midpoint is 54,750. Allowing for summaries or occasional extra chunks makes 50,000-70,000 vectors/year a sound planning envelope. This is modest enough for one MariaDB deployment and an approximate vector index, while retaining relational joins and transactionally consistent metadata.
 
@@ -633,57 +638,61 @@ The current dependency is unpinned `mysql-connector-python` (`requirements.txt:3
 
 | Capability | Recommended connector use | Audit conclusion |
 |---|---|---|
-| `VEC_FromText()` | `INSERT ... embedding = VEC_FromText(%s)` with a JSON-like vector string | expected to work through the current protocol without a Python vector adapter; integration test required |
-| `VEC_ToText()` | select `VEC_ToText(embedding)` for diagnostics/backfill verification | avoids relying on native binary type decoding; integration test required |
-| `VECTOR(N)` | execute version-checked DDL | server capability, not an ORM/connector feature |
-| `VECTOR INDEX` | execute version-checked DDL and inspect query plans | server capability; exact MariaDB 11.8 syntax/options must be proven in a disposable integration environment |
+| `VEC_FromText()` | `INSERT ... embedding = VEC_FromText(%s)` with a JSON vector string | verified for parameterized inserts |
+| `VEC_ToText()` | select `VEC_ToText(embedding)` for round-trip verification | verified through `mysql-connector-python` text results |
+| `VECTOR(1536)` | fixed-dimension column plus explicit dimension/version metadata | verified practical; short/long vectors are rejected |
+| distance | `VEC_DISTANCE_COSINE(column, VEC_FromText(%s))` and `VEC_DISTANCE_EUCLIDEAN(...)` | verified; cosine is the Phase 6A retrieval distance |
+| `VECTOR INDEX` | `CREATE VECTOR INDEX IF NOT EXISTS name ON table (embedding) DISTANCE=cosine` | verified, including rerun and `EXPLAIN` selection |
 
-Do not bind or decode raw binary vector values initially. Use `VEC_FromText()` and `VEC_ToText()` so the existing connector handles ordinary text parameters/results. Pin the connector version and run a disposable MariaDB 11.8 test covering DDL, insert, update, cosine query, index creation, `EXPLAIN`, backup, and restore before production migration.
+The implementation does not bind or decode raw binary vector values. It uses
+`VEC_FromText()` and `VEC_ToText()` so the connector handles ordinary text
+parameters/results. Integration coverage proves DDL, inserts, round trips, cosine
+ordering, dimension and malformed-input rejection, rollback, index creation, and
+`EXPLAIN`. Production backup/restore rehearsal remains a deployment prerequisite.
 
-One `VECTOR(N)` column has a fixed dimension. "Configurable dimensions" therefore means one active deployment/schema dimension at a time, validated against `EMBEDDING_DIMENSIONS`; a dimension change requires a side-by-side physical table/column and re-embedding migration, not mixed dimensions in one vector column.
+One `VECTOR(N)` column has a fixed dimension. Phase 6A validates 1536 values in
+the repository and schema metadata. A future dimension change requires a
+side-by-side physical table/column and re-embedding migration, not mixed
+dimensions in one vector column.
 
-## 24. Proposed schemas
+## 24. Vector schemas
 
-**PLANNED - additive; names/types require a real 11.8 migration review**
+**PHASE 6A STORAGE FOUNDATION IMPLEMENTED IN THE SEPARATE VECTOR DATABASE**
 
 ### `vector_documents`
 
 One logical source or generated document, independent of chunks:
 
-- `id`, `raw_article_id`, `rich_article_id`, `wp_post_id`;
-- `document_type`: `raw_source`, `rich_generated`, or `published_generated`;
-- source name/URL/canonical URL and their hashes;
-- provider news/event IDs plus provider scope;
-- title, source/published timestamps, content hash;
-- active embedding provider/model/dimensions/version and document status;
-- `factual_provenance`: `primary_source`, `secondary_source`, or `coincourier_derivative`;
-- created/updated timestamps.
+- `document_key`, `source_type`, durable `source_article_id`, and nullable
+  `rich_article_id`;
+- source URL, title, publication time, content hash/version, and timestamps;
+- unique `(document_key, content_version)` for retry-safe identity.
 
-Use nullable foreign identifiers but unique partial-equivalent keys through generated hashes or normal unique indexes appropriate to MariaDB. Never treat a CoinCourier derivative as independent factual confirmation of its source.
+`source_type` is `source_article` or `coincourier_generated`. A generated document
+requires both its source article ID and rich article ID; a source document cannot
+carry a rich ID. CoinCourier derivatives therefore remain linked to, and cannot be
+treated as corroboration independent from, their factual source.
 
 ### `vector_chunks`
 
 One active physical embedding dimension:
 
-- `id`, `document_id`, `chunk_index`, `chunk_type`;
-- `chunk_text`, `chunk_hash`;
-- `embedding VECTOR(N)`;
-- embedding provider/model/dimensions/version copied for audit;
-- `metadata_json`, token count, created timestamp;
-- unique `(document_id, chunk_index, embedding_version)`;
-- relational index on `(document_id, chunk_type)` and a cosine `VECTOR INDEX` on `embedding`.
+- document FK, deterministic chunk index, chunk text/hash, and timestamps;
+- `embedding VECTOR(1536)` plus model, dimensions, and immutable version identity;
+- unique document/index/version and document/hash/version keys;
+- relational document/version index and cosine VECTOR index.
 
 Keep chunk text for explainability and re-embedding only under source-retention policy. If source-content retention is restricted, retain a safe summary plus hashes and expire raw body chunks.
 
 ### `embedding_jobs`
 
-- `id`, `document_id`, requested embedding version;
-- `status`: queued/leased/succeeded/retry/dead;
-- `attempt_count`, `lease_owner`, `lease_expires_at`, `next_attempt_at`, redacted `last_error`;
-- created/updated timestamps;
-- unique active job per document/version and indexes for claim order.
+- document FK and requested embedding version;
+- `pending`, `claimed`, `completed`, `retryable`, or `failed` status;
+- bounded claim token/time, attempt count, bounded last error, and timestamps;
+- one row per document/version plus a status/claim-time ordering index.
 
-This stays separate from documents because retries/leases are many operational state transitions and should not overload document state.
+This is storage only in Phase 6A. No worker, claims, API calls, scheduling, or
+automatic ingestion is implemented.
 
 ### `duplicate_assessments`
 
@@ -716,15 +725,15 @@ The proposed tables should not be collapsed into the two article tables. Documen
 
 **PLANNED**
 
-### Initial hosted embedding configuration
+### Phase 6B embedding decision
 
-- Provider: OpenAI, because the repository already has its SDK/key path and no local LLM is allowed.
-- Initial model: `text-embedding-3-small`.
-- Initial dimensions: 1536, deployment-configured and schema-validated.
-- Version: explicit immutable value such as `openai:text-embedding-3-small:1536:source-normalization-v1`.
-- Optional later quality experiment: a larger hosted embedding model, evaluated side by side rather than silently replacing vectors.
-
-The provider/model recommendation must be revalidated against the approved provider catalog and data-retention terms at implementation time; this audit made no provider call.
+Phase 6A does not select or call an embedding provider or model. MariaDB
+`VECTOR(1536)` is the tested physical storage contract, not a final hosted-model
+decision. Phase 6B must approve provider retention terms, choose the model and
+dimension strategy, define deterministic chunking, and assign an immutable
+identity in the form `provider:model:dimensions:chunker-version`. A later model
+or dimension must be evaluated side by side rather than silently replacing old
+vectors.
 
 ### Document and chunk policy
 
@@ -765,18 +774,18 @@ Retrieval output must carry document type, source, source timestamp, WP ID, simi
 
 **PLANNED**
 
-Initial switches:
+Current and future switches:
 
 ```text
 VECTOR_ENABLED=false
 VECTOR_DUPLICATE_MODE=off
-EMBEDDING_PROVIDER=openai
-EMBEDDING_MODEL=text-embedding-3-small
-EMBEDDING_DIMENSIONS=1536
-EMBEDDING_VERSION=openai:text-embedding-3-small:1536:source-normalization-v1
 ```
 
-`VECTOR_DUPLICATE_MODE` supports `off|shadow|enforce`:
+Only `VECTOR_ENABLED` exists in Phase 6A. The semantic mode and embedding
+settings remain proposed Phase 6B/6C contracts and must not be inferred from the
+storage schema.
+
+The proposed future `VECTOR_DUPLICATE_MODE` contract is `off|shadow|enforce`:
 
 - `off`: schemas/jobs may exist, but no duplicate retrieval decision affects or logs candidate comparisons.
 - `shadow`: generate/query vectors and persist assessments, but never reject or delay the article.
@@ -878,15 +887,20 @@ Each phase is intentionally deployable and reversible on its own.
 - Rollback: switch off; no queue state changes in shadow.
 - Risk: low-medium.
 
-### Phase 4: MariaDB vector schema and asynchronous embedding jobs
+### Implementation Phase 6A/6B: vector storage, then embedding jobs
 
-- Files: config, vector repository, embedding client/worker/task, job sweeper, tests, requirements pin.
-- Migration: `vector_documents`, dimension-specific `vector_chunks`, `embedding_jobs`, indexes; no enforcement.
-- Tests: disposable MariaDB 11.8 DDL/functions/index/query plans, hosted client mocks, leasing/retries, dimension mismatch, backfill resume.
-- Logs/metrics: coverage/version, queue latency, failures, query latency; no vector/body logs.
-- Switch: `VECTOR_ENABLED=false` by default, then enable only job generation.
-- Rollback: disable worker/read path; additive tables remain or are archived.
-- Risk: medium.
+- Phase 6A status: local storage foundation implemented, disabled, and not deployed.
+- Phase 6A files: separate config/connection/repository, independent vector
+  migrations, local MariaDB 11.8 compose service, and synthetic integration tests.
+- Phase 6A migration: `vector_documents`, fixed-dimension `vector_chunks`,
+  storage-only `embedding_jobs`, relational keys, and cosine VECTOR index.
+- Phase 6A tests: disposable MariaDB 11.8.9 DDL/functions/index/query plans,
+  dimensions, malformed values, transactions, idempotency, and provenance filters.
+- Phase 6B planned: provider/model approval, chunker, embedding client/worker/task,
+  job leases/retries, backfill, metrics, and hosted-client mocks.
+- Switch: `VECTOR_ENABLED=false`; no current pipeline path reads it.
+- Rollback: leave the separate service absent/disabled; the application DB and
+  deterministic pipeline remain independent.
 
 ### Phase 5: semantic duplicate shadow mode
 

@@ -413,20 +413,32 @@ and representative mocked request/response fixtures before implementation.
   any eligibility policy is designed. Phase 6 remains vector schema and
   asynchronous embedding jobs; no vector dependency exists in Phase 5.
 
-### Phase 6: MariaDB vectors and embedding jobs
+### Phase 6A: MariaDB vector storage foundation
 
-- Files created: vector migrations, `repositories/vectors.py`,
-  `vector_store/embeddings.py`, `repository.py`, `jobs.py`, and tests.
-- Files modified: `tasks.py` only to add an explicit cron-safe embedding job; config
-  for model/version/batch settings.
-- Compatibility wrappers: article processing and publishing do not wait for vectors.
-- Tests: chunk determinism, model versioning, retries, stale jobs, similarity query,
-  connector capability, and fail-open behavior.
-- Rollout switch: `VECTOR_JOBS_ENABLED=false`; then enable asynchronous cron batches.
-- Rollback: disable jobs and reads; keep vector tables for later cleanup.
-- Risk: MariaDB capability/performance variance and embedding cost/backlog.
-- Behavior change: background vector records only; no selection decision yet.
-- Commit boundary: schema/capability, repository, embedding client, then job command.
+- Status: implemented locally and source-default disabled; not deployed.
+- Files created: independent migrations under `maintenance/vector_migrations/`, a
+  reproducible local `mariadb:11.8` service under `maintenance/vector/`, the
+  `vector_store` models/connection/repository boundary, and unit/integration tests.
+- Files modified: configuration and documentation only. `tasks.py`, processing,
+  publishing, and deterministic duplicate analysis have no vector-store import.
+- Schema: `vector_documents`, `vector_chunks` with `VECTOR(1536)`, and storage-only
+  `embedding_jobs`, all in the separate `coincourier_vectors` database.
+- Tests: deterministic fake-vector round trips, dimensions, idempotency, provenance
+  filters, native cosine ordering/index plans, transactions, and migration reruns on
+  disposable MariaDB 11.8.9.
+- Rollout switch: `VECTOR_ENABLED=false`. Disabled startup opens no vector connection.
+- Behavior change: none in fetch, process, publish, image, or duplicate decisions.
+- Rollback: keep the optional service absent or disabled; the application DB is
+  independent and has no vector migration.
+
+### Phase 6B: Embedding production and asynchronous jobs
+
+- Planned only: finalize provider/model/dimension policy, production chunking,
+  embedding client calls, job claiming/retries, backfill, and a cron-safe task.
+- Compatibility boundary: article processing and publishing must not wait for vectors.
+- Tests required: chunk determinism, hosted-client mocks, retries, stale claims,
+  resumable backfill, model-version isolation, and outage fail-open behavior.
+- Risk: embedding cost/backlog, source-retention policy, and dimension/model migration.
 
 ### Phase 7: Semantic duplicate shadow mode and retrieval
 

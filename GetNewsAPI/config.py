@@ -5,7 +5,7 @@ Loads environment variables from a local .env file and exposes:
 - API tokens/keys
 - WordPress REST credentials
 - Image generation settings
-- MySQL connection dictionaries for the app DB and the WordPress DB
+- MySQL connection dictionaries for the app DB, vector DB, and WordPress DB
 
 All values are sourced from environment variables to avoid hardcoding secrets.
 """
@@ -191,6 +191,21 @@ PUBLISH_CLAIM_TIMEOUT_MINUTES = int(os.getenv("PUBLISH_CLAIM_TIMEOUT_MINUTES", "
 DUPLICATE_SHADOW_ENABLED = _env_bool("DUPLICATE_SHADOW_ENABLED", False)
 DUPLICATE_LOOKBACK_HOURS = int(os.getenv("DUPLICATE_LOOKBACK_HOURS", "72"))
 DUPLICATE_POLICY_VERSION = os.getenv("DUPLICATE_POLICY_VERSION", "v1").strip() or "v1"
+
+# Phase 6A vector storage is a separate, optional MariaDB service. No pipeline
+# path imports the vector store or opens this connection while disabled.
+VECTOR_ENABLED = _env_bool("VECTOR_ENABLED", False)
+VECTOR_DB_CONNECT_TIMEOUT_SECONDS = int(
+    os.getenv("VECTOR_DB_CONNECT_TIMEOUT_SECONDS", "5")
+)
+VECTOR_DB_CONFIG = {
+    "user": os.getenv("VECTOR_DB_USER"),
+    "password": os.getenv("VECTOR_DB_PASSWORD"),
+    "host": os.getenv("VECTOR_DB_HOST"),
+    "port": int(os.getenv("VECTOR_DB_PORT", "3306")),
+    "database": os.getenv("VECTOR_DB_NAME", "coincourier_vectors"),
+    "connection_timeout": VECTOR_DB_CONNECT_TIMEOUT_SECONDS,
+}
 
 # WordPress REST API credentials
 WP_API_URL = os.getenv("WP_API_URL")
