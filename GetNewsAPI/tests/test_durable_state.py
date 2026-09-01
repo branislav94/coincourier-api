@@ -8,6 +8,8 @@ from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import MagicMock, Mock, call, patch
 
+import mysql.connector
+
 
 PROJECT_DIR = Path(__file__).resolve().parents[1]
 REPOSITORY_DIR = PROJECT_DIR.parent
@@ -23,7 +25,7 @@ from publishing.service import PublishingService, build_publication_key
 from publishing.wordpress import persistence, publisher
 from repositories.publication import PublicationClaim, PublicationRepository
 from repositories.raw_news import ProcessingClaim, RawNewsRepository
-from repositories.state import claim_prefix, safe_error_message
+from repositories.state import claim_prefix, is_claim_deadlock, safe_error_message
 
 
 ARTICLE = {
@@ -215,6 +217,69 @@ class FakeClaimDatabase:
         )
 
 
+class ScriptedClaimCursor:
+    def __init__(self, connection, dictionary=False):
+        self.connection = connection
+        self.delegate = FakeCursor(connection.database, dictionary=dictionary)
+
+    @property
+    def rowcount(self):
+        return self.delegate.rowcount
+
+    def execute(self, sql, params=()):
+        if self.connection.error is not None:
+            error = self.connection.error
+            self.connection.error = None
+            raise error
+        self.delegate.execute(sql, params)
+
+    def fetchone(self):
+        return self.delegate.fetchone()
+
+    def close(self):
+        self.connection.cursor_closed = True
+        self.delegate.close()
+
+
+class ScriptedClaimConnection:
+    def __init__(self, database, error):
+        self.database = database
+        self.error = error
+        self.transaction_starts = 0
+        self.commits = 0
+        self.rollbacks = 0
+        self.cursor_closed = False
+        self.closed = False
+
+    def start_transaction(self):
+        self.transaction_starts += 1
+
+    def cursor(self, dictionary=False):
+        return ScriptedClaimCursor(self, dictionary=dictionary)
+
+    def commit(self):
+        self.commits += 1
+
+    def rollback(self):
+        self.rollbacks += 1
+
+    def close(self):
+        self.closed = True
+
+
+class ScriptedClaimDatabase(FakeClaimDatabase):
+    def __init__(self, errors):
+        super().__init__()
+        self.errors = list(errors)
+        self.connections = []
+
+    def connect(self):
+        error = self.errors.pop(0) if self.errors else None
+        connection = ScriptedClaimConnection(self, error)
+        self.connections.append(connection)
+        return connection
+
+
 class ProcessingRepositoryTests(unittest.TestCase):
     def test_two_processors_cannot_claim_same_raw_row(self):
         database = FakeClaimDatabase()
@@ -282,7 +347,126 @@ class ProcessingRepositoryTests(unittest.TestCase):
         claim = repository.claim_next(timeout_minutes=30, lookahead_minutes=None, fresh_start_after=None)
         self.assertIsNotNone(claim)
         self.assertLess(database.events.index("commit"), database.events.index("connection-close"))
-        self.assertIn("FOR UPDATE", inspect.getsource(RawNewsRepository.claim_next))
+        self.assertIn("FOR UPDATE", inspect.getsource(RawNewsRepository._claim_next_once))
+
+
+class ClaimContentionPolicyTests(unittest.TestCase):
+    @staticmethod
+    def repository(name, database):
+        if name == "raw":
+            return RawNewsRepository(connect=database.connect), {
+                "timeout_minutes": 30,
+                "lookahead_minutes": None,
+                "fresh_start_after": None,
+            }
+        return PublicationRepository(connect=database.connect), {
+            "timeout_minutes": 30,
+            "fresh_start_after": None,
+        }
+
+    @staticmethod
+    def deadlock():
+        return mysql.connector.errors.InternalError(
+            msg="deadlock", errno=1213, sqlstate="40001"
+        )
+
+    def test_deadlock_recognition_is_errno_1213_only(self):
+        deadlock = mysql.connector.errors.InternalError(
+            msg="deadlock", errno=1213, sqlstate="40001"
+        )
+        lock_timeout = mysql.connector.errors.DatabaseError(
+            msg="lock timeout", errno=1205, sqlstate="HY000"
+        )
+        self.assertTrue(is_claim_deadlock(deadlock))
+        self.assertFalse(is_claim_deadlock(lock_timeout))
+
+    def test_first_deadlock_retries_with_fresh_connection_and_claims(self):
+        for name in ("raw", "publication"):
+            with self.subTest(repository=name):
+                database = ScriptedClaimDatabase([self.deadlock()])
+                repository, kwargs = self.repository(name, database)
+                claim = repository.claim_next(**kwargs)
+                self.assertIsNotNone(claim)
+                self.assertEqual(len(database.connections), 2)
+                first, second = database.connections
+                self.assertIsNot(first, second)
+                self.assertEqual(
+                    (
+                        first.transaction_starts,
+                        first.commits,
+                        first.rollbacks,
+                        first.cursor_closed,
+                        first.closed,
+                    ),
+                    (1, 0, 1, True, True),
+                )
+                self.assertEqual(
+                    (
+                        second.transaction_starts,
+                        second.commits,
+                        second.rollbacks,
+                        second.cursor_closed,
+                        second.closed,
+                    ),
+                    (1, 1, 0, True, True),
+                )
+                attempt_count = (
+                    database.raw["processing_attempt_count"]
+                    if name == "raw"
+                    else database.rich["publish_attempt_count"]
+                )
+                self.assertEqual(attempt_count, 1)
+
+    def test_second_deadlock_returns_clean_miss_after_two_cleanups(self):
+        for name in ("raw", "publication"):
+            with self.subTest(repository=name):
+                database = ScriptedClaimDatabase([self.deadlock(), self.deadlock()])
+                repository, kwargs = self.repository(name, database)
+                self.assertIsNone(repository.claim_next(**kwargs))
+                self.assertEqual(len(database.connections), 2)
+                self.assertIsNot(database.connections[0], database.connections[1])
+                for connection in database.connections:
+                    self.assertEqual(
+                        (
+                            connection.transaction_starts,
+                            connection.commits,
+                            connection.rollbacks,
+                            connection.cursor_closed,
+                            connection.closed,
+                        ),
+                        (1, 0, 1, True, True),
+                    )
+                self.assertEqual(database.raw["processing_attempt_count"], 0)
+                self.assertEqual(database.rich["publish_attempt_count"], 0)
+
+    def test_non_deadlock_connector_errors_propagate_after_cleanup(self):
+        for name, errno, sqlstate in (
+            ("raw", 1205, "HY000"),
+            ("publication", 1146, "42S02"),
+        ):
+            with self.subTest(repository=name, errno=errno):
+                error = mysql.connector.errors.DatabaseError(
+                    msg="non-contention database failure",
+                    errno=errno,
+                    sqlstate=sqlstate,
+                )
+                database = ScriptedClaimDatabase([error])
+                repository, kwargs = self.repository(name, database)
+                with self.assertRaises(mysql.connector.Error) as raised:
+                    repository.claim_next(**kwargs)
+                self.assertEqual(raised.exception.errno, errno)
+                self.assertEqual(len(database.connections), 1)
+                connection = database.connections[0]
+                self.assertEqual(
+                    (
+                        connection.transaction_starts,
+                        connection.commits,
+                        connection.rollbacks,
+                        connection.cursor_closed,
+                        connection.closed,
+                    ),
+                    (1, 0, 1, True, True),
+                )
 
 
 class ProcessingWiringTests(unittest.TestCase):
@@ -487,6 +671,19 @@ class ServiceRepository:
         return True
 
 
+class ClaimingServiceRepository(ServiceRepository):
+    def __init__(self, claim_repository):
+        super().__init__()
+        self.claim_repository = claim_repository
+
+    def claim_next(self, **kwargs):
+        claim = self.claim_repository.claim_next(**kwargs)
+        if claim is not None:
+            self.token = claim.token
+            self.row = dict(claim.article)
+        return claim
+
+
 class ServicePublisher:
     def __init__(self):
         self.reconcile_result = None
@@ -521,6 +718,27 @@ class ServicePublisher:
 
 
 class PublishingServiceTests(unittest.TestCase):
+    def test_transient_claim_deadlock_does_not_end_publish_batch(self):
+        database = ScriptedClaimDatabase([ClaimContentionPolicyTests.deadlock()])
+        claim_repository = PublicationRepository(connect=database.connect)
+        repository = ClaimingServiceRepository(claim_repository)
+        adapter = ServicePublisher()
+
+        result = PublishingService(
+            repository,
+            adapter,
+            Mock(return_value=(None, {})),
+        ).publish_due(1)
+
+        self.assertEqual(result, {"attempted": 1, "succeeded": 1, "failed": 0})
+        self.assertEqual(len(database.connections), 2)
+        self.assertIsNot(database.connections[0], database.connections[1])
+        self.assertEqual(database.connections[0].rollbacks, 1)
+        self.assertTrue(database.connections[0].closed)
+        self.assertEqual(database.connections[1].commits, 1)
+        self.assertTrue(database.connections[1].closed)
+        self.assertTrue(repository.completed)
+
     def test_publication_key_is_deterministic_and_ignores_title_and_slug(self):
         first = build_publication_key(8, 3, "https://news.example/one")
         changed_title_and_slug = build_publication_key(8, 3, "https://else.example/ignored")

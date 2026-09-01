@@ -9,7 +9,7 @@ import mysql.connector
 
 from config import DB_CONFIG
 
-from .state import new_claim_token
+from .state import is_claim_deadlock, new_claim_token
 
 
 @dataclass(frozen=True)
@@ -27,6 +27,27 @@ class RawNewsRepository:
         self._connect = connect or (lambda: mysql.connector.connect(**DB_CONFIG))
 
     def claim_next(
+        self,
+        *,
+        timeout_minutes: int,
+        lookahead_minutes: int | None,
+        fresh_start_after: str | None,
+    ) -> ProcessingClaim | None:
+        for attempt_index in range(2):
+            try:
+                return self._claim_next_once(
+                    timeout_minutes=timeout_minutes,
+                    lookahead_minutes=lookahead_minutes,
+                    fresh_start_after=fresh_start_after,
+                )
+            except mysql.connector.Error as error:
+                if not is_claim_deadlock(error):
+                    raise
+                if attempt_index == 1:
+                    return None
+        return None
+
+    def _claim_next_once(
         self,
         *,
         timeout_minutes: int,
