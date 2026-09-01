@@ -499,7 +499,8 @@ def _pull_batch() -> List[Dict[str, Any]]:
     pulls.append(_fetch(f"{_api}/category", {
         "section": "general",
         "items": ITEMS_PER_PULL,
-        "page": 1
+        "page": 1,
+        "extra-fields": "id,eventid,rankscore",
     }))
 
     # 3) Multi-ticker OR search (broad)
@@ -770,7 +771,7 @@ def _insert_or_update(items: List[Dict[str, Any]], batch_id: str):
         title = VALUES(title),
         full_text = VALUES(full_text),
         image_url = VALUES(image_url),
-        event_id = VALUES(event_id),
+        event_id = COALESCE(VALUES(event_id), event_id),
         rank_score = VALUES(rank_score),
         title_hash = VALUES(title_hash),
         fetch_batch_id = VALUES(fetch_batch_id);

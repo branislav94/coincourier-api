@@ -186,6 +186,12 @@ PROCESS_CLAIM_TIMEOUT_MINUTES = int(os.getenv("PROCESS_CLAIM_TIMEOUT_MINUTES", "
 PUBLISH_DURABLE_STATE_ENABLED = _env_bool("PUBLISH_DURABLE_STATE_ENABLED", False)
 PUBLISH_CLAIM_TIMEOUT_MINUTES = int(os.getenv("PUBLISH_CLAIM_TIMEOUT_MINUTES", "30"))
 
+# Deterministic duplicate analysis is observational only. Apply the Phase 5
+# manual migration before enabling its assessment reads and writes.
+DUPLICATE_SHADOW_ENABLED = _env_bool("DUPLICATE_SHADOW_ENABLED", False)
+DUPLICATE_LOOKBACK_HOURS = int(os.getenv("DUPLICATE_LOOKBACK_HOURS", "72"))
+DUPLICATE_POLICY_VERSION = os.getenv("DUPLICATE_POLICY_VERSION", "v1").strip() or "v1"
+
 # WordPress REST API credentials
 WP_API_URL = os.getenv("WP_API_URL")
 WP_USERNAME = os.getenv("WP_USERNAME")

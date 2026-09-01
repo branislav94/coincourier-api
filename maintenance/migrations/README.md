@@ -27,3 +27,17 @@ Rollback does not remove columns or indexes. Disable both feature flags, stop
 workers, and run `005_phase2_rollback_state.sql` to release active claims. The
 legacy `processed` and `published` booleans remain authoritative to the legacy
 path. Retain the additive state for diagnosis and reconciliation.
+
+Phase 5 shadow-analysis order:
+
+1. Keep `DUPLICATE_SHADOW_ENABLED=false`.
+2. Run `006_phase5_duplicate_preflight.sql`. Every result set must be empty.
+3. Run `007_phase5_duplicate_shadow.sql`.
+4. Verify the `duplicate_assessments` table and its unique pair/policy key.
+5. Deploy with the flag still false, then enable it explicitly for shadow data.
+
+Phase 5 does not alter raw identity columns: the deployed runtime already owns
+`news_id`, nullable `event_id`, `canonical_url`, and `title_hash`. Normalized
+content hashes are computed from bounded candidate source text and only the
+pairwise equality signal is persisted. Rollback is therefore just disabling
+`DUPLICATE_SHADOW_ENABLED`; retain assessment rows for audit analysis.

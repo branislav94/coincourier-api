@@ -4,7 +4,8 @@ Audit date: 2026-07-26
 
 Branch audited: `pipeline-throughput-hybrid-images`
 
-Code baseline: `f0c2945 Add provider-neutral image search v2`
+Pushed code baseline: `6b232377 Add durable processing and publishing state`,
+plus the uncommitted deterministic Phase 5 shadow implementation described here.
 
 Operational evidence: `getnewsapi-20260726_085522.log.txt` (2026-07-25T19:19:02Z through an incomplete run beginning 2026-07-26T00:47:30Z)
 
@@ -21,6 +22,11 @@ Phase 2 durable claims and WordPress reconciliation are now **IMPLEMENTED BUT
 DISABLED**. Their additive migration is manual and both source-default feature
 flags remain false until an operator applies and verifies it.
 
+Deterministic Phase 5 duplicate analysis is also **IMPLEMENTED BUT DISABLED**.
+`DUPLICATE_SHADOW_ENABLED=false` is the source default. When explicitly enabled
+after its manual migration, it records pairwise evidence before LLM work but never
+changes selection, processing, or publication eligibility.
+
 ## 1. Purpose and scope
 
 **CURRENT**
@@ -34,7 +40,10 @@ This document answers four operational questions:
 3. Why can separate URLs covering the same event both be selected and published?
 4. How should exact, event, lexical, semantic, topic, and publication defenses be introduced without making the main pipeline depend on embeddings?
 
-It is an architecture and roadmap artifact only. No application behavior, environment setting, database schema, provider, model, route, or infrastructure was changed during this audit.
+This document began as a read-only architecture audit. The current Phase 5 update
+adds only disabled-by-default deterministic shadow code, configuration, tests, and
+manual additive migration files. It changes no provider/model/image routing,
+selection decision, publication behavior, route, or infrastructure.
 
 ## 2. High-level system diagram
 
@@ -47,6 +56,8 @@ flowchart LR
     C --> D[API and hosted-AI scoring]
     D --> E[chosen_for_publish and scheduled_for]
     E --> F[gpt_processor.process_news_with_gpt]
+    F -. DUPLICATE_SHADOW_ENABLED=true .-> R[(duplicate_assessments)]
+    R -. always continue .-> G
     F --> G[Gemini search enrichment]
     F --> H[Grok or OpenAI rewrite and validation]
     G --> H
@@ -62,7 +73,12 @@ flowchart LR
     P --> Q[rich_crpytonews.published = 1]
 ```
 
-The current state path is keyed primarily by `news_url`, not by an immutable raw ID or provider event ID. The principal duplicate gap is between ingestion and publication: exact identities are checked only within a single pull or by URL uniqueness, while selection, processing, and publication do not compare event identity or semantic meaning.
+The persistent source path is still keyed primarily by `news_url`. Pull-local
+identity checks and raw URL uniqueness remain unchanged as eligibility controls.
+The optional Phase 5 hook compares deterministic exact/event/fact/lexical evidence
+before expensive LLM work, but its results are audit-only and cannot close the
+selection or publication duplicate gap until a separately reviewed enforcement
+phase.
 
 ## 3. Repository/module map
 
@@ -121,6 +137,7 @@ When `ENABLE_APSCHEDULER=true`, `app.py:56-67` starts the scheduler once with Fl
 | Search enrichment | `GOOGLE_API_KEY`; search itself is a code constant `USE_WEB_SEARCH=1` | `gpt_processor.py:73-93` |
 | Image mode | API/source flags, `hybrid`, `stock_first`, generated-image primary/fallback | `config.py:112-127` |
 | Image search | default engine `v1`; V2 providers, dimensions, limits, license allowlist, retry/exhaustion behavior | `config.py:129-180` |
+| Duplicate shadow | disabled by default; 72-hour lookback and `v1` policy version | `config.py` |
 | WordPress | REST URL/user/application password and separate WP DB settings | `config.py:182-205` |
 | Application DB | user/password/host/port/name; TLS verification is disabled in the connector dictionary | `config.py:187-196` |
 
@@ -135,11 +152,17 @@ Secrets are environment sourced and must remain absent from logs and documentati
 | Pull | Parameters relevant to identity |
 |---|---|
 | Rank-sorted multi-ticker | `extra-fields=id,eventid,rankscore` (`fetcher.py:487-495`) |
-| General category | no `extra-fields` parameter (`fetcher.py:498-503`) |
+| General category | `extra-fields=id,eventid,rankscore` (`fetcher.py:489-494`) |
 | Multi-ticker | `extra-fields=id,eventid,rankscore` (`fetcher.py:505-511`) |
 | Optional video | same extra fields, but `ALLOW_VIDEO=False` (`fetcher.py:513-523`) |
 
-CryptoNews event ID is therefore explicitly requested on two active feeds and the optional video feed. The code reads `eventid` and writes it to `cryptonewsapi.event_id` (`fetcher.py:757-797`). The supplied log does not print payload identities, so it cannot prove that `eventid` was returned or populated. The general category request does not explicitly request it. Event ID is stored when returned but is never consulted by scoring, selection, processing, or publishing.
+CryptoNews event ID is explicitly requested on all three active feeds and the
+optional video feed. The code reads `eventid` and writes it to nullable runtime
+`cryptonewsapi.event_id`; when a later provider item omits it, the upsert preserves
+an existing non-null value. The supplied log cannot prove provider population.
+Event ID remains absent from scoring and selection and is used only as shadow
+classification evidence before processing when the disabled-by-default hook is
+enabled.
 
 **CURRENT - pull-local exact dedupe**
 
@@ -149,13 +172,25 @@ Within one aggregated pull, the first candidate wins when any of these exact val
 - `_clean_url(news_url)`;
 - SHA-256 of the lowercased, outer-whitespace-trimmed title.
 
-`_clean_url()` removes a limited tracker list, dangling separators, repeated slashes, and a trailing slash (`fetcher.py:164-190`). It does not fully canonicalize host casing, default ports, fragments, query ordering, arbitrary tracking keys, percent encoding, redirects, AMP variants, or publisher canonical tags. Title hashing does not normalize punctuation, Unicode, internal whitespace, or wording.
+The pull-local `_clean_url()` and title hash retain their legacy behavior so this
+shadow phase cannot change ingestion eligibility. The separate Phase 5 identity
+module uses conservative parser-based canonicalization: scheme and host are
+lowercased, fragments/default ports are removed, a terminal slash is normalized,
+and only `utm_*` plus a fixed obvious-tracker allowlist is removed. Meaningful query
+parameters and publisher-specific paths are preserved. Its title comparison uses
+NFKC, case folding, punctuation/separator normalization, and whitespace collapse
+while retaining words, names, dates, and numbers; the stored source title is not
+mutated.
 
 **CURRENT - persistence**
 
 The retained pool is pre-ranked and truncated to `POOL_SIZE` before persistence (`fetcher.py:550-552`). `_insert_or_update()` inserts raw content and the news/event/rank/title identities, then uses `ON DUPLICATE KEY UPDATE` (`fetcher.py:734-800`). The repository schema declares only `news_url` unique (`crypto_news_db.sql:110-120`); it declares no unique provider news ID, canonical URL, title hash, event ID, or content hash. The live schema has additional columns because the runtime SQL uses them, but their indexes cannot be verified without a current schema artifact.
 
-There is no body/content hash. `event_id` should not itself become an exact-rejection key because separate sources and legitimate updates may share an event. It is immediately useful as a cluster key and selection signal.
+There is no persistent raw body/content-hash column. Phase 5 computes SHA-256 from
+NFKC/case-folded, HTML-text-extracted, whitespace-normalized source text only when
+at least 80 characters exist. The hash never contains source text, remains separate
+from event similarity, and only pairwise equality is persisted. `event_id` is a
+classification signal, never an exact-rejection key.
 
 ## 7. Scoring, selection and scheduling
 
@@ -185,12 +220,15 @@ The daily counter counts selected rows, not successfully published posts (`fetch
 
 Automatic batch size is the number due within the lookahead, clamped to `PROCESS_BATCH_MIN..PROCESS_BATCH_MAX`. The source-default legacy path retains its existing eligible-row query and has no processing advisory lock or transactional claim. When `PROCESS_DURABLE_CLAIMS_ENABLED=true` after migration, `RawNewsRepository` selects the same eligible order under `FOR UPDATE`, assigns an owner token, and commits before LLM work. Claims expire after `PROCESS_CLAIM_TIMEOUT_MINUTES`.
 
-For each row (`gpt_processor.py:1848-1895`):
+For each row:
 
-1. Gemini search grounding requests up to three recent facts when the code constant is enabled (`gpt_processor.py:1121-1198`).
-2. The rewrite tries the configured primary LLM and then the configured fallback (`gpt_processor.py:876-921`). Defaults are Grok then OpenAI (`config.py:65-70`, `config.py:105-109`).
-3. The provider that produced the valid rewrite becomes sticky for repair (`gpt_processor.py:1353-1368`, `gpt_processor.py:1532-1625`). A short body may first receive same-provider expansion (`gpt_processor.py:747-811`).
-4. On legacy-path failure, the row remains `processed=0`. On the durable path it also becomes `processing_status='retryable'`, clears its claim, and stores a bounded error class; success still sets `processed=1`.
+1. When explicitly enabled, deterministic duplicate shadow analysis reads recent
+   selected/processed candidates, records classifications, and always continues.
+   Any repository or policy error is caught and logged before continuing.
+2. Gemini search grounding requests up to three recent facts when the code constant is enabled (`gpt_processor.py:1121-1198`).
+3. The rewrite tries the configured primary LLM and then the configured fallback (`gpt_processor.py:876-921`). Defaults are Grok then OpenAI (`config.py:65-70`, `config.py:105-109`).
+4. The provider that produced the valid rewrite becomes sticky for repair (`gpt_processor.py:1353-1368`, `gpt_processor.py:1532-1625`). A short body may first receive same-provider expansion (`gpt_processor.py:747-811`).
+5. On legacy-path failure, the row remains `processed=0`. On the durable path it also becomes `processing_status='retryable'`, clears its claim, and stores a bounded error class; success still sets `processed=1`.
 
 Provider HTTP calls use bounded retry/backoff. Grok retries up to seven times with jitter (`gpt_processor.py:591-669`); OpenAI handles network/transient statuses and malformed/truncated output (`gpt_processor.py:947-1115`); Gemini retries only 429/503 (`gpt_processor.py:1159-1172`).
 
@@ -295,6 +333,7 @@ The checked-in dump was generated against MariaDB 10.4 in April 2025 (`crypto_ne
 |---|---|
 | `cryptonewsapi` | Existing runtime fields plus additive `processing_status`, claim token/time, attempt count, and safe last error after Phase 2 migration; `processed` remains |
 | `rich_crpytonews` | Existing runtime fields plus `raw_article_id`, publication claim state, `publication_key`, WP post/media IDs and metadata, external URL/timestamps after Phase 2 migration; `published` remains |
+| `duplicate_assessments` | Phase 5 pair IDs, five-way classification, exact/event/lexical/fact/time evidence, reason JSON, policy version, and audit timestamps; unique per directed article/candidate/policy tuple |
 
 ```mermaid
 stateDiagram-v2
@@ -362,21 +401,29 @@ A rich row becomes publishable when its URL joins a chosen raw row whose schedul
 | Scoring | candidate itself must remain unchosen for blended-score update | state guard, not duplicate detection (`fetcher.py:847-853`) |
 | Selection | candidate must have `chosen_for_publish=0` | prevents reselection of one row; does not compare rows (`fetcher.py:955-963`, `fetcher.py:1031-1040`) |
 | Processing | `processed=0` and `chosen=1`; rich URL upsert | retries one URL into one rich row; no process claim (`gpt_processor.py:1953-1964`, `gpt_processor.py:1717-1729`) |
+| Phase 5 processor preflight | provider ID, canonical URL, normalized source hash, event ID, token Jaccard, entities, dates, numbers, actions, and publication distance | optional 72-hour selected/processed shadow window; records only and always continues |
 | Publishing | rich `published=0`, joined due schedule, global advisory lock | prevents normal republish after app flag is set; not crash-idempotent (`publish_to_wp.py:683-722`, `publish_to_wp.py:1671-1775`) |
 | Images | recent asset/source URL checks; V2 adds license, connected identities, SHA-256 and perceptual hash | image reuse only, not article duplicate defense |
 
-No stage computes a normalized body hash or compares a new story to selected, processed, or published content by event or meaning.
+No eligibility stage uses a body hash or compares event meaning. The disabled-by-
+default Phase 5 processor hook now computes normalized source hashes and compares
+deterministic event/lexical facts against recent selected or processed raw rows,
+but it only records observations.
 
-## 19. Current same-event/semantic duplicate gaps
+## 19. Remaining same-event/semantic duplicate gaps
 
 **CURRENT gaps**
 
-1. `event_id` is requested and stored but not used, and is not explicitly requested on the category pull.
+1. `event_id` is now requested and stored on every relevant pull, but provider
+   coverage remains unmeasured and the value is shadow evidence only.
 2. There is no provider-news-ID or canonical/content-hash unique constraint visible in repository DDL.
-3. URL normalization is too narrow to represent a publisher canonical identity safely.
+3. Conservative URL/title/content identity exists, but no new database uniqueness
+   or enforcement policy uses it.
 4. Multiple URLs for one event can all be scored and set `chosen_for_publish=1`.
 5. Selection has no lookback across selected, processed, rich, or published rows and no topic/source quota.
-6. LLM processing spends search/rewrite cost before any lexical, event, or semantic duplicate check.
+6. With the source-default shadow flag off, LLM processing retains its previous
+   path. With it on, deterministic analysis runs first; semantic/vector comparison
+   is still absent.
 7. Processing has no claim/lease, so overlapping cron/manual workers can process the same raw row.
 8. Rich persistence has no raw-ID foreign key and is not atomic with `processed=1`.
 9. Publication stores neither a WP post ID nor an idempotency key and does no WP reconciliation.
@@ -479,16 +526,20 @@ Provider IDs and URLs can be logged as hashes when operations do not need the cl
 
 ## 21. Duplicate terminology and policy
 
-**PLANNED**
+**CURRENT classifications; all actions remain planned**
 
 | Category | Definition | Initial action |
 |---|---|---|
-| Exact duplicate | same provider news ID, trusted canonical source URL, or normalized body/content hash | reject automatically using deterministic constraints; no vector threshold required |
-| Same-event duplicate | separate sources/titles reporting substantially the same facts and event state | cluster and keep the strongest candidate; semantic enforcement starts only after shadow evaluation |
-| Legitimate update | same event but materially new decisions, outcomes, numbers, participants, or timestamps | allow, link to prior coverage, record `relationship=update`, and require a non-repetitive angle |
-| Broad topical overlap | same topic/entity but a different event | allow, subject to topic/entity frequency and angle-diversity policy |
+| `exact_duplicate` | same non-empty provider news ID, conservative canonical source URL, or normalized source-content hash | record only |
+| `same_event_duplicate` | same non-null event ID without new structured facts, or matching key entity plus date/number, title Jaccard >= 0.60, and bounded time | record only |
+| `material_update` | same explicit/inferred event with a new date, numeric value, named participant, or action/status | record only |
+| `related_event` | shared event-level entity but different date/action or insufficient same-event evidence | record only |
+| `broad_topic_overlap` | only generic asset/topic overlap or no event-level identity | record only |
 
-Event ID is a clustering signal, not automatically an exact-duplicate key. Vector similarity is also a signal, not a complete policy. Exact, event, update, and topic decisions require different evidence combinations and thresholds.
+Event ID is a clustering signal, not an exact-duplicate key. Null IDs never match,
+and different non-null IDs do not prevent deterministic inferred-event matching.
+Source names are labeled evidence but do not count as key event entities. Vector
+similarity remains future work and would be another signal, not a complete policy.
 
 ## 22. Recommended layered duplicate architecture
 
@@ -545,12 +596,13 @@ Run before Gemini/rewrite cost. Query recent raw title/summary vectors first, th
 
 ### Immediate non-vector priorities
 
-1. Current schema snapshot and collision report.
-2. Durable publication idempotency, WP ID persistence, reconciliation, and processor claims.
-3. Provider ID/canonical URL/content hashes with validated unique constraints.
-4. Event ID requested on every relevant CryptoNews pull, indexed, logged, and clustered in shadow mode.
-5. Lexical/entity/number/date same-event assessments before selection and processing.
-6. Structured stage logs and a labeled duplicate-evaluation set.
+1. Current deployed schema snapshot and collision report.
+2. Apply and verify the completed durable-state migration before enabling its flags.
+3. Apply the Phase 5 assessment migration and collect shadow precision evidence.
+4. Measure provider event-ID population; indexing needs a deployed-schema review.
+5. Build a labeled evaluation set from the persisted deterministic assessments.
+6. Consider selection-time policy only after false-positive review; no current
+   classification changes queue state.
 7. Topic/entity rolling quotas and an explicit breaking override; do not lower `DAILY_TARGET` as a substitute.
 
 ### Topic saturation and angle diversity
@@ -635,12 +687,16 @@ This stays separate from documents because retries/leases are many operational s
 
 ### `duplicate_assessments`
 
-- candidate raw ID, matched document/chunk/event cluster;
-- exact match type, vector/lexical/entity/number/date/event signals;
-- decision: exact reject, same-event reject, allow update, allow topic overlap, insufficient evidence;
-- reason codes, policy/embedding versions, mode (`shadow`/`enforce`), actor, timestamp.
+**CURRENT after manual Phase 5 migration; disabled by source default**
 
-Keep this separate for evaluation, threshold changes, appeals, and false-positive analysis.
+- directed raw `article_id` and `candidate_article_id`;
+- five-way assessment type and provider/event/URL/content equality booleans;
+- title token Jaccard, publication-time distance, shared entity/date/number JSON;
+- deterministic reason JSON, policy version, and created/updated timestamps;
+- unique `(article_id, candidate_article_id, policy_version)` for retry-safe upsert.
+
+It remains separate for evaluation and false-positive analysis. It contains no
+vector, embedding, queue decision, enforcement mode, or full source content.
 
 ### `event_clusters` and `event_cluster_articles`
 
@@ -800,7 +856,9 @@ Each phase is intentionally deployable and reversible on its own.
 
 ### Phase 2: CryptoNews event-ID ingestion and event clustering
 
-- Files: `fetcher.py`, config, new clustering service/repository, tests.
+- Status: event-ID request coverage and pairwise shadow evidence are implemented by
+  project Phase 5; durable event-cluster tables and primary-member policy remain planned.
+- Files: `fetcher.py`, config, deterministic policy/repository, tests.
 - Migration: provider-scoped event ID index plus `event_clusters` and `event_cluster_articles`.
 - Tests: every pull requests event ID, missing IDs, reused IDs, multiple sources per event, legitimate updates.
 - Logs/metrics: event-ID coverage, cluster size, primary changes, source diversity.
@@ -810,11 +868,13 @@ Each phase is intentionally deployable and reversible on its own.
 
 ### Phase 3: lexical/entity duplicate checks in shadow mode
 
-- Files: new normalization/feature module; `fetcher.py` selection integration; processor preflight; tests.
-- Migration: optional normalized-title/entity/fact-signature columns and assessment rows.
+- Status: implemented but disabled before processor LLM work; selection integration
+  and all enforcement remain planned.
+- Files: normalization/fact/policy modules; processor preflight; focused tests.
+- Migration: pairwise assessment rows only; existing raw identity columns are reused.
 - Tests: punctuation/Unicode/title variants, entity and number/date deltas, update versus duplicate fixtures.
 - Logs/metrics: component scores and shadow decision reasons, without bodies.
-- Switch: `LEXICAL_DUPLICATE_MODE=off|shadow`.
+- Switch: `DUPLICATE_SHADOW_ENABLED=false`, with lookback and policy version controls.
 - Rollback: switch off; no queue state changes in shadow.
 - Risk: low-medium.
 

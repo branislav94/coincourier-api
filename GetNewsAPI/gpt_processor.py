@@ -9,6 +9,7 @@ from config import (
     GROK_MAX_OUTPUT_TOKENS,
     GROK_TEXT_MODEL,
     LLM_FALLBACK_PROVIDER,
+    DUPLICATE_SHADOW_ENABLED,
     OPENAI_API_KEY,
     OPENAI_MAX_OUTPUT_TOKENS,
     OPENAI_REASONING_EFFORT,
@@ -19,6 +20,7 @@ from config import (
     PRIMARY_LLM_PROVIDER,
     get_grok_reasoning_effort,
 )
+from duplicate_detection.shadow import analyze_duplicates_in_shadow
 from repositories.raw_news import RawNewsRepository
 from repositories.state import claim_prefix, safe_error_message
 import time, random
@@ -1868,11 +1870,24 @@ def validate_rewritten_article(doc: dict, raw: dict) -> None:
         )
         raise ArticleValidationError(failures, raw.get("id"), raw.get("title"))
 
+
+def _run_duplicate_shadow_fail_open(raw: dict) -> None:
+    if not DUPLICATE_SHADOW_ENABLED:
+        return
+    try:
+        analyze_duplicates_in_shadow(raw)
+    except Exception:
+        logging.exception(
+            "[DUPLICATE-SHADOW] article_id=%s analysis_failed=true decision=continue",
+            raw.get("id"),
+        )
+
 def process_one(raw, *, mark_complete=True, on_error=None):
     """
     Process a single raw cryptonewsapi row through the GPT enrichment pipeline.
 
     Steps:
+        - Run optional fail-open deterministic duplicate shadow analysis
         - Optionally enrich via search (enrich_with_search)
         - Detect/normalize YouTube video URL (_maybe_video_url)
         - Rewrite/classify to strict JSON (classify_and_rewrite)
@@ -1890,6 +1905,7 @@ def process_one(raw, *, mark_complete=True, on_error=None):
             True when the article was stored and marked processed, False otherwise.
     """
     try:
+        _run_duplicate_shadow_fail_open(raw)
         extra = enrich_with_search(raw)
         video_url = _maybe_video_url(raw)
         draft, text_provider = classify_and_rewrite(raw, extra, video_url)

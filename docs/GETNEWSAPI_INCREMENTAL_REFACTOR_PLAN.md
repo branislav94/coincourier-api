@@ -379,19 +379,39 @@ and representative mocked request/response fixtures before implementation.
 
 ### Phase 5: Exact, event-ID, and lexical duplicate detection
 
-- Files created: `duplicate_detection/identities.py`, `event_matching.py`,
-  `lexical.py`, `policy.py`, focused persistence migration if required, and tests.
-- Files modified: ingestion/selection call sites and repositories that expose
-  identity/event facts.
-- Compatibility wrappers: existing canonical URL/title-hash checks remain active
-  and feed the new policy.
-- Tests: normalized URL/title identity, transitive event groups, provider event ID,
-  lexical thresholds, provenance separation, and false-positive corpora.
-- Rollout switch: `DUPLICATE_POLICY_MODE=shadow|enforce_exact|enforce_lexical`.
-- Rollback: return to `enforce_exact` or existing exact checks.
-- Risk: false positives suppressing legitimate new angles.
-- Behavior change: exact checks first; lexical blocking only after shadow evidence.
-- Commit boundary: identities, event matching, lexical shadow, then policy rollout.
+**Implemented but disabled; observational only.**
+
+- `duplicate_detection/` now owns conservative URL identity, Unicode-aware title
+  normalization, SHA-256 source-content fingerprints, token-set Jaccard, and
+  lightweight structured entity/date/number/action extraction. It makes no AI or
+  embedding call.
+- Every active CryptoNews pull requests `id,eventid,rankscore`. Returned `eventid`
+  remains nullable and is persisted as `event_id`; an omitted value no longer
+  overwrites a previously stored non-null event ID.
+- The versioned policy emits `exact_duplicate`, `same_event_duplicate`,
+  `material_update`, `related_event`, or `broad_topic_overlap` with individual
+  evidence and reason codes. Exact identity is provider article ID, conservative
+  canonical URL, or sufficiently long normalized source-content hash. Event ID is
+  strong event evidence, never an exact identity or a suppression rule.
+- `DuplicateAssessmentRepository` compares at most 200 selected or processed raw
+  rows published within the configured 72-hour window. It excludes the current
+  row, orders candidates deterministically, and upserts one audit row per
+  `(article_id, candidate_article_id, policy_version)`.
+- Manual migrations `006_phase5_duplicate_preflight.sql` and
+  `007_phase5_duplicate_shadow.sql` add only `duplicate_assessments`. Existing
+  `news_id`, `event_id`, `canonical_url`, and `title_hash` are not duplicated or
+  rewritten. Shadow comparison computes its conservative identities from source
+  values; only pairwise evidence is persisted, avoiding new raw-table columns.
+- The hook runs in `gpt_processor.process_one()` before search enrichment and
+  rewrite. It is guarded by `DUPLICATE_SHADOW_ENABLED=false`; disabled means no
+  duplicate query or write. Any analysis error is logged and processing continues.
+- No classification changes `chosen_for_publish`, `scheduled_for`, `processed`,
+  `published`, processing claims, publication claims, or WordPress behavior.
+- Rollback: set `DUPLICATE_SHADOW_ENABLED=false`; retain additive assessments for
+  evaluation. There is intentionally no enforcement flag in this phase.
+- Remaining risk: deterministic rules need production shadow evaluation before
+  any eligibility policy is designed. Phase 6 remains vector schema and
+  asynchronous embedding jobs; no vector dependency exists in Phase 5.
 
 ### Phase 6: MariaDB vectors and embedding jobs
 
