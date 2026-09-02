@@ -1,4 +1,4 @@
-"""Opt-in Phase 6B1 job-engine coverage on disposable MariaDB 11.8."""
+"""Opt-in Phase 6B job and ingestion coverage on disposable MariaDB 11.8."""
 
 from __future__ import annotations
 
@@ -22,11 +22,17 @@ if str(PROJECT_DIR) not in sys.path:
 
 from embeddings.chunking import prepare_document
 from embeddings.models import EmbeddingBatch, EmbeddingSettings
+from embeddings.operations import (
+    run_embedding_backfill,
+    run_embedding_ingest,
+    run_embedding_worker,
+)
 from embeddings.provider import (
     EmbeddingProviderUnavailable,
     FakeEmbeddingProvider,
 )
 from embeddings.service import EmbeddingJobEngine
+from repositories.embedding_articles import EmbeddingArticleRepository
 from vector_store.models import (
     SourceType,
     VECTOR_DIMENSIONS,
@@ -87,6 +93,55 @@ def _drop_vector_tables() -> None:
     try:
         for table in ("embedding_jobs", "vector_chunks", "vector_documents"):
             cursor.execute(f"DROP TABLE IF EXISTS {table}")
+    finally:
+        cursor.close()
+        connection.close()
+
+
+def _drop_application_tables() -> None:
+    connection = _connect(autocommit=True)
+    cursor = connection.cursor()
+    try:
+        cursor.execute("DROP TABLE IF EXISTS rich_crpytonews")
+        cursor.execute("DROP TABLE IF EXISTS cryptonewsapi")
+    finally:
+        cursor.close()
+        connection.close()
+
+
+def _create_application_tables() -> None:
+    connection = _connect(autocommit=True)
+    cursor = connection.cursor()
+    try:
+        cursor.execute(
+            """
+            CREATE TABLE cryptonewsapi (
+                id BIGINT UNSIGNED NOT NULL PRIMARY KEY,
+                news_url TEXT NULL,
+                title TEXT NULL,
+                full_text LONGTEXT NULL,
+                publish_date DATETIME(6) NULL,
+                insertDate DATETIME(6) NOT NULL DEFAULT UTC_TIMESTAMP(6),
+                chosen_for_publish TINYINT(1) NOT NULL DEFAULT 0,
+                selected_at DATETIME(6) NULL
+            ) ENGINE=InnoDB
+            """
+        )
+        cursor.execute(
+            """
+            CREATE TABLE rich_crpytonews (
+                id BIGINT UNSIGNED NOT NULL PRIMARY KEY,
+                raw_article_id BIGINT UNSIGNED NULL,
+                news_url TEXT NULL,
+                title TEXT NULL,
+                full_text LONGTEXT NULL,
+                publish_date DATETIME(6) NULL,
+                insertDate DATETIME(6) NOT NULL DEFAULT UTC_TIMESTAMP(6),
+                CONSTRAINT fk_embedding_test_raw
+                    FOREIGN KEY (raw_article_id) REFERENCES cryptonewsapi(id)
+            ) ENGINE=InnoDB
+            """
+        )
     finally:
         cursor.close()
         connection.close()
@@ -529,6 +584,311 @@ class EmbeddingMariaDBIntegrationTests(unittest.TestCase):
             ),
             2,
         )
+
+
+@unittest.skipUnless(
+    RUN_INTEGRATION,
+    "set RUN_VECTOR_MARIADB_INTEGRATION=true for disposable MariaDB 11.8 tests",
+)
+class EmbeddingOperationsMariaDBIntegrationTests(unittest.TestCase):
+    def setUp(self) -> None:
+        _drop_application_tables()
+        _drop_vector_tables()
+        _create_application_tables()
+        _execute_script(MIGRATION_DIR / "001_vector_schema.sql")
+        _execute_script(MIGRATION_DIR / "002_vector_indexes.sql")
+        self.vector_repository = VectorRepository(connect=_connect)
+        self.article_repository = EmbeddingArticleRepository(connect=_connect)
+        self.settings = _settings()
+
+    def execute(self, sql: str, params: tuple[Any, ...] = ()) -> None:
+        connection = _connect()
+        cursor = connection.cursor()
+        try:
+            cursor.execute(sql, params)
+            connection.commit()
+        finally:
+            cursor.close()
+            connection.close()
+
+    def rows(self, sql: str, params: tuple[Any, ...] = ()) -> list[tuple[Any, ...]]:
+        connection = _connect()
+        cursor = connection.cursor()
+        try:
+            cursor.execute(sql, params)
+            return list(cursor.fetchall())
+        finally:
+            cursor.close()
+            connection.close()
+
+    def scalar(self, sql: str, params: tuple[Any, ...] = ()) -> Any:
+        return self.rows(sql, params)[0][0]
+
+    def insert_source(
+        self,
+        article_id: int,
+        *,
+        body: str,
+        chosen: bool = False,
+        published_at: str = "2026-09-01 12:00:00",
+    ) -> None:
+        self.execute(
+            """
+            INSERT INTO cryptonewsapi (
+                id, news_url, title, full_text, publish_date,
+                chosen_for_publish, selected_at
+            ) VALUES (%s,%s,%s,%s,%s,%s,%s)
+            """,
+            (
+                article_id,
+                f"https://source.example.test/{article_id}",
+                f"Source title {article_id}",
+                body,
+                published_at,
+                int(chosen),
+                published_at if chosen else None,
+            ),
+        )
+
+    def ingest(self, limit: int = 25):
+        return run_embedding_ingest(
+            limit=limit,
+            vector_enabled=True,
+            settings=self.settings,
+            vector_repository=self.vector_repository,
+            article_repository=self.article_repository,
+        )
+
+    def backfill(self, limit: int = 25, page_size: int = 2):
+        return run_embedding_backfill(
+            SourceType.SOURCE_ARTICLE,
+            limit=limit,
+            page_size=page_size,
+            vector_enabled=True,
+            settings=self.settings,
+            vector_repository=self.vector_repository,
+            article_repository=self.article_repository,
+        )
+
+    def worker(self, provider: FakeEmbeddingProvider, limit: int = 5):
+        return run_embedding_worker(
+            limit=limit,
+            claim_timeout_minutes=30,
+            vector_enabled=True,
+            settings=self.settings,
+            vector_repository=self.vector_repository,
+            article_repository=self.article_repository,
+            provider=provider,
+        )
+
+    def test_source_ingest_worker_end_to_end_and_idempotent_rerun(self) -> None:
+        self.insert_source(1, body="BTC rose 8% after the vote.", chosen=True)
+
+        ingested = self.ingest()
+        provider = FakeEmbeddingProvider()
+        worked = self.worker(provider)
+
+        self.assertEqual(
+            (
+                ingested.documents_scanned,
+                ingested.documents_registered,
+                ingested.jobs_enqueued,
+            ),
+            (1, 1, 1),
+        )
+        self.assertEqual(worked.jobs_completed, 1)
+        self.assertEqual(worked.provider_calls, 1)
+        self.assertEqual(provider.call_count, 1)
+        self.assertGreater(self.scalar("SELECT COUNT(*) FROM vector_chunks"), 0)
+        self.assertEqual(
+            self.rows(
+                """
+                SELECT source_type, source_article_id, rich_article_id
+                FROM vector_documents
+                """
+            ),
+            [("source_article", 1, None)],
+        )
+
+        rerun = self.ingest()
+        idle_provider = FakeEmbeddingProvider()
+        idle = self.worker(idle_provider)
+        self.assertEqual(rerun.documents_registered, 0)
+        self.assertEqual(rerun.jobs_enqueued, 0)
+        self.assertEqual(rerun.jobs_skipped_existing, 1)
+        self.assertTrue(idle.queue_empty)
+        self.assertEqual(idle.provider_calls, 0)
+        self.assertEqual(idle_provider.call_count, 0)
+        self.assertEqual(self.scalar("SELECT COUNT(*) FROM vector_documents"), 1)
+        self.assertEqual(self.scalar("SELECT COUNT(*) FROM embedding_jobs"), 1)
+
+    def test_changed_content_creates_second_document_and_preserves_old_vectors(self) -> None:
+        self.insert_source(1, body="Initial source facts.", chosen=True)
+        self.ingest()
+        self.worker(FakeEmbeddingProvider())
+        original = self.rows(
+            """
+            SELECT id, content_version FROM vector_documents
+            WHERE source_article_id=1 ORDER BY id
+            """
+        )[0]
+        original_chunk_count = self.scalar(
+            "SELECT COUNT(*) FROM vector_chunks WHERE document_id=%s",
+            (original[0],),
+        )
+
+        self.execute(
+            "UPDATE cryptonewsapi SET full_text=%s WHERE id=1",
+            ("Initial source facts plus a material update.",),
+        )
+        changed = self.ingest()
+        changed_work = self.worker(FakeEmbeddingProvider())
+        versions = self.rows(
+            """
+            SELECT id, content_version FROM vector_documents
+            WHERE source_article_id=1 ORDER BY id
+            """
+        )
+
+        self.assertEqual(changed.documents_registered, 1)
+        self.assertEqual(changed.jobs_enqueued, 1)
+        self.assertEqual(changed_work.jobs_completed, 1)
+        self.assertEqual(len(versions), 2)
+        self.assertNotEqual(versions[0][1], versions[1][1])
+        self.assertEqual(
+            self.scalar(
+                "SELECT COUNT(*) FROM vector_chunks WHERE document_id=%s",
+                (original[0],),
+            ),
+            original_chunk_count,
+        )
+        self.assertGreater(
+            self.scalar(
+                "SELECT COUNT(*) FROM vector_chunks WHERE document_id=%s",
+                (versions[1][0],),
+            ),
+            0,
+        )
+
+    def test_backfill_restart_resumes_via_idempotent_keyset_rescan(self) -> None:
+        for article_id in range(1, 5):
+            self.insert_source(
+                article_id,
+                body=f"Historical source facts {article_id}.",
+                published_at=f"2026-08-0{article_id} 12:00:00",
+            )
+
+        first = self.backfill(limit=2, page_size=2)
+        second = self.backfill(limit=2, page_size=2)
+        rerun = self.backfill(limit=5, page_size=2)
+
+        self.assertEqual(first.documents_registered, 2)
+        self.assertEqual(second.documents_registered, 2)
+        self.assertGreater(second.documents_scanned, second.documents_registered)
+        self.assertEqual(rerun.documents_registered, 0)
+        self.assertEqual(rerun.jobs_enqueued, 0)
+        self.assertEqual(rerun.jobs_skipped_existing, 4)
+        self.assertEqual(
+            [row[0] for row in self.rows(
+                "SELECT source_article_id FROM vector_documents ORDER BY id"
+            )],
+            [4, 3, 2, 1],
+        )
+
+    def test_generated_backfill_preserves_derivative_linkage_and_skips_missing(self) -> None:
+        self.insert_source(7, body="Raw source facts.")
+        self.execute(
+            """
+            INSERT INTO rich_crpytonews (
+                id, raw_article_id, news_url, title, full_text, publish_date
+            ) VALUES
+                (70,7,'https://coincourier.test/70','Generated 70',
+                 '<p>Generated derivative facts.</p>','2026-09-01 13:00:00'),
+                (71,NULL,'https://coincourier.test/71','Generated 71',
+                 '<p>Unlinked derivative.</p>','2026-09-01 14:00:00')
+            """
+        )
+
+        metrics = run_embedding_backfill(
+            SourceType.COINCOURIER_GENERATED,
+            limit=5,
+            page_size=5,
+            vector_enabled=True,
+            settings=self.settings,
+            vector_repository=self.vector_repository,
+            article_repository=self.article_repository,
+        )
+
+        self.assertEqual(metrics.documents_registered, 1)
+        self.assertEqual(metrics.documents_skipped, 1)
+        self.assertEqual(
+            self.rows(
+                """
+                SELECT source_type, source_article_id, rich_article_id
+                FROM vector_documents
+                """
+            ),
+            [("coincourier_generated", 7, 70)],
+        )
+
+    def test_fresh_article_claim_precedes_later_backfill_registration(self) -> None:
+        self.insert_source(
+            1,
+            body="Historical article.",
+            published_at="2020-01-01 00:00:00",
+        )
+        self.insert_source(
+            100,
+            body="Fresh article.",
+            chosen=True,
+            published_at="2026-09-01 12:00:00",
+        )
+        self.ingest(limit=1)
+        self.backfill(limit=1, page_size=1)
+
+        claim = self.vector_repository.claim_embedding_job(
+            self.settings.embedding_version,
+            timeout_minutes=30,
+        )
+
+        self.assertIsNotNone(claim)
+        assert claim is not None
+        self.assertEqual(claim.document.source_article_id, 100)
+
+    def test_retryable_jobs_rotate_across_separate_worker_invocations(self) -> None:
+        for article_id in range(1, 4):
+            self.insert_source(
+                article_id,
+                body=f"Retryable source facts {article_id}.",
+                chosen=True,
+                published_at=f"2026-09-0{article_id} 12:00:00",
+            )
+        self.ingest()
+        provider = FakeEmbeddingProvider(
+            fail_with=EmbeddingProviderUnavailable("synthetic outage")
+        )
+
+        for _invocation in range(6):
+            metrics = self.worker(provider, limit=5)
+            self.assertEqual(metrics.jobs_claimed, 1)
+            self.assertEqual(metrics.jobs_retryable, 1)
+
+        self.assertEqual(
+            self.rows(
+                """
+                SELECT d.source_article_id, j.status, j.attempt_count
+                FROM embedding_jobs j
+                JOIN vector_documents d ON d.id=j.document_id
+                ORDER BY d.source_article_id
+                """
+            ),
+            [
+                (1, "retryable", 2),
+                (2, "retryable", 2),
+                (3, "retryable", 2),
+            ],
+        )
+        self.assertEqual(provider.call_count, 6)
 
 
 if __name__ == "__main__":

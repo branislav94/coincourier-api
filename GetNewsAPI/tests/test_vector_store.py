@@ -50,9 +50,10 @@ class VectorConfigurationTests(unittest.TestCase):
             "coincourier_vectors_test",
         )
 
-    def test_pipeline_modules_do_not_import_vector_store(self):
+    def test_automatic_pipeline_modules_do_not_import_vector_store(self):
         for relative_path in (
-            "GetNewsAPI/tasks.py",
+            "GetNewsAPI/app.py",
+            "GetNewsAPI/scheduler.py",
             "GetNewsAPI/fetcher.py",
             "GetNewsAPI/gpt_processor.py",
             "GetNewsAPI/publishing/service.py",

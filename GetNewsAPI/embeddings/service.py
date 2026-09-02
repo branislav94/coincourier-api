@@ -118,17 +118,20 @@ class EmbeddingJobEngine:
                     reconciled=True,
                 )
 
+            if len(prepared.chunks) > self.settings.max_chunks_per_job:
+                raise InvalidEmbeddingInput("document exceeds embedding chunk limit")
+
             vectors: list[tuple[float, ...]] = []
             usage_tokens = 0
             for start_index in range(0, len(prepared.chunks), self.settings.batch_size):
                 batch_chunks = prepared.chunks[
                     start_index : start_index + self.settings.batch_size
                 ]
+                provider_calls += 1
                 batch = self.provider.embed(
                     [chunk.text for chunk in batch_chunks],
                     self.settings.dimensions,
                 )
-                provider_calls += 1
                 vectors.extend(
                     validate_embedding_batch(
                         batch,
@@ -178,6 +181,7 @@ class EmbeddingJobEngine:
                 attempt=claim.attempt,
                 chunk_count=len(prepared.chunks),
                 provider_calls=provider_calls,
+                embedding_tokens=usage_tokens,
             )
         except (
             EmbeddingConfigurationError,

@@ -473,6 +473,21 @@ class JobEngineTests(unittest.TestCase):
             list(range(result.chunk_count)),
         )
 
+    def test_oversized_job_is_terminal_before_provider_work(self):
+        body = " ".join(f"token{index}" for index in range(1300))
+        settings = EmbeddingSettings(
+            enabled=True,
+            provider="openai",
+            model="text-embedding-3-small",
+            max_chunks_per_job=1,
+        )
+        engine, repository, provider = self.engine(body, settings=settings)
+        result = engine.process_next()
+        self.assertEqual(result.status, "failed")
+        self.assertEqual(repository.status, "failed")
+        self.assertEqual(provider.call_count, 0)
+        self.assertEqual(repository.persisted, ())
+
     def test_provider_failure_becomes_retryable_without_chunks(self):
         provider = FakeEmbeddingProvider(
             fail_with=EmbeddingProviderUnavailable("synthetic outage")
@@ -632,10 +647,10 @@ class JobEngineTests(unittest.TestCase):
         self.assertNotIn(marker, safe)
         self.assertLessEqual(len(safe), 500)
 
-    def test_pipeline_modules_have_no_embedding_import_or_enqueue(self):
+    def test_automatic_pipeline_modules_have_no_embedding_import_or_enqueue(self):
         for relative_path in (
             "GetNewsAPI/app.py",
-            "GetNewsAPI/tasks.py",
+            "GetNewsAPI/scheduler.py",
             "GetNewsAPI/fetcher.py",
             "GetNewsAPI/gpt_processor.py",
             "GetNewsAPI/publish_to_wp.py",

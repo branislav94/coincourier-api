@@ -460,16 +460,47 @@ and representative mocked request/response fixtures before implementation.
 
 ### Phase 6B2: Automatic ingestion, scheduling, and backfill
 
-- Planned only: article-to-document ingestion, pipeline enqueue/reconciliation,
-  a production task command, historical backfill, rate-limited scheduling,
-  metrics, and operational provider enablement.
+- Status: implemented locally, source-default disabled, and not deployed.
+  `VECTOR_ENABLED=false` and `EMBEDDING_ENABLED=false` remain the defaults.
+- Controlled ingestion: `embedding_ingest [limit]` scans a bounded newest-first
+  set of selected source articles and durably linked CoinCourier derivatives,
+  registers immutable content versions, and idempotently enqueues missing jobs.
+  It makes no provider call.
+- Provenance: source documents use the raw article ID and no rich ID. Generated
+  documents require both the durable `raw_article_id` linkage and rich article
+  ID; unlinked generated rows are skipped rather than assigned invented lineage.
+- Worker: `embedding_worker [limit]` validates the approved provider/model/
+  dimension/chunker contract, API key, and both database connections before a
+  claim. It processes at most five jobs by default, batches at 16 chunks, rejects
+  more than 100 chunks per job before provider work, and stops normally on an
+  empty queue. One repository-level deadlock retry is retained; a second
+  deadlock and unexpected storage/programming failures propagate.
+- Backfill: `embedding_backfill [source|generated] [limit]` is manual, bounded by
+  newly registered versions, and scans descending IDs under a per-run high-water
+  mark. Restart/rerun safety comes from immutable document/content identity and
+  unique document/job constraints, so no new migration or offset cursor is
+  required. Reruns rescan existing rows, which is an accepted small-schema tradeoff
+  that also discovers changed historical content and new concurrent inserts.
+- Priority: pending jobs precede expired claims and retryable jobs. Fresh pending
+  work remains publication-time newest first; retryable work rotates by least
+  attempts and oldest retry update, then publication time. A retryable result
+  still ends its current run without reclaiming itself, while later invocations
+  cannot let it indefinitely starve other ready jobs. Backfill remains separate.
+- Metrics: each task reports only counts and status, including scanned/registered/
+  skipped documents, enqueued/existing jobs, worker outcomes, provider calls,
+  chunks, and provider token usage when available. Bodies and vectors are never
+  logged.
+- Eventual external cron order is `embedding_ingest` followed by
+  `embedding_worker` every few minutes. No APScheduler or production cron change
+  is included, and historical backfill remains an operator-run command.
 - Compatibility boundary: fetch, process, publish, image, and duplicate paths do
-  not import or invoke the Phase 6B1 engine; article processing and publishing do
-  not wait for vectors.
+  not import or invoke embedding operations; article processing and publishing
+  do not wait for vectors. Only the explicit lazy `tasks.py` commands import the
+  Phase 6B subsystem.
 - Risk: embedding cost/backlog, source-retention policy, provider retention terms,
   and dimension/model migration.
 
-### Phase 7: Semantic duplicate shadow mode and retrieval
+### Phase 6C (roadmap Phase 7): Semantic duplicate shadow mode and retrieval
 
 - Files created: `vector_store/retrieval.py`, duplicate assessment persistence,
   evaluation fixtures, and retrieval audit tests.

@@ -9,6 +9,7 @@ from vector_store.models import VECTOR_DIMENSIONS
 
 CHUNKER_VERSION = "chunk-v1"
 DEFAULT_EMBEDDING_BATCH_SIZE = 16
+DEFAULT_EMBEDDING_MAX_CHUNKS_PER_JOB = 100
 
 
 @dataclass(frozen=True)
@@ -45,6 +46,7 @@ class EmbeddingSettings:
     dimensions: int = VECTOR_DIMENSIONS
     chunker_version: str = CHUNKER_VERSION
     batch_size: int = DEFAULT_EMBEDDING_BATCH_SIZE
+    max_chunks_per_job: int = DEFAULT_EMBEDDING_MAX_CHUNKS_PER_JOB
 
     def __post_init__(self) -> None:
         if not self.provider or ":" in self.provider:
@@ -59,6 +61,8 @@ class EmbeddingSettings:
             raise ValueError(f"unsupported chunker version: {self.chunker_version}")
         if not 1 <= self.batch_size <= 100:
             raise ValueError("embedding batch size must be between 1 and 100")
+        if not 1 <= self.max_chunks_per_job <= 1000:
+            raise ValueError("embedding max chunks per job must be between 1 and 1000")
 
     @property
     def embedding_version(self) -> str:
@@ -74,6 +78,7 @@ class EmbeddingSettings:
             EMBEDDING_CHUNKER_VERSION,
             EMBEDDING_DIMENSIONS,
             EMBEDDING_ENABLED,
+            EMBEDDING_MAX_CHUNKS_PER_JOB,
             EMBEDDING_MODEL,
             EMBEDDING_PROVIDER,
         )
@@ -85,6 +90,7 @@ class EmbeddingSettings:
             dimensions=EMBEDDING_DIMENSIONS,
             chunker_version=EMBEDDING_CHUNKER_VERSION,
             batch_size=EMBEDDING_BATCH_SIZE,
+            max_chunks_per_job=EMBEDDING_MAX_CHUNKS_PER_JOB,
         )
 
 
@@ -97,3 +103,4 @@ class EmbeddingJobResult:
     chunk_count: int = 0
     provider_calls: int = 0
     reconciled: bool = False
+    embedding_tokens: int = 0

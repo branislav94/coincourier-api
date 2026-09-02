@@ -48,7 +48,21 @@ class VectorRepository:
     def __init__(self, connect: Callable[[], Any] | None = None) -> None:
         self._connect = connect or connect_vector_db
 
+    def check_connection(self) -> None:
+        connection = self._connect()
+        cursor = connection.cursor()
+        try:
+            cursor.execute("SELECT 1")
+            cursor.fetchone()
+        finally:
+            cursor.close()
+            connection.close()
+
     def upsert_document(self, document: VectorDocumentDraft) -> int:
+        document_id, _created = self.register_document(document)
+        return document_id
+
+    def register_document(self, document: VectorDocumentDraft) -> tuple[int, bool]:
         connection = self._connect()
         cursor = connection.cursor(dictionary=True)
         try:
@@ -79,6 +93,7 @@ class VectorRepository:
                 ),
             )
             document_id = int(cursor.lastrowid)
+            created = cursor.rowcount == 1
             cursor.execute(
                 "SELECT content_hash FROM vector_documents WHERE id=%s FOR UPDATE",
                 (document_id,),
@@ -89,7 +104,7 @@ class VectorRepository:
                     "document key/version already belongs to a different content hash"
                 )
             connection.commit()
-            return document_id
+            return document_id, created
         except BaseException:
             connection.rollback()
             raise
@@ -268,6 +283,17 @@ class VectorRepository:
             connection.close()
 
     def enqueue_embedding_job(self, document_id: int, embedding_version: str) -> int:
+        job_id, _created = self.enqueue_embedding_job_with_status(
+            document_id,
+            embedding_version,
+        )
+        return job_id
+
+    def enqueue_embedding_job_with_status(
+        self,
+        document_id: int,
+        embedding_version: str,
+    ) -> tuple[int, bool]:
         if document_id <= 0 or not embedding_version.strip():
             raise ValueError("document_id and embedding_version are required")
         connection = self._connect()
@@ -283,8 +309,9 @@ class VectorRepository:
                 (document_id, embedding_version),
             )
             job_id = int(cursor.lastrowid)
+            created = cursor.rowcount == 1
             connection.commit()
-            return job_id
+            return job_id, created
         except BaseException:
             connection.rollback()
             raise
@@ -310,7 +337,7 @@ class VectorRepository:
                 if getattr(error, "errno", None) != MARIADB_ER_LOCK_DEADLOCK:
                     raise
                 if attempt_index == 1:
-                    return None
+                    raise
         return None
 
     def _claim_embedding_job_once(
@@ -345,7 +372,22 @@ class VectorRepository:
                             )
                         ))
                   )
-                ORDER BY j.created_at ASC, j.id ASC
+                ORDER BY CASE j.status
+                             WHEN 'pending' THEN 0
+                             WHEN 'claimed' THEN 1
+                             ELSE 2
+                         END ASC,
+                         CASE WHEN j.status='retryable'
+                              THEN j.attempt_count ELSE 0 END ASC,
+                         CASE WHEN j.status='retryable'
+                              THEN j.updated_at ELSE NULL END ASC,
+                         CASE WHEN j.status='claimed'
+                              THEN j.claimed_at ELSE NULL END ASC,
+                         d.published_at IS NULL ASC,
+                         d.published_at DESC,
+                         d.id DESC,
+                         j.created_at ASC,
+                         j.id ASC
                 LIMIT 1
                 FOR UPDATE
                 """,

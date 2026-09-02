@@ -1,4 +1,4 @@
-"""Phase 6B1 deterministic chunking and embedding job machinery."""
+"""Disabled-by-default Phase 6B embedding subsystem."""
 
 from .chunking import (
     chunk_text,
@@ -14,6 +14,11 @@ from .models import (
     PreparedDocument,
     TextChunk,
 )
+from .ingestion import (
+    ApplicationArticle,
+    EmbeddingIngestionService,
+    RegistrationResult,
+)
 from .provider import (
     EmbeddingConfigurationError,
     EmbeddingProvider,
@@ -27,10 +32,12 @@ from .service import EmbeddingJobEngine
 
 __all__ = [
     "CHUNKER_VERSION",
+    "ApplicationArticle",
     "EmbeddingBatch",
     "EmbeddingConfigurationError",
     "EmbeddingJobEngine",
     "EmbeddingJobResult",
+    "EmbeddingIngestionService",
     "EmbeddingProvider",
     "EmbeddingProviderError",
     "EmbeddingProviderUnavailable",
@@ -39,6 +46,7 @@ __all__ = [
     "InvalidEmbeddingResponse",
     "OpenAIEmbeddingProvider",
     "PreparedDocument",
+    "RegistrationResult",
     "TextChunk",
     "chunk_text",
     "normalize_document_text",

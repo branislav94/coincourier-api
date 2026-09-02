@@ -27,11 +27,12 @@ Deterministic Phase 5 duplicate analysis is also **IMPLEMENTED BUT DISABLED**.
 after its manual migration, it records pairwise evidence before LLM work but never
 changes selection, processing, or publication eligibility.
 
-Phase 6A vector storage and the Phase 6B1 deterministic chunking/embedding job
-engine are **IMPLEMENTED LOCALLY BUT DISABLED**. They use a separate MariaDB
-boundary, and neither is wired into fetch, process, publish, image, scheduler, or
-duplicate behavior. Automatic ingestion, backfill, production scheduling, and
-all semantic duplicate behavior remain planned.
+Phase 6A vector storage, Phase 6B1 deterministic chunking/job processing, and
+Phase 6B2 controlled ingestion/worker/backfill operations are **IMPLEMENTED
+LOCALLY BUT DISABLED**. They use a separate MariaDB boundary and explicit lazy
+task commands; none is wired into fetch, process, publish, image, scheduler, or
+duplicate behavior. Production scheduling, provider rollout, and all semantic
+duplicate behavior remain planned.
 
 ## 1. Purpose and scope
 
@@ -627,7 +628,7 @@ Calculate topic/entity saturation from both raw source labels and generated SEO 
 
 ## 23. MariaDB vector architecture
 
-**PHASE 6A AND PHASE 6B1 IMPLEMENTED LOCALLY; DISABLED AND NOT DEPLOYED**
+**PHASE 6A, 6B1, AND 6B2 IMPLEMENTED LOCALLY; DISABLED AND NOT DEPLOYED**
 
 Phase 6A adds an optional, separate MariaDB service and database named
 `coincourier_vectors`. The reproducible local service uses `mariadb:11.8`, binds
@@ -636,9 +637,10 @@ alter or share the application database. `VECTOR_ENABLED=false` is the source
 default, and no fetch, process, publish, image, or duplicate path imports the
 vector store or opens its connection.
 
-Phase 6B1 adds a directly invokable embedding job engine over this repository.
-`EMBEDDING_ENABLED=false` is also the source default. There is no task command,
-scheduler hook, automatic document ingestion, backfill, or production provider
+Phase 6B1 adds the embedding job engine. Phase 6B2 adds explicit lazy task
+commands for bounded application-row ingestion, worker execution, and manual
+historical backfill. `EMBEDDING_ENABLED=false` is also the source default. There
+is no scheduler hook, automatic pipeline hook, deployment, or production provider
 invocation.
 
 At approximately 30 posts/day and 4-6 vectors/article, the mathematical range is about 43,800-65,700 vectors/year and the five-vector midpoint is 54,750. Allowing for summaries or occasional extra chunks makes 50,000-70,000 vectors/year a sound planning envelope. This is modest enough for one MariaDB deployment and an approximate vector index, while retaining relational joins and transactionally consistent metadata.
@@ -668,7 +670,7 @@ dimensions in one vector column.
 
 ## 24. Vector schemas
 
-**PHASE 6A STORAGE AND PHASE 6B1 JOB OPERATIONS IMPLEMENTED LOCALLY**
+**PHASE 6A STORAGE AND PHASE 6B JOB OPERATIONS IMPLEMENTED LOCALLY**
 
 ### `vector_documents`
 
@@ -705,8 +707,9 @@ Keep chunk text for explainability and re-embedding only under source-retention 
 Phase 6B1 implements direct job claiming, ownership checks, stale-claim recovery,
 attempt counting, safe errors, reconciliation, and atomic persistence/completion.
 The claim transaction commits and closes before content loading or a provider
-call. Automatic ingestion, scheduling, a production worker command, and backfill
-are not implemented.
+call. Phase 6B2 implements idempotent registration/enqueue plus bounded worker and
+manual backfill commands. Scheduling and production provider rollout are not
+implemented.
 
 ### `duplicate_assessments`
 
@@ -737,7 +740,7 @@ The proposed tables should not be collapsed into the two article tables. Documen
 
 ## 25. Embedding and chunking strategy
 
-**PHASE 6B1 IMPLEMENTED LOCALLY AND DISABLED; PHASE 6B2 PLANNED**
+**PHASE 6B1 AND 6B2 IMPLEMENTED LOCALLY; DISABLED AND NOT DEPLOYED**
 
 ### Phase 6B1 embedding decision
 
@@ -766,8 +769,11 @@ SHA-256 hash and deterministic contiguous index. Exact duplicate chunks within a
 document are retained once.
 
 Source and CoinCourier-generated provenance remains separate in
-`vector_documents`. Phase 6B1 accepts content only through an injected loader; it
-does not decide which application rows to ingest.
+`vector_documents`. Phase 6B2 maps raw `cryptonewsapi.id`, title, and `full_text`
+to `source_article` documents. It maps `rich_crpytonews.id`, title, and
+`full_text` to `coincourier_generated` only when the durable `raw_article_id`
+join resolves; missing lineage is skipped. Registration uses normalized title
+plus visible body and never treats URL alone as identity.
 
 ### Retention and re-embedding
 
@@ -775,7 +781,8 @@ does not decide which application rows to ingest.
 - Keep recent raw candidates long enough for duplicate/event windows; propose 90 days for rejected/unselected metadata and 12-24 months for source chunks, subject to provider/license policy.
 - Keep hashes and cluster/audit decisions longer than source text when legally permitted.
 - Re-embed side by side into a new dimension-compatible physical table/version, validate coverage and retrieval quality, switch reads, then retire the old version after rollback expiry.
-- Backfill newest published/raw documents first, rate-limited and restartable by deterministic jobs.
+- Backfill newest published/raw documents first through the manual bounded task;
+  restart safety comes from descending keyset scans and deterministic documents/jobs.
 
 ### Async failure policy
 
@@ -790,8 +797,33 @@ Unexpected storage/programming faults release the claim to a recoverable state
 when possible and propagate; if cleanup itself is unavailable, normal claim
 expiry still permits recovery.
 
-Phase 6B2 still must add rate-limited scheduling, backoff policy, maximum-attempt
-operations, a sweeper/backfill, metrics, and pipeline enqueue/reconciliation.
+Phase 6B2 adds `embedding_ingest`, `embedding_worker`, and
+`embedding_backfill source|generated`. The worker requires both enable flags,
+preflights the approved OpenAI/model/dimension/chunker contract, API key, and
+both database connections before claiming, then processes a bounded job count.
+Provider requests retain the Phase 6B1 batch size; a 100-chunk per-job cap makes
+paid work finite and rejects oversized input before a call. Retryable provider
+results end the current run to avoid immediate hot reclaim. Across later runs,
+pending jobs rank first and retryable jobs rotate by least attempts and oldest
+retry update, preventing one repeatedly failing newest job from starving other
+ready jobs. Failed, lost-claim, and reconciled jobs are counted separately. A
+genuine empty queue is success.
+
+Backfill takes a fixed per-run high-water ID and scans descending keyset pages.
+It deliberately persists no extra cursor table: immutable content versions and
+unique document/job constraints make restarts idempotent, while rescanning also
+finds historical edits and rows inserted after an earlier high-water mark. This
+trades repeated reads for no Phase 6B2 migration. Claims order by publication
+time newest first, so historical rows registered later do not overtake fresh
+dated articles. Backfill remains a separate manual invocation.
+
+Each operation logs count-only run metrics: scanned/registered/skipped documents,
+enqueued/existing jobs, claimed/completed/reconciled/retryable/failed/lost jobs,
+provider calls, embedded chunks, and token usage when supplied. No article text
+or vector is logged. External cron may eventually run `embedding_ingest` then
+`embedding_worker` every few minutes; no scheduler or deployment change exists.
+Phase 6C remains semantic retrieval and duplicate-shadow evaluation. It must not
+be inferred from Phase 6B storage or job completion.
 
 ## 26. Retrieval use cases
 
@@ -819,12 +851,18 @@ EMBEDDING_MODEL=text-embedding-3-small
 EMBEDDING_DIMENSIONS=1536
 EMBEDDING_CHUNKER_VERSION=chunk-v1
 EMBEDDING_BATCH_SIZE=16
+EMBEDDING_INGEST_LIMIT=25
+EMBEDDING_WORK_LIMIT=5
+EMBEDDING_CLAIM_TIMEOUT_MINUTES=30
+EMBEDDING_BACKFILL_PAGE_SIZE=100
+EMBEDDING_MAX_CHUNKS_PER_JOB=100
 VECTOR_DUPLICATE_MODE=off
 ```
 
 The vector and embedding settings exist with disabled source defaults. The
 semantic mode remains proposed and must not be inferred from storage or job
-machinery. No current pipeline path reads either enable flag.
+machinery. Explicit embedding task commands read the enable flags; no automatic
+fetch/process/publish/scheduler path does.
 
 The proposed future `VECTOR_DUPLICATE_MODE` contract is `off|shadow|enforce`:
 
@@ -836,7 +874,11 @@ Rollout order is exact constraints/idempotency first, event and lexical shadow n
 
 ## 28. Metrics and evaluation
 
-**PLANNED**
+**PHASE 6B2 RUN COUNTS IMPLEMENTED LOCALLY; SEMANTIC EVALUATION PLANNED**
+
+The explicit ingestion, worker, and backfill tasks emit bounded count-only run
+summaries. Corpus labeling, retrieval-quality metrics, dashboards, and production
+alerts remain planned.
 
 Build a labeled set containing exact duplicates, same-event duplicates, legitimate updates, and broad topical overlap. Include the suspicious log groups but label them only after source/DB inspection. Evaluate at pair and publication-decision level.
 
@@ -941,10 +983,14 @@ Each phase is intentionally deployable and reversible on its own.
   OpenAI adapter, versioned settings, direct job claims/recovery, provider-outside-
   transaction execution, atomic completion, and paid-call reconciliation are
   implemented locally and verified on MariaDB 11.8.
-- Phase 6B2 planned: application document ingestion, production worker/task,
-  historical backfill, rate-limited scheduling, metrics, and operational rollout.
-- Switches: `VECTOR_ENABLED=false` and `EMBEDDING_ENABLED=false`; no current
-  pipeline path reads either one.
+- Phase 6B2 status: application document ingestion, idempotent job enqueue,
+  bounded worker/manual backfill task commands, preflight controls, and count-only
+  metrics are implemented locally. They are disabled and not deployed.
+- Switches: `VECTOR_ENABLED=false` and `EMBEDDING_ENABLED=false`; only explicit
+  embedding task commands read them. No automatic pipeline path reads either one.
+- Eventual external cron sequence: run `embedding_ingest`, then
+  `embedding_worker`, every few minutes. Keep `embedding_backfill` manual and
+  separately bounded. APScheduler and deployment configuration remain unchanged.
 - Rollback: leave the separate service absent/disabled; the application DB and
   deterministic pipeline remain independent.
 
@@ -1044,10 +1090,14 @@ No test should make a live provider, WordPress, or production DB call by default
 - For a suspected duplicate, collect raw/rich/WP IDs, provider news/event IDs, source/canonical URLs, source timestamps, content hashes, and decision records before deleting or unpublishing anything.
 - For a post visible in WordPress but `published=0`, enable no new behavior until Phase 2 migrations are verified. Once the durable path owns the row, reconcile only by saved WP ID or CoinCourier publication key, never title/slug.
 
-**PLANNED vector checks; IMPLEMENTED BUT DISABLED idempotency checks**
+**IMPLEMENTED LOCALLY BUT DISABLED vector-job checks; IMPLEMENTED BUT DISABLED idempotency checks**
 
-- Monitor active embedding version coverage and dead/retry jobs.
-- Verify `VECTOR_ENABLED`, duplicate mode, policy version, and dimension/schema agreement at startup.
+- Monitor active embedding version coverage and failed/retryable jobs using the
+  count-only ingest/worker metrics; do not log body or vector values.
+- Verify both enable flags, vector DB isolation, API key, approved provider/model,
+  1536 dimensions, and `chunk-v1` agreement before running a worker.
+- Run fresh ingestion before workers. Invoke source/generated backfill separately
+  with small limits so it remains operationally subordinate to fresh work.
 - Inspect exact identity and cluster evidence before overriding a decision.
 - When embeddings are unavailable, confirm semantic checks show `unavailable/fail_open` while exact and publication-idempotency controls remain active.
 - Reconcile stuck publication leases by deterministic idempotency key and WP post ID; never create a new post until reconciliation proves none exists.

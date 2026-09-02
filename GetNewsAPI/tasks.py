@@ -13,7 +13,11 @@ logging.basicConfig(
 
 logger = logging.getLogger(__name__)
 
-USAGE = "Usage: python tasks.py [fetch|process|publish|chained]"
+USAGE = (
+    "Usage: python tasks.py "
+    "[fetch|process|publish|chained|embedding_ingest [limit]|"
+    "embedding_worker [limit]|embedding_backfill [source|generated] [limit]]"
+)
 
 
 def run_fetch() -> None:
@@ -56,6 +60,59 @@ def run_chained() -> None:
     logger.info("[TASK] chained done")
 
 
+def run_embedding_ingest(limit: int | None = None):
+    from embeddings.operations import run_embedding_ingest as run
+
+    logger.info("[TASK] embedding_ingest start limit=%s", limit)
+    result = run(limit=limit)
+    logger.info("[TASK] embedding_ingest done result=%s", result)
+    return result
+
+
+def run_embedding_worker(limit: int | None = None):
+    from embeddings.operations import run_embedding_worker as run
+
+    logger.info("[TASK] embedding_worker start limit=%s", limit)
+    result = run(limit=limit)
+    logger.info("[TASK] embedding_worker done result=%s", result)
+    return result
+
+
+def run_embedding_backfill(
+    source: str = "source",
+    limit: int | None = None,
+):
+    from embeddings.operations import run_embedding_backfill as run
+    from vector_store.models import SourceType
+
+    normalized = source.strip().lower()
+    source_types = {
+        "source": SourceType.SOURCE_ARTICLE,
+        "source_article": SourceType.SOURCE_ARTICLE,
+        "generated": SourceType.COINCOURIER_GENERATED,
+        "coincourier_generated": SourceType.COINCOURIER_GENERATED,
+    }
+    if normalized not in source_types:
+        raise ValueError("embedding backfill source must be source or generated")
+    logger.info(
+        "[TASK] embedding_backfill start source=%s limit=%s",
+        normalized,
+        limit,
+    )
+    result = run(source_types[normalized], limit=limit)
+    logger.info("[TASK] embedding_backfill done result=%s", result)
+    return result
+
+
+def _optional_positive_int(index: int) -> int | None:
+    if len(sys.argv) <= index:
+        return None
+    value = int(sys.argv[index])
+    if value <= 0:
+        raise ValueError("task limit must be positive")
+    return value
+
+
 def main() -> int:
     command = sys.argv[1].strip().lower() if len(sys.argv) > 1 else ""
 
@@ -73,6 +130,19 @@ def main() -> int:
 
     if command == "chained":
         run_chained()
+        return 0
+
+    if command == "embedding_ingest":
+        run_embedding_ingest(_optional_positive_int(2))
+        return 0
+
+    if command == "embedding_worker":
+        run_embedding_worker(_optional_positive_int(2))
+        return 0
+
+    if command == "embedding_backfill":
+        source = sys.argv[2] if len(sys.argv) > 2 else "source"
+        run_embedding_backfill(source, _optional_positive_int(3))
         return 0
 
     print(USAGE)
