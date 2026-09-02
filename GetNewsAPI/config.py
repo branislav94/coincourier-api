@@ -207,6 +207,21 @@ VECTOR_DB_CONFIG = {
     "connection_timeout": VECTOR_DB_CONNECT_TIMEOUT_SECONDS,
 }
 
+# Phase 6B1 embedding machinery is directly invokable only. Source defaults
+# keep paid provider behavior disabled and do not add pipeline task wiring.
+EMBEDDING_ENABLED = _env_bool("EMBEDDING_ENABLED", False)
+EMBEDDING_PROVIDER = os.getenv("EMBEDDING_PROVIDER", "openai").strip().lower()
+EMBEDDING_MODEL = os.getenv(
+    "EMBEDDING_MODEL",
+    "text-embedding-3-small",
+).strip()
+EMBEDDING_DIMENSIONS = int(os.getenv("EMBEDDING_DIMENSIONS", "1536"))
+EMBEDDING_CHUNKER_VERSION = os.getenv(
+    "EMBEDDING_CHUNKER_VERSION",
+    "chunk-v1",
+).strip()
+EMBEDDING_BATCH_SIZE = int(os.getenv("EMBEDDING_BATCH_SIZE", "16"))
+
 # WordPress REST API credentials
 WP_API_URL = os.getenv("WP_API_URL")
 WP_USERNAME = os.getenv("WP_USERNAME")

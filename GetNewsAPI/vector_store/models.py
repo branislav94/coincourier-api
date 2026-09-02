@@ -96,3 +96,33 @@ class VectorMatch:
     chunk_hash: str
     embedding_model: str
     embedding_version: str
+
+
+@dataclass(frozen=True)
+class VectorChunkWrite:
+    chunk_index: int
+    chunk_text: str
+    chunk_hash: str
+    embedding: tuple[float, ...]
+
+
+@dataclass(frozen=True)
+class EmbeddingJobRecord:
+    id: int
+    document_id: int
+    embedding_version: str
+    status: str
+    attempt_count: int
+    claim_token: str | None
+    claimed_at: datetime | None
+    last_error: str | None
+
+
+@dataclass(frozen=True)
+class EmbeddingJobClaim:
+    id: int
+    token: str
+    document: VectorDocumentRecord
+    embedding_version: str
+    attempt: int
+    recovered: bool = False

@@ -27,6 +27,12 @@ Deterministic Phase 5 duplicate analysis is also **IMPLEMENTED BUT DISABLED**.
 after its manual migration, it records pairwise evidence before LLM work but never
 changes selection, processing, or publication eligibility.
 
+Phase 6A vector storage and the Phase 6B1 deterministic chunking/embedding job
+engine are **IMPLEMENTED LOCALLY BUT DISABLED**. They use a separate MariaDB
+boundary, and neither is wired into fetch, process, publish, image, scheduler, or
+duplicate behavior. Automatic ingestion, backfill, production scheduling, and
+all semantic duplicate behavior remain planned.
+
 ## 1. Purpose and scope
 
 **CURRENT**
@@ -621,7 +627,7 @@ Calculate topic/entity saturation from both raw source labels and generated SEO 
 
 ## 23. MariaDB vector architecture
 
-**PHASE 6A IMPLEMENTED LOCALLY; DISABLED AND NOT DEPLOYED**
+**PHASE 6A AND PHASE 6B1 IMPLEMENTED LOCALLY; DISABLED AND NOT DEPLOYED**
 
 Phase 6A adds an optional, separate MariaDB service and database named
 `coincourier_vectors`. The reproducible local service uses `mariadb:11.8`, binds
@@ -629,6 +635,11 @@ only to `127.0.0.1:13309`, and was verified against MariaDB 11.8.9. It does not
 alter or share the application database. `VECTOR_ENABLED=false` is the source
 default, and no fetch, process, publish, image, or duplicate path imports the
 vector store or opens its connection.
+
+Phase 6B1 adds a directly invokable embedding job engine over this repository.
+`EMBEDDING_ENABLED=false` is also the source default. There is no task command,
+scheduler hook, automatic document ingestion, backfill, or production provider
+invocation.
 
 At approximately 30 posts/day and 4-6 vectors/article, the mathematical range is about 43,800-65,700 vectors/year and the five-vector midpoint is 54,750. Allowing for summaries or occasional extra chunks makes 50,000-70,000 vectors/year a sound planning envelope. This is modest enough for one MariaDB deployment and an approximate vector index, while retaining relational joins and transactionally consistent metadata.
 
@@ -657,7 +668,7 @@ dimensions in one vector column.
 
 ## 24. Vector schemas
 
-**PHASE 6A STORAGE FOUNDATION IMPLEMENTED IN THE SEPARATE VECTOR DATABASE**
+**PHASE 6A STORAGE AND PHASE 6B1 JOB OPERATIONS IMPLEMENTED LOCALLY**
 
 ### `vector_documents`
 
@@ -691,8 +702,11 @@ Keep chunk text for explainability and re-embedding only under source-retention 
 - bounded claim token/time, attempt count, bounded last error, and timestamps;
 - one row per document/version plus a status/claim-time ordering index.
 
-This is storage only in Phase 6A. No worker, claims, API calls, scheduling, or
-automatic ingestion is implemented.
+Phase 6B1 implements direct job claiming, ownership checks, stale-claim recovery,
+attempt counting, safe errors, reconciliation, and atomic persistence/completion.
+The claim transaction commits and closes before content loading or a provider
+call. Automatic ingestion, scheduling, a production worker command, and backfill
+are not implemented.
 
 ### `duplicate_assessments`
 
@@ -723,28 +737,37 @@ The proposed tables should not be collapsed into the two article tables. Documen
 
 ## 25. Embedding and chunking strategy
 
-**PLANNED**
+**PHASE 6B1 IMPLEMENTED LOCALLY AND DISABLED; PHASE 6B2 PLANNED**
 
-### Phase 6B embedding decision
+### Phase 6B1 embedding decision
 
-Phase 6A does not select or call an embedding provider or model. MariaDB
-`VECTOR(1536)` is the tested physical storage contract, not a final hosted-model
-decision. Phase 6B must approve provider retention terms, choose the model and
-dimension strategy, define deterministic chunking, and assign an immutable
-identity in the form `provider:model:dimensions:chunker-version`. A later model
-or dimension must be evaluated side by side rather than silently replacing old
-vectors.
+The approved baseline is OpenAI `text-embedding-3-small`, 1536 dimensions, cosine
+distance, deterministic `chunk-v1`, and immutable embedding identity
+`openai:text-embedding-3-small:1536:chunk-v1`. The implementation provides a
+provider protocol, deterministic fake provider, and mockable OpenAI adapter. The
+adapter sends explicit `model`, `input`, and `dimensions`; no live embedding smoke
+or production call is part of Phase 6B1. A later model or dimension must be
+evaluated side by side rather than silently replacing existing vectors.
 
 ### Document and chunk policy
 
-| Document | Vector/chunk policy | Primary use |
-|---|---|---|
-| Raw source title + provider summary | one compact `raw_summary` vector, including entities/numbers/date | pre-selection and pre-processing duplicate search |
-| Raw source body | heading/sentence-aware 450-700 token chunks, 60-100 token overlap, usually 3-5 | fact/event matching and historical source context |
-| Rich title + concise summary | one `rich_summary` vector | angle comparison and internal links, not factual confirmation |
-| Published body | heading-aware chunks, usually 3-5 | continuity, related coverage, internal links, repetitive-angle detection |
+`chunk-v1` normalizes title plus visible body with Unicode NFKC, CRLF
+normalization, horizontal-whitespace collapse, and paragraph preservation. HTML
+is reduced to visible text; script/style content is ignored. Numbers, dates,
+tickers, names, percentages, currency, and negation remain.
 
-Normalize Unicode and whitespace; retain meaningful numbers, dates, tickers, and named entities. Do not remove negation. Hash the exact normalized chunk input. Keep raw-source and CoinCourier-generated namespaces separate in every query.
+Segmentation is paragraph/sentence first, using a deterministic stdlib
+word/punctuation token estimate. It targets 500 token units, flushes a current
+chunk at or above 350 when the next segment would exceed the target, never exceeds
+600, uses zero overlap, and splits oversized segments only at whitespace so words
+are not broken. The SHA-256 content hash covers exact normalized title plus body;
+`content_version` is `chunk-v1:<content-hash>`. Each exact normalized chunk has a
+SHA-256 hash and deterministic contiguous index. Exact duplicate chunks within a
+document are retained once.
+
+Source and CoinCourier-generated provenance remains separate in
+`vector_documents`. Phase 6B1 accepts content only through an injected loader; it
+does not decide which application rows to ingest.
 
 ### Retention and re-embedding
 
@@ -756,7 +779,19 @@ Normalize Unicode and whitespace; retain meaningful numbers, dates, tickers, and
 
 ### Async failure policy
 
-Embedding jobs use short timeouts, exponential backoff with jitter, leases, maximum attempts, and dead-letter status. Fetch/process/publish enqueue or reconcile jobs but do not fail when embeddings are unavailable. A sweeper finds documents missing the active version. Semantic checks return `unavailable` and fail open to deterministic controls.
+Phase 6B1 claims one exact embedding version with an opaque ownership token,
+commits and closes the claim transaction, then loads content and calls the
+provider. Complete valid persisted chunks reconcile the job with zero provider
+calls. Otherwise vectors are generated in bounded batches and full replacement
+plus completion occurs atomically in a separate short transaction. Invalid
+content identity, configuration, or provider output is terminal. Genuine
+provider/network unavailability is retryable. Lost ownership is distinct.
+Unexpected storage/programming faults release the claim to a recoverable state
+when possible and propagate; if cleanup itself is unavailable, normal claim
+expiry still permits recovery.
+
+Phase 6B2 still must add rate-limited scheduling, backoff policy, maximum-attempt
+operations, a sweeper/backfill, metrics, and pipeline enqueue/reconciliation.
 
 ## 26. Retrieval use cases
 
@@ -778,12 +813,18 @@ Current and future switches:
 
 ```text
 VECTOR_ENABLED=false
+EMBEDDING_ENABLED=false
+EMBEDDING_PROVIDER=openai
+EMBEDDING_MODEL=text-embedding-3-small
+EMBEDDING_DIMENSIONS=1536
+EMBEDDING_CHUNKER_VERSION=chunk-v1
+EMBEDDING_BATCH_SIZE=16
 VECTOR_DUPLICATE_MODE=off
 ```
 
-Only `VECTOR_ENABLED` exists in Phase 6A. The semantic mode and embedding
-settings remain proposed Phase 6B/6C contracts and must not be inferred from the
-storage schema.
+The vector and embedding settings exist with disabled source defaults. The
+semantic mode remains proposed and must not be inferred from storage or job
+machinery. No current pipeline path reads either enable flag.
 
 The proposed future `VECTOR_DUPLICATE_MODE` contract is `off|shadow|enforce`:
 
@@ -896,9 +937,14 @@ Each phase is intentionally deployable and reversible on its own.
   storage-only `embedding_jobs`, relational keys, and cosine VECTOR index.
 - Phase 6A tests: disposable MariaDB 11.8.9 DDL/functions/index/query plans,
   dimensions, malformed values, transactions, idempotency, and provenance filters.
-- Phase 6B planned: provider/model approval, chunker, embedding client/worker/task,
-  job leases/retries, backfill, metrics, and hosted-client mocks.
-- Switch: `VECTOR_ENABLED=false`; no current pipeline path reads it.
+- Phase 6B1 status: deterministic `chunk-v1`, provider abstraction, fake provider,
+  OpenAI adapter, versioned settings, direct job claims/recovery, provider-outside-
+  transaction execution, atomic completion, and paid-call reconciliation are
+  implemented locally and verified on MariaDB 11.8.
+- Phase 6B2 planned: application document ingestion, production worker/task,
+  historical backfill, rate-limited scheduling, metrics, and operational rollout.
+- Switches: `VECTOR_ENABLED=false` and `EMBEDDING_ENABLED=false`; no current
+  pipeline path reads either one.
 - Rollback: leave the separate service absent/disabled; the application DB and
   deterministic pipeline remain independent.
 
@@ -1034,8 +1080,8 @@ No test should make a live provider, WordPress, or production DB call by default
 6. What false-positive ceiling and editorial override workflow are acceptable before semantic enforcement?
 7. Should WordPress idempotency use a registered REST meta field/custom endpoint, direct DB reconciliation, or both?
 8. Is draft-first post reservation acceptable operationally, and how long may stuck drafts/media remain?
-9. Is OpenAI `text-embedding-3-small` approved for source text, and what provider data-retention policy applies?
-10. Is 1536 the long-lived dimension, or should a quality/cost benchmark choose another dimension before DDL?
+9. What provider data-retention policy must be enforced before production source-text embedding is enabled?
+10. What quality/cost benchmark and rollback window are required before replacing the approved 1536-dimension baseline?
 11. What rolling windows and caps apply independently to events, topics, entities, sources, and breaking news?
 12. Should the hard-coded `bitcoin dominance` SEO examples be replaced with neutral/dynamic examples to reduce framing repetition?
 13. Should generated `schema_jsonld` and `image_alt` be persisted, and must missing licensed-image attribution block publication?

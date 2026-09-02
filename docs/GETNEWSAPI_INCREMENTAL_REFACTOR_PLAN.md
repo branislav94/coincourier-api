@@ -431,14 +431,43 @@ and representative mocked request/response fixtures before implementation.
 - Rollback: keep the optional service absent or disabled; the application DB is
   independent and has no vector migration.
 
-### Phase 6B: Embedding production and asynchronous jobs
+### Phase 6B1: Deterministic chunking and embedding job engine
 
-- Planned only: finalize provider/model/dimension policy, production chunking,
-  embedding client calls, job claiming/retries, backfill, and a cron-safe task.
-- Compatibility boundary: article processing and publishing must not wait for vectors.
-- Tests required: chunk determinism, hosted-client mocks, retries, stale claims,
-  resumable backfill, model-version isolation, and outage fail-open behavior.
-- Risk: embedding cost/backlog, source-retention policy, and dimension/model migration.
+- Status: implemented locally and source-default disabled; not pipeline-wired or
+  deployed. `EMBEDDING_ENABLED=false` and `VECTOR_ENABLED=false` remain defaults.
+- Provider contract: OpenAI `text-embedding-3-small`, 1536 dimensions, cosine
+  storage, and immutable version
+  `openai:text-embedding-3-small:1536:chunk-v1`. A deterministic fake provider
+  supports tests; the OpenAI adapter is mock-tested with explicit model, input,
+  and dimension arguments.
+- `chunk-v1`: NFKC and visible-HTML normalization, script/style removal,
+  paragraph/sentence-first segmentation, deterministic stdlib token estimates,
+  target 500, minimum flush 350, hard ceiling 600, zero overlap, no word
+  breaking, and SHA-256 document/chunk hashes. Document identity is normalized
+  title plus normalized visible body.
+- Job engine: ownership-token claims and stale-claim recovery, provider calls
+  after the claim transaction closes, bounded batches, response validation,
+  paid-call reconciliation when complete matching vectors already exist, and
+  atomic vector replacement/job completion in a separate short transaction.
+- Failure policy: invalid content/configuration/provider output is terminal;
+  genuine provider/network unavailability is retryable; lost ownership is
+  reported separately; unexpected storage or programming faults release the
+  claim when possible and propagate instead of being silently classified as a
+  provider retry.
+- Tests: deterministic chunking, hosted-client mocks, failure classification,
+  stale claims, ownership, transaction boundaries, reconciliation, rollback,
+  and model-version coexistence were verified on disposable MariaDB 11.8.
+
+### Phase 6B2: Automatic ingestion, scheduling, and backfill
+
+- Planned only: article-to-document ingestion, pipeline enqueue/reconciliation,
+  a production task command, historical backfill, rate-limited scheduling,
+  metrics, and operational provider enablement.
+- Compatibility boundary: fetch, process, publish, image, and duplicate paths do
+  not import or invoke the Phase 6B1 engine; article processing and publishing do
+  not wait for vectors.
+- Risk: embedding cost/backlog, source-retention policy, provider retention terms,
+  and dimension/model migration.
 
 ### Phase 7: Semantic duplicate shadow mode and retrieval
 
