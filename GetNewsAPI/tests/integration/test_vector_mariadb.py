@@ -23,6 +23,15 @@ if str(PROJECT_DIR) not in sys.path:
 from vector_store.db import VectorSchemaError, verify_vector_schema
 from vector_store.models import SourceType, VECTOR_DIMENSIONS, VectorDocumentDraft
 from vector_store.repository import VectorRepository, serialize_embedding
+from semantic_retrieval.evaluation import (
+    EvaluationFixture,
+    LabeledRelationship,
+    RelationshipLabel,
+    RelevanceDefinition,
+    evaluate_retrieval,
+)
+from semantic_retrieval.models import SemanticRetrievalSettings, SemanticRetrievalStatus
+from semantic_retrieval.service import SemanticRetrievalService
 
 
 RUN_INTEGRATION = os.getenv("RUN_VECTOR_MARIADB_INTEGRATION", "false").strip().lower() in {
@@ -134,6 +143,43 @@ class VectorMariaDBIntegrationTests(unittest.TestCase):
             content_hash=digest(f"{article_id}:{content_version}:{title}"),
             content_version=content_version,
         )
+
+    def add_chunk(
+        self,
+        document_id: int,
+        *,
+        vector: list[float],
+        text: str,
+        chunk_index: int = 0,
+        version: str = "synthetic:test:1536:chunk-v1",
+    ) -> None:
+        self.repository.upsert_chunk(
+            document_id=document_id,
+            chunk_index=chunk_index,
+            chunk_text=text,
+            embedding=vector,
+            embedding_model="synthetic:test",
+            embedding_version=version,
+        )
+
+    def mark_embedding_complete(
+        self,
+        document_id: int,
+        *,
+        version: str = "synthetic:test:1536:chunk-v1",
+    ) -> None:
+        job_id = self.repository.enqueue_embedding_job(document_id, version)
+        connection = _connect()
+        cursor = connection.cursor()
+        try:
+            cursor.execute(
+                "UPDATE embedding_jobs SET status='completed' WHERE id=%s",
+                (job_id,),
+            )
+            connection.commit()
+        finally:
+            cursor.close()
+            connection.close()
 
     def test_001_clean_migrations_schema_and_rerun(self) -> None:
         connection = _connect()
@@ -451,6 +497,210 @@ class VectorMariaDBIntegrationTests(unittest.TestCase):
             cursor.close()
             connection.close()
         chunk_plan = next(row for row in plan if row["table"] == "c")
+        self.assertEqual(chunk_plan["key"], "idx_vector_chunks_embedding_cosine")
+
+    def test_semantic_source_only_temporal_distinct_retrieval_and_evaluation(self) -> None:
+        query_time = datetime(2026, 9, 1, 12, 0, 0)
+        version = "synthetic:test:1536:chunk-v1"
+
+        old_query_version_id = self.repository.upsert_document(
+            self.source_document(
+                900,
+                title="Old immutable query version",
+                published_at=query_time - timedelta(hours=1),
+                content_version="source-old",
+            )
+        )
+        self.add_chunk(
+            old_query_version_id,
+            vector=fake_vector(1.0),
+            text="Same-source historical version",
+            version=version,
+        )
+        query_id = self.repository.upsert_document(
+            self.source_document(
+                900,
+                title="Current query article",
+                published_at=query_time,
+                content_version="source-current",
+            )
+        )
+        self.add_chunk(
+            query_id,
+            vector=fake_vector(1.0),
+            text="Query event",
+            version=version,
+        )
+        self.mark_embedding_complete(query_id, version=version)
+
+        candidates = []
+        for article_id, title, age_hours, vector in (
+            (901, "Candidate A", 1, fake_vector(0.99, 0.01)),
+            (902, "Candidate B", 2, fake_vector(0.8, 0.2)),
+            (903, "Candidate C", 3, fake_vector(0.0, 1.0)),
+        ):
+            candidate_id = self.repository.upsert_document(
+                self.source_document(
+                    article_id,
+                    title=title,
+                    published_at=query_time - timedelta(hours=age_hours),
+                )
+            )
+            self.add_chunk(
+                candidate_id,
+                vector=vector,
+                text=f"{title} primary chunk",
+                version=version,
+            )
+            candidates.append(candidate_id)
+        self.add_chunk(
+            candidates[0],
+            vector=fake_vector(0.98, 0.02),
+            text="Candidate A second matching chunk",
+            chunk_index=1,
+            version=version,
+        )
+
+        generated_id = self.repository.upsert_document(
+            VectorDocumentDraft(
+                source_type=SourceType.COINCOURIER_GENERATED,
+                source_article_id=901,
+                rich_article_id=1901,
+                source_url="https://source.example.test/901",
+                title="Derivative exact match",
+                published_at=query_time - timedelta(minutes=30),
+                content_hash=digest("generated-semantic"),
+                content_version="generated-semantic-v1",
+            )
+        )
+        self.add_chunk(
+            generated_id,
+            vector=fake_vector(1.0),
+            text="Derivative exact chunk",
+            version=version,
+        )
+
+        for article_id, title, published_at in (
+            (904, "Future exact match", query_time + timedelta(seconds=1)),
+            (905, "Outside lookback exact match", query_time - timedelta(hours=73)),
+            (906, "Null-date exact match", None),
+        ):
+            document_id = self.repository.upsert_document(
+                self.source_document(
+                    article_id,
+                    title=title,
+                    published_at=published_at,
+                )
+            )
+            self.add_chunk(
+                document_id,
+                vector=fake_vector(1.0),
+                text=title,
+                version=version,
+            )
+
+        incompatible_id = self.repository.upsert_document(
+            self.source_document(
+                907,
+                title="Incompatible embedding version",
+                published_at=query_time - timedelta(hours=1),
+            )
+        )
+        self.add_chunk(
+            incompatible_id,
+            vector=fake_vector(1.0),
+            text="Incompatible version chunk",
+            version="synthetic:other:1536:chunk-v1",
+        )
+
+        semantic = SemanticRetrievalService(
+            repository=self.repository,
+            settings=SemanticRetrievalSettings(
+                vector_enabled=True,
+                semantic_enabled=True,
+                embedding_version=version,
+                lookback_hours=72,
+                top_k=3,
+            ),
+        )
+        before_counts = (
+            self.scalar("SELECT COUNT(*) FROM vector_documents"),
+            self.scalar("SELECT COUNT(*) FROM vector_chunks"),
+            self.scalar("SELECT COUNT(*) FROM embedding_jobs"),
+        )
+        result = semantic.retrieve_source_neighbors(900)
+        self.assertEqual(result.status, SemanticRetrievalStatus.RETRIEVED)
+        self.assertEqual(
+            [item.candidate_source_article_id for item in result.candidates],
+            [901, 902, 903],
+        )
+        self.assertEqual(len({item.candidate_source_article_id for item in result.candidates}), 3)
+        self.assertEqual(result.candidates[0].best_candidate_chunk_index, 0)
+        self.assertLess(result.candidates[0].native_distance, result.candidates[1].native_distance)
+        self.assertLess(result.candidates[1].native_distance, result.candidates[2].native_distance)
+
+        fixture = EvaluationFixture(
+            schema_version="semantic-eval-v1",
+            relationships=(
+                LabeledRelationship(900, 901, RelationshipLabel.EXACT_DUPLICATE),
+                LabeledRelationship(900, 902, RelationshipLabel.MATERIAL_UPDATE),
+                LabeledRelationship(900, 903, RelationshipLabel.UNRELATED),
+            ),
+        )
+        metrics = evaluate_retrieval(
+            fixture,
+            semantic,
+            top_k=3,
+            relevance_definition=RelevanceDefinition.STRICT_DUPLICATE,
+        )
+        self.assertEqual(metrics.recall_at_k, 1.0)
+        self.assertEqual(metrics.mean_reciprocal_rank, 1.0)
+        self.assertEqual(
+            before_counts,
+            (
+                self.scalar("SELECT COUNT(*) FROM vector_documents"),
+                self.scalar("SELECT COUNT(*) FROM vector_chunks"),
+                self.scalar("SELECT COUNT(*) FROM embedding_jobs"),
+            ),
+        )
+
+    def test_semantic_filtered_explain_uses_cosine_vector_index(self) -> None:
+        query_time = datetime(2026, 9, 1, 12, 0, 0)
+        document_id = self.repository.upsert_document(
+            self.source_document(950, title="Semantic explain", published_at=query_time)
+        )
+        version = "synthetic:test:1536:chunk-v1"
+        self.add_chunk(
+            document_id,
+            vector=fake_vector(1.0),
+            text="Semantic explain chunk",
+            version=version,
+        )
+        connection = _connect()
+        cursor = connection.cursor(dictionary=True)
+        try:
+            cursor.execute(
+                """
+                EXPLAIN
+                SELECT id,
+                       VEC_DISTANCE_COSINE(
+                           embedding, VEC_FromText(%s)
+                       ) AS distance
+                FROM vector_chunks
+                WHERE embedding_version=%s
+                ORDER BY distance ASC
+                LIMIT 15
+                """,
+                (
+                    serialize_embedding(fake_vector(1.0)),
+                    version,
+                ),
+            )
+            plan = cursor.fetchall()
+        finally:
+            cursor.close()
+            connection.close()
+        chunk_plan = next(row for row in plan if row["table"] == "vector_chunks")
         self.assertEqual(chunk_plan["key"], "idx_vector_chunks_embedding_cosine")
 
 

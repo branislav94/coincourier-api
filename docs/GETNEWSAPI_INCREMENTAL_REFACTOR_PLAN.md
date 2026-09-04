@@ -500,22 +500,41 @@ and representative mocked request/response fixtures before implementation.
 - Risk: embedding cost/backlog, source-retention policy, provider retention terms,
   and dimension/model migration.
 
-### Phase 6C (roadmap Phase 7): Semantic duplicate shadow mode and retrieval
+### Phase 6C1: Semantic retrieval and offline evaluation foundation
 
-- Files created: `vector_store/retrieval.py`, duplicate assessment persistence,
-  evaluation fixtures, and retrieval audit tests.
-- Files modified: duplicate policy for optional semantic evidence and processor
-  context assembly for measured historical retrieval.
-- Compatibility wrappers: vector failure returns no semantic signal and preserves
-  the previous path.
-- Tests: known duplicate/non-duplicate corpus, thresholds, outages, stale vectors,
-  provenance filters, and historical citation/audit records.
-- Rollout switch: `SEMANTIC_DEDUPE_MODE=off|shadow|enforce_high_confidence` and a
-  separate `HISTORICAL_RETRIEVAL_ENABLED=false`.
-- Rollback: set both switches off; retain assessments for analysis.
-- Risk: semantic false positives, context leakage, latency, and model drift.
-- Behavior change: none in shadow; later only evaluated high-confidence enforcement.
-- Commit boundary: retrieval, shadow assessment, evaluation, then optional rollout.
+- Status: implemented locally, offline, source-default disabled, and not deployed.
+  `SEMANTIC_SHADOW_ENABLED=false`; no automatic task or pipeline path reads it.
+- Retrieval: one newest immutable `source_article` document with completed vectors
+  for the exact requested embedding version queries a bounded native cosine ANN
+  pool. Candidates are source articles only, use the same embedding version, and
+  fall in the inclusive 72-hour causal window ending at the query publication time.
+  Null-dated queries are not ready; null-dated candidates are ineligible.
+- Identity/provenance: the query document and every immutable version sharing its
+  durable source article ID are excluded. CoinCourier-generated vectors remain
+  stored for future RAG/internal linking but cannot supply duplicate/event evidence.
+- Bounds and ranking: at most eight deterministic query chunks, 5x chunk
+  oversampling capped at 100 rows per query chunk, article top-K default 10 and
+  ceiling 20. Distinct source articles rank by minimum native cosine distance;
+  no derived similarity, learned reranker, threshold, or classification exists.
+- Evaluation: synthetic JSON labels retain exact duplicate, same-event duplicate,
+  material update, related event, broad-topic overlap, and unrelated distinctions.
+  Reports include Recall@K, first-relevant MRR/rank, label-distance distributions,
+  labeled top-K coverage, missing pairs, and unavailable queries. Unavailable
+  queries are reported but excluded from quality denominators; a valid empty
+  retrieval remains an evaluated miss.
+- Storage/tests: no migration or durable semantic assessment table. Unit tests and
+  disposable MariaDB 11.8 tests verify geometry, filtering, distinct aggregation,
+  bounded work, evaluation semantics, and cosine VECTOR-index selection.
+- Behavior change: none in fetch, selection, processing, deterministic duplicate
+  analysis, publishing, or scheduling.
+
+### Phase 6C2: Semantic duplicate shadow integration
+
+- Planned only: automatic fail-open invocation, durable retrieval/assessment audit,
+  deterministic feature comparison, real labeled calibration, and an explicitly
+  reviewed shadow policy.
+- No production threshold, semantic duplicate classification, suppression, or
+  publication-eligibility effect is part of Phase 6C1.
 
 ### Phase 8: Optional gpt_processor extraction
 

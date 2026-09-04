@@ -131,6 +131,33 @@ class VectorRepository:
             cursor.close()
             connection.close()
 
+    def get_latest_source_document(
+        self,
+        source_article_id: int,
+    ) -> VectorDocumentRecord | None:
+        if source_article_id <= 0:
+            raise ValueError("source_article_id must be positive")
+        connection = self._connect()
+        cursor = connection.cursor(dictionary=True)
+        try:
+            cursor.execute(
+                """
+                SELECT id, document_key, source_type, source_article_id,
+                       rich_article_id, source_url, title, published_at,
+                       content_hash, content_version
+                FROM vector_documents
+                WHERE source_type=%s AND source_article_id=%s
+                ORDER BY id DESC
+                LIMIT 1
+                """,
+                (SourceType.SOURCE_ARTICLE.value, source_article_id),
+            )
+            row = cursor.fetchone()
+            return self._document_record(row) if row else None
+        finally:
+            cursor.close()
+            connection.close()
+
     def upsert_chunk(
         self,
         *,
@@ -241,12 +268,32 @@ class VectorRepository:
         embedding_version: str,
         source_type: SourceType | None = None,
         published_after: datetime | None = None,
+        published_before: datetime | None = None,
+        exclude_document_id: int | None = None,
+        exclude_source_article_id: int | None = None,
     ) -> list[VectorMatch]:
         if top_k <= 0:
             return []
         if not embedding_version.strip():
             raise ValueError("embedding_version is required")
         vector_text = serialize_embedding(query_embedding)
+        result_limit = min(top_k, 100)
+        if (
+            published_before is not None
+            or exclude_document_id is not None
+            or exclude_source_article_id is not None
+        ):
+            return self._nearest_chunks_with_causal_filters(
+                vector_text,
+                result_limit=result_limit,
+                embedding_version=embedding_version,
+                source_type=source_type,
+                published_after=published_after,
+                published_before=published_before,
+                exclude_document_id=exclude_document_id,
+                exclude_source_article_id=exclude_source_article_id,
+            )
+
         clauses = ["c.embedding_version=%s"]
         params: list[Any] = [vector_text, embedding_version]
         if source_type is not None:
@@ -255,7 +302,16 @@ class VectorRepository:
         if published_after is not None:
             clauses.append("d.published_at >= %s")
             params.append(published_after)
-        params.append(min(top_k, 100))
+        if published_before is not None:
+            clauses.append("d.published_at <= %s")
+            params.append(published_before)
+        if exclude_document_id is not None:
+            clauses.append("d.id <> %s")
+            params.append(exclude_document_id)
+        if exclude_source_article_id is not None:
+            clauses.append("d.source_article_id <> %s")
+            params.append(exclude_source_article_id)
+        params.append(result_limit)
 
         connection = self._connect()
         cursor = connection.cursor(dictionary=True)
@@ -272,12 +328,95 @@ class VectorRepository:
                 FROM vector_chunks c
                 JOIN vector_documents d ON d.id = c.document_id
                 WHERE {' AND '.join(clauses)}
-                ORDER BY distance ASC, c.id ASC
+                ORDER BY distance ASC
                 LIMIT %s
                 """,
                 tuple(params),
             )
-            return [self._match(row) for row in cursor.fetchall()]
+            return sorted(
+                (self._match(row) for row in cursor.fetchall()),
+                key=lambda match: (match.distance, match.chunk_id),
+            )
+        finally:
+            cursor.close()
+            connection.close()
+
+    def _nearest_chunks_with_causal_filters(
+        self,
+        vector_text: str,
+        *,
+        result_limit: int,
+        embedding_version: str,
+        source_type: SourceType | None,
+        published_after: datetime | None,
+        published_before: datetime | None,
+        exclude_document_id: int | None,
+        exclude_source_article_id: int | None,
+    ) -> list[VectorMatch]:
+        connection = self._connect()
+        cursor = connection.cursor(dictionary=True)
+        try:
+            cursor.execute(
+                """
+                SELECT id,
+                       VEC_DISTANCE_COSINE(
+                           embedding, VEC_FromText(%s)
+                       ) AS distance
+                FROM vector_chunks
+                WHERE embedding_version=%s
+                ORDER BY distance ASC
+                LIMIT %s
+                """,
+                (vector_text, embedding_version, result_limit),
+            )
+            nearest_rows = list(cursor.fetchall())
+            if not nearest_rows:
+                return []
+
+            chunk_ids = [int(row["id"]) for row in nearest_rows]
+            distances = {int(row["id"]): float(row["distance"]) for row in nearest_rows}
+            chunk_placeholders = ",".join("%s" for _chunk_id in chunk_ids)
+            clauses = [
+                f"c.id IN ({chunk_placeholders})",
+                "c.embedding_version=%s",
+            ]
+            params: list[Any] = [*chunk_ids, embedding_version]
+            if source_type is not None:
+                clauses.append("d.source_type=%s")
+                params.append(source_type.value)
+            if published_after is not None:
+                clauses.append("d.published_at >= %s")
+                params.append(published_after)
+            if published_before is not None:
+                clauses.append("d.published_at <= %s")
+                params.append(published_before)
+            if exclude_document_id is not None:
+                clauses.append("d.id <> %s")
+                params.append(exclude_document_id)
+            if exclude_source_article_id is not None:
+                clauses.append("d.source_article_id <> %s")
+                params.append(exclude_source_article_id)
+
+            cursor.execute(
+                f"""
+                SELECT d.id AS document_id, d.document_key, d.source_type,
+                       d.source_article_id, d.rich_article_id, d.source_url,
+                       d.title, d.published_at,
+                       c.id AS chunk_id, c.chunk_index, c.chunk_text, c.chunk_hash,
+                       c.embedding_model, c.embedding_version
+                FROM vector_chunks c
+                JOIN vector_documents d ON d.id = c.document_id
+                WHERE {' AND '.join(clauses)}
+                """,
+                tuple(params),
+            )
+            rows = list(cursor.fetchall())
+            for row in rows:
+                row["distance"] = distances[int(row["chunk_id"])]
+            return sorted(
+                (self._match(row) for row in rows),
+                key=lambda match: (match.distance, match.chunk_id),
+            )[:result_limit]
         finally:
             cursor.close()
             connection.close()
@@ -465,6 +604,42 @@ class VectorRepository:
                 FROM embedding_jobs WHERE id=%s
                 """,
                 (job_id,),
+            )
+            row = cursor.fetchone()
+            if not row:
+                return None
+            return EmbeddingJobRecord(
+                id=int(row["id"]),
+                document_id=int(row["document_id"]),
+                embedding_version=row["embedding_version"],
+                status=row["status"],
+                attempt_count=int(row["attempt_count"]),
+                claim_token=row["claim_token"],
+                claimed_at=row["claimed_at"],
+                last_error=row["last_error"],
+            )
+        finally:
+            cursor.close()
+            connection.close()
+
+    def get_document_embedding_job(
+        self,
+        document_id: int,
+        embedding_version: str,
+    ) -> EmbeddingJobRecord | None:
+        if document_id <= 0 or not embedding_version.strip():
+            raise ValueError("document_id and embedding_version are required")
+        connection = self._connect()
+        cursor = connection.cursor(dictionary=True)
+        try:
+            cursor.execute(
+                """
+                SELECT id, document_id, embedding_version, status,
+                       attempt_count, claim_token, claimed_at, last_error
+                FROM embedding_jobs
+                WHERE document_id=%s AND embedding_version=%s
+                """,
+                (document_id, embedding_version),
             )
             row = cursor.fetchone()
             if not row:

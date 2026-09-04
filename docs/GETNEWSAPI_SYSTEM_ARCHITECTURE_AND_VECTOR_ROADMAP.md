@@ -4,8 +4,8 @@ Audit date: 2026-07-26
 
 Branch audited: `pipeline-throughput-hybrid-images`
 
-Pushed code baseline: `6b232377 Add durable processing and publishing state`,
-plus the uncommitted deterministic Phase 5 shadow implementation described here.
+Pushed code baseline: `ea3ba334 Add embedding ingestion and worker operations`,
+plus the uncommitted Phase 6C1 retrieval/evaluation foundation described here.
 
 Operational evidence: `getnewsapi-20260726_085522.log.txt` (2026-07-25T19:19:02Z through an incomplete run beginning 2026-07-26T00:47:30Z)
 
@@ -32,7 +32,9 @@ Phase 6B2 controlled ingestion/worker/backfill operations are **IMPLEMENTED
 LOCALLY BUT DISABLED**. They use a separate MariaDB boundary and explicit lazy
 task commands; none is wired into fetch, process, publish, image, scheduler, or
 duplicate behavior. Production scheduling, provider rollout, and all semantic
-duplicate behavior remain planned.
+duplicate behavior remain planned. Phase 6C1 bounded source-only semantic
+retrieval and synthetic labeled evaluation are **IMPLEMENTED LOCALLY BUT
+DISABLED**; they have no automatic caller and make no duplicate decision.
 
 ## 1. Purpose and scope
 
@@ -822,24 +824,41 @@ enqueued/existing jobs, claimed/completed/reconciled/retryable/failed/lost jobs,
 provider calls, embedded chunks, and token usage when supplied. No article text
 or vector is logged. External cron may eventually run `embedding_ingest` then
 `embedding_worker` every few minutes; no scheduler or deployment change exists.
-Phase 6C remains semantic retrieval and duplicate-shadow evaluation. It must not
-be inferred from Phase 6B storage or job completion.
+Phase 6C1 now provides isolated semantic retrieval and offline evaluation.
+Automatic duplicate-shadow evaluation remains Phase 6C2 and must not be inferred
+from Phase 6B storage, embedding completion, or a retrieved neighbor.
 
 ## 26. Retrieval use cases
 
-**PLANNED**
+**PHASE 6C1 SOURCE-ARTICLE RETRIEVAL IMPLEMENTED LOCALLY; OTHER USES PLANNED**
 
-1. **Semantic duplicate detection:** query recent raw summary vectors; rerank with event, lexical, entity, number/date, source, and time signals.
+Phase 6C1 retrieves distinct historical source articles for one already embedded
+source article. The newest immutable vector document must have a completed job
+and nonempty chunks for the exact requested embedding version. Query publication
+time is required. Candidates must be non-null dated source articles in the
+inclusive `[query time - 72 hours, query time]` window; the same document and all
+versions sharing the query source ID are excluded. Generated CoinCourier vectors
+cannot corroborate duplicate/event evidence.
+
+At most eight query chunks are sampled deterministically across the document.
+Each performs a native cosine ANN query with 5x article oversampling, capped at
+100 chunk rows. Article top-K defaults to 10 and cannot exceed 20. Results group
+by durable source article ID and rank by the best/minimum native chunk distance,
+with chunk indexes, document/source IDs, publication delta, version, and source
+type retained as evidence. No full vectors or complete chunk text are returned.
+
+1. **Semantic duplicate retrieval:** Phase 6C1 implements source-only candidates and distance evidence; event-feature reranking and decisions remain planned.
 2. **Historical factual context:** retrieve raw-source chunks separately and label their source/time. Generated CoinCourier text can provide continuity but not corroboration.
 3. **Internal-link suggestions:** retrieve published CoinCourier chunks, require live WP IDs/URLs and topical relevance, and avoid self-links.
 4. **Repetitive-angle avoidance:** compare proposed rich summary/outline to recent published derivatives in the same event/topic, then prompt for genuinely new facts or framing.
 5. **Update classification:** compare fact signatures and source chunks to determine whether a new article contains material changes.
 
-Retrieval output must carry document type, source, source timestamp, WP ID, similarity, and reason. A vector result alone must never be presented as factual confirmation.
+Future retrieval output must retain provenance appropriate to its purpose. A
+vector result alone must never be presented as factual confirmation.
 
 ## 27. Shadow-mode rollout
 
-**PLANNED**
+**PHASE 6C1 OFFLINE/DISABLED; PHASE 6C2 SHADOW INTEGRATION PLANNED**
 
 Current and future switches:
 
@@ -856,13 +875,16 @@ EMBEDDING_WORK_LIMIT=5
 EMBEDDING_CLAIM_TIMEOUT_MINUTES=30
 EMBEDDING_BACKFILL_PAGE_SIZE=100
 EMBEDDING_MAX_CHUNKS_PER_JOB=100
+SEMANTIC_SHADOW_ENABLED=false
+SEMANTIC_LOOKBACK_HOURS=72
+SEMANTIC_TOP_K=10
 VECTOR_DUPLICATE_MODE=off
 ```
 
 The vector and embedding settings exist with disabled source defaults. The
-semantic mode remains proposed and must not be inferred from storage or job
-machinery. Explicit embedding task commands read the enable flags; no automatic
-fetch/process/publish/scheduler path does.
+Phase 6C1 semantic flag is also false and is read only by direct package use.
+Explicit embedding task commands read the embedding flags; no automatic fetch,
+process, publish, duplicate, or scheduler path invokes semantic retrieval.
 
 The proposed future `VECTOR_DUPLICATE_MODE` contract is `off|shadow|enforce`:
 
@@ -874,11 +896,17 @@ Rollout order is exact constraints/idempotency first, event and lexical shadow n
 
 ## 28. Metrics and evaluation
 
-**PHASE 6B2 RUN COUNTS IMPLEMENTED LOCALLY; SEMANTIC EVALUATION PLANNED**
+**PHASE 6B2 RUN COUNTS AND PHASE 6C1 OFFLINE EVALUATION IMPLEMENTED LOCALLY**
 
 The explicit ingestion, worker, and backfill tasks emit bounded count-only run
-summaries. Corpus labeling, retrieval-quality metrics, dashboards, and production
-alerts remain planned.
+summaries. Phase 6C1 loads a versioned synthetic JSON relationship fixture and
+reports candidate rank, Recall@K, first-relevant MRR, per-label native-distance
+distributions, top-K labeled coverage, missing pairs, and unavailable queries.
+Strict duplicate relevance means exact plus same-event duplicate; broader
+same-event relevance additionally includes material updates. Unavailable queries
+are reported and excluded from Recall/MRR and coverage denominators, while a
+valid no-candidates result remains an evaluated retrieval miss. Real labels,
+dashboards, production alerts, and threshold calibration remain planned.
 
 Build a labeled set containing exact duplicates, same-event duplicates, legitimate updates, and broad topical overlap. Include the suspicious log groups but label them only after source/DB inspection. Evaluate at pair and publication-decision level.
 
@@ -906,6 +934,9 @@ Initial similarity hypotheses, to be calibrated on real labels:
 | Repetitive angle | cosine >= 0.86 on rich summaries/outlines | same topic/event window; prompt/review before any blocking |
 
 These values are hypotheses, not universal truths. Model version, text type, language, chunk type, and corpus distribution change score meaning. Event ID, lexical overlap, entities, numbers, dates, and new-information scoring must remain separate features.
+
+Phase 6C1 installs none of these hypotheses as configuration or policy. It exposes
+native MariaDB cosine distance only and contains no suppression threshold.
 
 ## 29. Security and secret handling
 
@@ -994,7 +1025,20 @@ Each phase is intentionally deployable and reversible on its own.
 - Rollback: leave the separate service absent/disabled; the application DB and
   deterministic pipeline remain independent.
 
-### Phase 5: semantic duplicate shadow mode
+### Implementation Phase 6C1: semantic retrieval and evaluation
+
+- Status: bounded source-only retrieval and synthetic labeled evaluation are
+  implemented locally, offline, disabled, and verified on MariaDB 11.8.
+- Migration: none. Phase 6C1 reads existing vector documents/chunks/jobs only.
+- Tests: exact-version readiness, causal 72-hour filtering, source/generated
+  provenance, source-identity exclusion, distinct article aggregation, native
+  cosine ordering/index plan, bounded work, Recall@K/MRR, and availability rules.
+- Switch: `SEMANTIC_SHADOW_ENABLED=false`; there is no automatic task or pipeline
+  hook, threshold, decision, or durable semantic assessment.
+- Rollback: leave the switch false or remove the isolated package; existing
+  deterministic and publication behavior is independent.
+
+### Phase 6C2: semantic duplicate shadow mode
 
 - Files: semantic retrieval/reranking service; selection/processor preflight hooks; audit repository; tests.
 - Migration: `duplicate_assessments`; possibly retrieval-audit table.

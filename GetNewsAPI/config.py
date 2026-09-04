@@ -233,6 +233,14 @@ EMBEDDING_MAX_CHUNKS_PER_JOB = int(
     os.getenv("EMBEDDING_MAX_CHUNKS_PER_JOB", "100")
 )
 
+# Phase 6C1 retrieval is offline/directly invoked only. It has no threshold,
+# decision, scheduler, or pipeline integration.
+SEMANTIC_SHADOW_ENABLED = _env_bool("SEMANTIC_SHADOW_ENABLED", False)
+SEMANTIC_LOOKBACK_HOURS = int(
+    os.getenv("SEMANTIC_LOOKBACK_HOURS", str(DUPLICATE_LOOKBACK_HOURS))
+)
+SEMANTIC_TOP_K = int(os.getenv("SEMANTIC_TOP_K", "10"))
+
 # WordPress REST API credentials
 WP_API_URL = os.getenv("WP_API_URL")
 WP_USERNAME = os.getenv("WP_USERNAME")
