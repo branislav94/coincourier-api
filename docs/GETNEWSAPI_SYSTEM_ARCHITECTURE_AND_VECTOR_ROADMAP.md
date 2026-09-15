@@ -32,9 +32,9 @@ Phase 6B2 controlled ingestion/worker/backfill operations are **IMPLEMENTED
 LOCALLY BUT DISABLED**. They use a separate MariaDB boundary and explicit lazy
 task commands; none is wired into fetch, process, publish, image, scheduler, or
   duplicate behavior. Production scheduling and provider rollout remain planned.
-  Phase 6C1 bounded retrieval/evaluation and Phase 6C2A fail-open semantic evidence
-  collection are **IMPLEMENTED LOCALLY BUT DISABLED**. When explicitly enabled,
-  processing stores neighbors for audit but makes no duplicate decision.
+  Phase 6C1 bounded retrieval/evaluation, Phase 6C2A fail-open semantic evidence,
+  and Phase 6C2B offline calibration are **IMPLEMENTED LOCALLY**. Runtime semantic
+  collection remains disabled; calibration reads evidence but makes no decision.
 
 ## 1. Purpose and scope
 
@@ -906,7 +906,7 @@ Rollout order is exact constraints/idempotency first, event and lexical shadow n
 
 ## 28. Metrics and evaluation
 
-**PHASE 6B2 COUNTS, 6C1 EVALUATION, AND 6C2A AUDIT METRICS IMPLEMENTED LOCALLY**
+**PHASE 6B2 COUNTS AND PHASE 6C1-6C2B EVIDENCE ANALYSIS IMPLEMENTED LOCALLY**
 
 The explicit ingestion, worker, and backfill tasks emit bounded count-only run
 summaries. Phase 6C1 loads a versioned synthetic JSON relationship fixture and
@@ -915,12 +915,20 @@ distributions, top-K labeled coverage, missing pairs, and unavailable queries.
 Strict duplicate relevance means exact plus same-event duplicate; broader
 same-event relevance additionally includes material updates. Unavailable queries
 are reported and excluded from Recall/MRR and coverage denominators, while a
-valid no-candidates result remains an evaluated retrieval miss. Real labels,
-dashboards, production alerts, and threshold calibration remain planned.
+valid no-candidates result remains an evaluated retrieval miss.
 
 Phase 6C2A logs bounded attempted/disabled/not-ready/no-candidate/retrieved/error
 outcomes, candidate count, best native distance, persistence state, and error type.
 It logs no vector, article/chunk body, credential, or claim token.
+
+Phase 6C2B adds a read-only `semantic_calibration` package. Versioned reviewed
+labels join directed Phase 5 pairs to ordered Phase 6 candidate evidence by source
+article IDs. Reports preserve deterministic policy, embedding, semantic, and label
+schema versions; expose missing evidence; and calculate multiclass confusion counts,
+distance/rank distributions, strict and broader Recall@1/3/5/10 and MRR, advisory
+cutoff research, and material-update overlap. No real labels are fabricated.
+Percentiles and policy confidence are withheld below the documented sample minimum.
+All cutoff rows are `research_candidate_only`; none is runtime configuration.
 
 Build a labeled set containing exact duplicates, same-event duplicates, legitimate updates, and broad topical overlap. Include the suspicious log groups but label them only after source/DB inspection. Evaluate at pair and publication-decision level.
 
@@ -1070,9 +1078,25 @@ Each phase is intentionally deployable and reversible on its own.
 
 ### Phase 6C2B: semantic calibration and shadow-policy comparison
 
-- Planned only: real labels, deterministic/semantic feature comparison, threshold
-  research, human review, and an explicitly versioned shadow policy.
-- No enforcement or publication decision is authorized by Phase 6C2A evidence.
+- Status: offline calibration/evidence-analysis foundation implemented locally.
+- Inputs: synthetic mechanics fixtures or manually reviewed JSON/JSONL/CSV labels;
+  selected Phase 5 policy, embedding, and semantic versions are never averaged
+  across incompatible generations.
+- Reads: existing application `duplicate_assessments` and vector
+  `semantic_shadow_assessments` only. No migration, task command, provider work,
+  database write, or pipeline import was added.
+- Output: deterministic JSON with label/availability counts, deterministic confusion
+  cells, distance/rank distributions, strict and broader Recall@K/MRR, research-only
+  cutoff metrics, material-update overlap, and small-sample warnings.
+- Behavior: no threshold, semantic classification, suppression, selection,
+  scheduling, processing, or publication-state effect.
+
+### Phase 6C2C: reviewed semantic policy proposal
+
+- Planned only after sufficient real reviewed labels exist. Compare version-isolated
+  evidence, inspect material-update overlap and false positives, and decide whether
+  a versioned shadow-only candidate policy merits separate implementation review.
+- No runtime threshold or enforcement is inherited from Phase 6C2B output.
 
 ### Phase 6: enforce high-confidence duplicate blocking
 

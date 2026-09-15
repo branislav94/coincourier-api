@@ -552,10 +552,26 @@ and representative mocked request/response fixtures before implementation.
 
 ### Phase 6C2B: Semantic calibration and policy comparison
 
-- Planned only: real labeled calibration, deterministic-versus-semantic comparison,
-  reviewed policy/version changes, and measured shadow analysis.
-- No production threshold, semantic duplicate classification, suppression, or
-  publication-eligibility effect is part of Phase 6C2A.
+- Status: calibration/evidence-analysis foundation implemented locally and offline;
+  no production labels are bundled or assumed.
+- Inputs: versioned reviewed JSON, JSONL, or CSV labels preserve exact duplicate,
+  same-event duplicate, material update, related event, broad topic, and unrelated
+  distinctions. Readers join the selected Phase 5 policy version and Phase 6
+  embedding/semantic versions by directed source-article pair without writes.
+- Analysis: deterministic multiclass confusion counts, explicit missing evidence,
+  per-label distance/rank distributions, strict and broader Recall@1/3/5/10 and
+  MRR, advisory cutoff precision/recall/F1, and material-update overlap are emitted
+  in deterministic JSON. Small samples are marked insufficient for policy.
+- Boundary: no migration, task/scheduler command, runtime config, provider call,
+  threshold, classification, suppression, or article/publication-state effect.
+  Candidate cutoffs are tagged `research_candidate_only`.
+
+### Phase 6C2C: Reviewed semantic policy proposal
+
+- Planned only after sufficient real human-reviewed labels are available: review
+  version-isolated calibration, material-update false-positive risk, and candidate
+  shadow-policy evidence. Any threshold or policy wiring requires separate review;
+  Phase 6C2B does not authorize enforcement.
 
 ### Phase 8: Optional gpt_processor extraction
 
