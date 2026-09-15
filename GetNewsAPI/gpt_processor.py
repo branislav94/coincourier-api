@@ -29,18 +29,12 @@ from repositories.state import claim_prefix, safe_error_message
 import time, random
 import requests
 from typing import Any, Dict
-import logging, pathlib
+import logging
 import re, hashlib
 from html import escape
-logging.basicConfig(
-    level=logging.INFO,
-    format="%(asctime)s  %(levelname)s  %(message)s",
-    handlers=[
-        logging.StreamHandler(),
-        logging.FileHandler(pathlib.Path(__file__).with_suffix('.log'),  # GetNewsAPI/gpt_processor.log
-                       encoding="utf-8")
-    ],
-)
+from runtime.logging_config import configure_logging
+
+configure_logging()
 
 _session = requests.Session()
 _session.headers.update({

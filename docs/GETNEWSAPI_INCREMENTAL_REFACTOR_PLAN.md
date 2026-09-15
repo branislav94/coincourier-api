@@ -573,6 +573,26 @@ and representative mocked request/response fixtures before implementation.
   shadow-policy evidence. Any threshold or policy wiring requires separate review;
   Phase 6C2B does not authorize enforcement.
 
+### Deployment Phase 7A/7B: Audit and production packaging
+
+- Phase 7A status: read-only deployment readiness audit completed; no environment
+  or live service was accessed.
+- Phase 7B status: production packaging and runtime hardening implemented locally,
+  not deployed, and awaiting review.
+- Packaging: `.dockerignore`, a non-root immutable application image, and
+  `docker-compose.prod.yml` with edge/backend networks, no host ports or source
+  bind mount, persistent application state, and private MariaDB 11.8 vector data.
+- Runtime: offline `config_check`, strict production startup validation, static
+  `/health`, conditional database-only `/ready`, Bearer-protected publication,
+  production-disabled API docs, stderr/stdout logging, configurable file logging,
+  writable-state paths, explicit DB TLS controls, and pinned runtime dependencies.
+- Safety: all existing rollout flags remain false and image search remains V1.
+  Startup runs no migration, task, provider request, embedding, or backfill.
+- Contract: `docs/GETNEWSAPI_PRODUCTION_ENVIRONMENT.md` describes required secrets,
+  reverse-proxy attachment, state ownership, TLS, and the remaining Phase 7C gate.
+- Phase 7C remains planned: migration plan/check/apply/verify, backup gates, and
+  external one-shot scheduler/job orchestration are intentionally absent.
+
 ### Phase 8: Optional gpt_processor extraction
 
 - Files created: only proven cohesive modules such as validation, prompt building,

@@ -1,0 +1,48 @@
+.git
+.gitignore
+.gitattributes
+
+# Secrets and local environment files. Keep examples available as documentation.
+.env
+.env.*
+GetNewsAPI/.env
+**/.env
+**/.env.*
+!.env.example
+!**/.env.example
+
+# Protected/local artifacts.
+*.log
+GetNewsAPI/gpt_processor.log
+image-search-v2.diff
+image-search-v2-reviewed.diff
+
+# Python environments, bytecode, and test output.
+**/__pycache__/
+**/*.py[cod]
+**/.pytest_cache/
+**/.mypy_cache/
+**/.ruff_cache/
+**/.coverage
+**/htmlcov/
+**/.venv/
+**/venv/
+GetNewsAPI/tests/
+
+# IDE and operating-system metadata.
+.idea/
+.vscode/
+**/.DS_Store
+**/Thumbs.db
+
+# Local writable state and generated output.
+GetNewsAPI/cache/
+**/*.db
+**/*.db-journal
+**/*.sqlite
+**/*.sqlite3
+**/*.pid
+**/*.tmp
+**/*.temp
+**/dist/
+**/build/

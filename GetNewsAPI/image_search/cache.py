@@ -3,7 +3,6 @@ from __future__ import annotations
 import hashlib
 import json
 import logging
-import os
 import time
 from pathlib import Path
 from typing import Any
@@ -13,6 +12,7 @@ import requests
 from config import (
     IMAGE_PROVIDER_MAX_RETRIES,
     IMAGE_PROVIDER_TIMEOUT_SECONDS,
+    STOCK_IMAGE_CACHE_DIR,
     STOCK_IMAGE_CACHE_HOURS,
 )
 
@@ -36,9 +36,7 @@ class CachedHttpClient:
         sleeper=time.sleep,
     ) -> None:
         self.session = session or requests.Session()
-        self.cache_root = Path(
-            cache_root or os.getenv("STOCK_IMAGE_CACHE_DIR", "/app/cache/stock_images")
-        ) / "v2"
+        self.cache_root = Path(cache_root or STOCK_IMAGE_CACHE_DIR) / "v2"
         self.cache_hours = cache_hours
         self.timeout = timeout
         self.max_retries = max(0, max_retries)

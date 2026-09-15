@@ -24,6 +24,10 @@ import app as api_app
 import tasks
 
 
+PUBLISH_TOKEN = "test-publish-token-with-sufficient-entropy"
+PUBLISH_HEADERS = {"Authorization": f"Bearer {PUBLISH_TOKEN}"}
+
+
 def connection_with_rows(rows):
     cursor = Mock()
     cursor.fetchall.return_value = rows
@@ -50,6 +54,9 @@ class ApiRouteTests(unittest.TestCase):
         self.scheduler_flag = patch.object(api_app, "ENABLE_APSCHEDULER", False)
         self.scheduler_flag.start()
         self.addCleanup(self.scheduler_flag.stop)
+        self.publish_token = patch.object(api_app, "PUBLISH_API_TOKEN", PUBLISH_TOKEN)
+        self.publish_token.start()
+        self.addCleanup(self.publish_token.stop)
         api_app.app.state.scheduler_references = None
         self.addCleanup(setattr, api_app.app.state, "scheduler_references", None)
 
@@ -126,7 +133,7 @@ class ApiRouteTests(unittest.TestCase):
     def test_publish_calls_wordpress_publisher_once(self):
         with patch.object(api_app, "publish_news_to_wp") as publish:
             with self.client() as client:
-                response = client.post("/api/publish")
+                response = client.post("/api/publish", headers=PUBLISH_HEADERS)
 
         self.assertEqual(response.status_code, 200)
         publish.assert_called_once_with()
@@ -134,7 +141,7 @@ class ApiRouteTests(unittest.TestCase):
     def test_publish_success_preserves_response_shape(self):
         with patch.object(api_app, "publish_news_to_wp"):
             with self.client() as client:
-                response = client.post("/api/publish")
+                response = client.post("/api/publish", headers=PUBLISH_HEADERS)
 
         self.assertEqual(response.status_code, 200)
         self.assertEqual(
@@ -152,7 +159,7 @@ class ApiRouteTests(unittest.TestCase):
             patch.object(api_app.logger, "error"),
             self.client() as client,
         ):
-            response = client.post("/api/publish")
+            response = client.post("/api/publish", headers=PUBLISH_HEADERS)
 
         self.assertEqual(response.status_code, 500)
         self.assertEqual(response.headers["content-type"], "text/html; charset=utf-8")
@@ -226,11 +233,195 @@ class ApiRouteTests(unittest.TestCase):
         ):
             self.assertEqual(client.get("/health").status_code, 200)
             self.assertEqual(client.get("/api/news").status_code, 200)
-            self.assertEqual(client.post("/api/publish").status_code, 200)
+            self.assertEqual(
+                client.post("/api/publish", headers=PUBLISH_HEADERS).status_code,
+                200,
+            )
 
         connect.assert_called_once_with()
         publish.assert_called_once_with()
         start.assert_not_called()
+
+    def test_publish_rejects_missing_bearer_authentication(self):
+        with patch.object(api_app, "publish_news_to_wp") as publish:
+            with self.client() as client:
+                response = client.post("/api/publish")
+
+        self.assertEqual(response.status_code, 401)
+        self.assertEqual(response.headers["www-authenticate"], "Bearer")
+        publish.assert_not_called()
+
+    def test_publish_is_unavailable_when_authentication_is_not_configured(self):
+        with (
+            patch.object(api_app, "PUBLISH_API_TOKEN", None),
+            patch.object(api_app, "publish_news_to_wp") as publish,
+            self.client() as client,
+        ):
+            response = client.post("/api/publish", headers=PUBLISH_HEADERS)
+
+        self.assertEqual(response.status_code, 503)
+        self.assertNotIn(PUBLISH_TOKEN, response.text)
+        publish.assert_not_called()
+
+    def test_publish_rejects_incorrect_bearer_authentication(self):
+        with patch.object(api_app, "publish_news_to_wp") as publish:
+            with self.client() as client:
+                response = client.post(
+                    "/api/publish",
+                    headers={"Authorization": "Bearer incorrect-token"},
+                )
+
+        self.assertEqual(response.status_code, 401)
+        self.assertNotIn("incorrect-token", response.text)
+        publish.assert_not_called()
+
+    def test_publish_accepts_correct_bearer_authentication(self):
+        with patch.object(api_app, "publish_news_to_wp") as publish:
+            with self.client() as client:
+                response = client.post("/api/publish", headers=PUBLISH_HEADERS)
+
+        self.assertEqual(response.status_code, 200)
+        publish.assert_called_once_with()
+
+    def test_publish_token_is_never_logged(self):
+        with (
+            patch.object(api_app, "publish_news_to_wp") as publish,
+            patch.object(api_app.logger, "log") as log,
+            patch.object(api_app.logger, "error") as error,
+            self.client() as client,
+        ):
+            response = client.post(
+                "/api/publish",
+                headers={"Authorization": "Bearer secret-token-that-must-not-log"},
+            )
+
+        self.assertEqual(response.status_code, 401)
+        publish.assert_not_called()
+        log.assert_not_called()
+        error.assert_not_called()
+
+    def test_ready_succeeds_when_application_database_is_reachable(self):
+        connection, cursor = connection_with_rows([])
+        with (
+            patch.object(api_app, "validate_runtime_config", return_value=()),
+            patch.object(
+                api_app,
+                "get_readiness_db_connection",
+                return_value=connection,
+            ),
+            patch.object(api_app, "VECTOR_ENABLED", False),
+            patch.object(api_app, "get_vector_readiness_db_connection") as vector,
+            self.client() as client,
+        ):
+            response = client.get("/ready")
+
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(response.json()["status"], "ready")
+        self.assertEqual(
+            response.json()["checks"]["vector_database"]["status"],
+            "skipped",
+        )
+        cursor.execute.assert_called_once_with("SELECT 1")
+        vector.assert_not_called()
+
+    def test_ready_fails_when_application_database_is_unreachable(self):
+        with (
+            patch.object(api_app, "validate_runtime_config", return_value=()),
+            patch.object(
+                api_app,
+                "get_readiness_db_connection",
+                side_effect=RuntimeError("database unavailable"),
+            ),
+            self.client() as client,
+        ):
+            response = client.get("/ready")
+
+        self.assertEqual(response.status_code, 503)
+        self.assertEqual(response.json()["status"], "not_ready")
+        self.assertEqual(
+            response.json()["checks"]["application_database"]["status"],
+            "unavailable",
+        )
+        self.assertNotIn("database unavailable", response.text)
+
+    def test_ready_rejects_invalid_configuration_before_connecting(self):
+        issue = api_app.validate_runtime_config(
+            {
+                "DB_USER": "user",
+                "DB_PASSWORD": "password",
+                "DB_NAME": "database",
+                "PUBLISH_API_TOKEN": "token",
+            }
+        )[0]
+        with (
+            patch.object(api_app, "validate_runtime_config", return_value=(issue,)),
+            patch.object(api_app, "get_readiness_db_connection") as connect,
+            self.client() as client,
+        ):
+            response = client.get("/ready")
+
+        self.assertEqual(response.status_code, 503)
+        self.assertEqual(
+            response.json()["checks"]["configuration"]["status"],
+            "failed",
+        )
+        connect.assert_not_called()
+
+    def test_ready_checks_vector_database_only_when_enabled(self):
+        application_connection, _ = connection_with_rows([])
+        vector_connection, vector_cursor = connection_with_rows([])
+        with (
+            patch.object(api_app, "validate_runtime_config", return_value=()),
+            patch.object(
+                api_app,
+                "get_readiness_db_connection",
+                return_value=application_connection,
+            ),
+            patch.object(
+                api_app,
+                "get_vector_readiness_db_connection",
+                return_value=vector_connection,
+            ) as vector,
+            patch.object(api_app, "VECTOR_ENABLED", True),
+            self.client() as client,
+        ):
+            response = client.get("/ready")
+
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(
+            response.json()["checks"]["vector_database"]["status"],
+            "ok",
+        )
+        vector.assert_called_once_with()
+        vector_cursor.execute.assert_called_once_with("SELECT 1")
+
+    def test_ready_does_not_call_provider_or_wordpress_boundaries(self):
+        connection, _ = connection_with_rows([])
+        with (
+            patch.object(api_app, "validate_runtime_config", return_value=()),
+            patch.object(
+                api_app,
+                "get_readiness_db_connection",
+                return_value=connection,
+            ),
+            patch.object(api_app, "VECTOR_ENABLED", False),
+            patch.object(api_app, "publish_news_to_wp") as publish,
+            patch.object(api_app, "start_scheduler") as start,
+            self.client() as client,
+        ):
+            response = client.get("/ready")
+
+        self.assertEqual(response.status_code, 200)
+        publish.assert_not_called()
+        start.assert_not_called()
+
+    def test_docs_and_openapi_can_be_disabled(self):
+        with patch.object(api_app, "API_DOCS_ENABLED", False):
+            application = api_app.create_app()
+
+        self.assertIsNone(application.docs_url)
+        self.assertIsNone(application.redoc_url)
+        self.assertIsNone(application.openapi_url)
 
 
 class ApiImportAndCommandTests(unittest.TestCase):
@@ -256,6 +447,44 @@ class ApiImportAndCommandTests(unittest.TestCase):
 
         fake_scheduler.start_scheduler.assert_not_called()
         fake_scheduler.stop_scheduler.assert_not_called()
+
+    def test_invalid_production_config_fails_before_scheduler_start(self):
+        issue = api_app.validate_runtime_config({}, profile="web")[0]
+
+        async def enter_lifespan():
+            async with api_app.lifespan(api_app.app):
+                self.fail("invalid production configuration entered lifespan")
+
+        with (
+            patch.object(api_app, "APP_ENV", "production"),
+            patch.object(api_app, "validate_runtime_config", return_value=(issue,)),
+            patch.object(api_app, "start_scheduler") as start,
+        ):
+            with self.assertRaisesRegex(RuntimeError, "Invalid production configuration"):
+                asyncio.run(enter_lifespan())
+
+        start.assert_not_called()
+
+    def test_disabled_scheduler_startup_has_no_external_side_effects(self):
+        async def enter_lifespan():
+            async with api_app.lifespan(api_app.app):
+                pass
+
+        with (
+            patch.object(api_app, "APP_ENV", "production"),
+            patch.object(api_app, "ENABLE_APSCHEDULER", False),
+            patch.object(api_app, "validate_runtime_config", return_value=()),
+            patch.object(api_app, "start_scheduler") as start,
+            patch.object(api_app, "publish_news_to_wp") as publish,
+            patch.object(api_app, "get_readiness_db_connection") as database,
+            patch.object(api_app, "get_vector_readiness_db_connection") as vector,
+        ):
+            asyncio.run(enter_lifespan())
+
+        start.assert_not_called()
+        publish.assert_not_called()
+        database.assert_not_called()
+        vector.assert_not_called()
 
     def test_importing_app_does_not_start_uvicorn(self):
         fake_uvicorn = types.ModuleType("uvicorn")

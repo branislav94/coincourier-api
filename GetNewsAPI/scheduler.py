@@ -21,9 +21,10 @@ from fetcher import start_scheduler as start_fetcher_scheduler
 from fetcher import stop_scheduler as stop_fetcher_scheduler
 from gpt_processor import process_news_with_gpt
 from publish_to_wp import publish_news_to_wp
+from runtime.logging_config import configure_logging
 
 
-logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
+configure_logging()
 
 
 _scheduler = None

@@ -1,0 +1,89 @@
+name: getnewsapi-production
+
+services:
+  getnewsapi-web:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    image: ${GETNEWSAPI_IMAGE:-getnewsapi:phase7b}
+    env_file:
+      - ${GETNEWSAPI_ENV_FILE:-.env.production}
+    environment:
+      APP_ENV: production
+      API_DOCS_ENABLED: ${API_DOCS_ENABLED:-false}
+      ENABLE_APSCHEDULER: "false"
+      PROCESS_DURABLE_CLAIMS_ENABLED: ${PROCESS_DURABLE_CLAIMS_ENABLED:-false}
+      PUBLISH_DURABLE_STATE_ENABLED: ${PUBLISH_DURABLE_STATE_ENABLED:-false}
+      DUPLICATE_SHADOW_ENABLED: ${DUPLICATE_SHADOW_ENABLED:-false}
+      VECTOR_ENABLED: ${VECTOR_ENABLED:-false}
+      EMBEDDING_ENABLED: ${EMBEDDING_ENABLED:-false}
+      SEMANTIC_SHADOW_ENABLED: ${SEMANTIC_SHADOW_ENABLED:-false}
+      FILE_LOGGING_ENABLED: ${FILE_LOGGING_ENABLED:-false}
+      WRITABLE_STATE_DIR: /data
+      STOCK_IMAGE_CACHE_DIR: /data/cache/stock_images
+      STOCK_IMAGE_USAGE_PATH: /data/stock_image_usage.json
+      VECTOR_DB_HOST: getnewsapi-vector-mariadb
+      VECTOR_DB_PORT: "3306"
+      VECTOR_DB_NAME: ${VECTOR_MARIADB_DATABASE:?VECTOR_MARIADB_DATABASE is required}
+      VECTOR_DB_USER: ${VECTOR_MARIADB_USER:?VECTOR_MARIADB_USER is required}
+      VECTOR_DB_PASSWORD: ${VECTOR_MARIADB_PASSWORD:?VECTOR_MARIADB_PASSWORD is required}
+      VECTOR_DB_SSL_ENABLED: ${VECTOR_DB_SSL_ENABLED:-false}
+      VECTOR_DB_SSL_VERIFY_CERT: ${VECTOR_DB_SSL_VERIFY_CERT:-false}
+      VECTOR_DB_SSL_VERIFY_IDENTITY: ${VECTOR_DB_SSL_VERIFY_IDENTITY:-false}
+    expose:
+      - "5000"
+    volumes:
+      - getnewsapi-state:/data
+    tmpfs:
+      - /tmp:size=64m,mode=1777
+    networks:
+      - getnewsapi-edge
+      - getnewsapi-private
+    read_only: true
+    init: true
+    security_opt:
+      - no-new-privileges:true
+    cap_drop:
+      - ALL
+    healthcheck:
+      test:
+        - CMD
+        - python
+        - -c
+        - "import urllib.request; urllib.request.urlopen('http://127.0.0.1:5000/health', timeout=3).read()"
+      interval: 30s
+      timeout: 5s
+      start_period: 10s
+      retries: 3
+    restart: unless-stopped
+
+  getnewsapi-vector-mariadb:
+    image: mariadb:11.8
+    environment:
+      MARIADB_DATABASE: ${VECTOR_MARIADB_DATABASE:?VECTOR_MARIADB_DATABASE is required}
+      MARIADB_USER: ${VECTOR_MARIADB_USER:?VECTOR_MARIADB_USER is required}
+      MARIADB_PASSWORD: ${VECTOR_MARIADB_PASSWORD:?VECTOR_MARIADB_PASSWORD is required}
+      MARIADB_ROOT_PASSWORD: ${VECTOR_MARIADB_ROOT_PASSWORD:?VECTOR_MARIADB_ROOT_PASSWORD is required}
+    volumes:
+      - getnewsapi-vector-data:/var/lib/mysql
+    networks:
+      - getnewsapi-private
+    healthcheck:
+      test: ["CMD", "healthcheck.sh", "--connect", "--innodb_initialized"]
+      interval: 10s
+      timeout: 5s
+      start_period: 20s
+      retries: 30
+    restart: unless-stopped
+
+networks:
+  getnewsapi-edge:
+    name: ${GETNEWSAPI_EDGE_NETWORK:-getnewsapi-edge}
+    driver: bridge
+  getnewsapi-private:
+    driver: bridge
+    internal: true
+
+volumes:
+  getnewsapi-state:
+  getnewsapi-vector-data:

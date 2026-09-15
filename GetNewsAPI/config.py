@@ -49,6 +49,42 @@ def _parse_optional_utc(name: str) -> datetime | None:
     return parsed.replace(microsecond=0)
 
 
+def _db_tls_options(prefix: str, *, default_enabled: bool = True) -> dict[str, object]:
+    """Build options supported by mysql-connector-python 9.3."""
+
+    enabled = _env_bool(f"{prefix}_SSL_ENABLED", default_enabled)
+    options: dict[str, object] = {"ssl_disabled": not enabled}
+    if not enabled:
+        return options
+
+    options["ssl_verify_cert"] = _env_bool(f"{prefix}_SSL_VERIFY_CERT", False)
+    options["ssl_verify_identity"] = _env_bool(
+        f"{prefix}_SSL_VERIFY_IDENTITY",
+        False,
+    )
+    ca_path = (os.getenv(f"{prefix}_SSL_CA") or "").strip()
+    if ca_path:
+        options["ssl_ca"] = ca_path
+    return options
+
+
+APP_ENV = os.getenv("APP_ENV", "development").strip().lower()
+API_DOCS_ENABLED = _env_bool("API_DOCS_ENABLED", APP_ENV != "production")
+PUBLISH_API_TOKEN = os.getenv("PUBLISH_API_TOKEN")
+READINESS_DB_TIMEOUT_SECONDS = int(os.getenv("READINESS_DB_TIMEOUT_SECONDS", "3"))
+LOG_LEVEL = os.getenv("LOG_LEVEL", "INFO").strip().upper() or "INFO"
+FILE_LOGGING_ENABLED = _env_bool("FILE_LOGGING_ENABLED", False)
+_DEFAULT_WRITABLE_STATE_DIR = "/data" if APP_ENV == "production" else "/app/cache"
+WRITABLE_STATE_DIR = (
+    os.getenv("WRITABLE_STATE_DIR", _DEFAULT_WRITABLE_STATE_DIR).strip()
+    or _DEFAULT_WRITABLE_STATE_DIR
+)
+FILE_LOG_PATH = os.getenv(
+    "FILE_LOG_PATH",
+    os.path.join(WRITABLE_STATE_DIR, "logs", "getnewsapi.log"),
+)
+
+
 ENABLE_APSCHEDULER = _env_bool("ENABLE_APSCHEDULER", False)
 FLASK_DEBUG = _env_bool("FLASK_DEBUG", False)
 PIPELINE_FRESH_START_AFTER_UTC = _parse_optional_utc("PIPELINE_FRESH_START_AFTER_UTC")
@@ -176,7 +212,14 @@ OPENVERSE_PER_PAGE = int(os.getenv("OPENVERSE_PER_PAGE", "10"))
 STOCK_IMAGE_TIMEOUT_SECONDS = int(os.getenv("STOCK_IMAGE_TIMEOUT_SECONDS", "10"))
 STOCK_IMAGE_CACHE_HOURS = int(os.getenv("STOCK_IMAGE_CACHE_HOURS", "24"))
 STOCK_IMAGE_REUSE_WINDOW_DAYS = int(os.getenv("STOCK_IMAGE_REUSE_WINDOW_DAYS", "20"))
-STOCK_IMAGE_USAGE_PATH = os.getenv("STOCK_IMAGE_USAGE_PATH", "/app/cache/stock_image_usage.json")
+STOCK_IMAGE_CACHE_DIR = os.getenv(
+    "STOCK_IMAGE_CACHE_DIR",
+    os.path.join(WRITABLE_STATE_DIR, "cache", "stock_images"),
+)
+STOCK_IMAGE_USAGE_PATH = os.getenv(
+    "STOCK_IMAGE_USAGE_PATH",
+    os.path.join(WRITABLE_STATE_DIR, "stock_image_usage.json"),
+)
 STOCK_IMAGE_REUSE_CHECK_WP_HISTORY = _env_bool("STOCK_IMAGE_REUSE_CHECK_WP_HISTORY", True)
 
 # Additive durable-state rollout controls. Apply maintenance/migrations Phase 2
@@ -205,6 +248,7 @@ VECTOR_DB_CONFIG = {
     "port": int(os.getenv("VECTOR_DB_PORT", "3306")),
     "database": os.getenv("VECTOR_DB_NAME", "coincourier_vectors"),
     "connection_timeout": VECTOR_DB_CONNECT_TIMEOUT_SECONDS,
+    **_db_tls_options("VECTOR_DB"),
 }
 
 # Phase 6B1 embedding machinery is directly invokable only. Source defaults
@@ -250,22 +294,28 @@ WP_API_URL = os.getenv("WP_API_URL")
 WP_USERNAME = os.getenv("WP_USERNAME")
 WP_APP_PASSWORD = os.getenv("WP_APP_PASSWORD")
 
-# MySQL configuration for Flask API
+# MySQL configuration for the application API and pipeline.
+DB_CONNECT_TIMEOUT_SECONDS = int(os.getenv("DB_CONNECT_TIMEOUT_SECONDS", "5"))
 DB_CONFIG = {
     'user': os.getenv('DB_USER'),
     'password': os.getenv('DB_PASSWORD'),
     'host': os.getenv('DB_HOST'),
     'port': int(os.getenv("DB_PORT", 3306)),
     'database': os.getenv('DB_NAME'),
-    "ssl_disabled": False,
-    "ssl_verify_cert": False
+    "connection_timeout": DB_CONNECT_TIMEOUT_SECONDS,
+    **_db_tls_options("DB"),
 }
 
 # MySQL configuration for WordPress DB
+WP_DB_CONNECT_TIMEOUT_SECONDS = int(
+    os.getenv("WP_DB_CONNECT_TIMEOUT_SECONDS", "5")
+)
 WP_DB_CONFIG = {
     'user': os.getenv('WP_DB_USER'),
     'password': os.getenv('WP_DB_PASSWORD'),
     'host': os.getenv('WP_DB_HOST'),
     'port': int(os.getenv("WP_DB_PORT", 3306)),
     'database': os.getenv('WP_DB_NAME'),
+    "connection_timeout": WP_DB_CONNECT_TIMEOUT_SECONDS,
+    **_db_tls_options("WP_DB"),
 }

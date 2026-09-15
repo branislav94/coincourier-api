@@ -3,7 +3,6 @@ from __future__ import annotations
 import hashlib
 import json
 import logging
-import os
 import re
 import time
 from dataclasses import dataclass, field
@@ -25,6 +24,7 @@ from config import (
     PIXABAY_MIN_SCORE,
     PIXABAY_ORIENTATION,
     PIXABAY_PER_PAGE,
+    STOCK_IMAGE_CACHE_DIR,
     STOCK_IMAGE_CACHE_HOURS,
     STOCK_IMAGE_REUSE_CHECK_WP_HISTORY,
     STOCK_IMAGE_REUSE_WINDOW_DAYS,
@@ -216,7 +216,7 @@ def build_stock_queries(article: dict[str, Any]) -> list[str]:
 
 
 def _cache_root() -> Path:
-    return Path(os.getenv("STOCK_IMAGE_CACHE_DIR", "/app/cache/stock_images"))
+    return Path(STOCK_IMAGE_CACHE_DIR)
 
 
 def _usage_path() -> Path:

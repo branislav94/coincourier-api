@@ -965,11 +965,17 @@ native MariaDB cosine distance only and contains no suppression threshold.
 **CURRENT and PLANNED**
 
 - Continue sourcing credentials from environment variables (`config.py:18-205`); never persist them in docs, vector metadata, logs, or assessment reasons.
-- Pin and scan dependencies before vector rollout; current requirements are unpinned.
+- Phase 7B pins the reviewed direct and cross-platform transitive runtime dependency
+  set used by the Linux image; vulnerability scanning remains an operational gate.
 - Redact provider tokens and credential-shaped strings from every error path, not only existing Grok/OpenAI helper errors (`gpt_processor.py:503-511`; `publish_to_wp.py:898-905`).
-- Restrict `GET /api/news` or return an explicit public projection before treating Flask as internet-facing.
+- `POST /api/publish` now always requires a deployment Bearer token. `GET /api/news`
+  intentionally retains its existing read-only behavior and should be restricted at
+  the reverse proxy if it is not intended to be public.
 - Treat source chunks and embeddings as sensitive derived data. Approve hosted-provider retention/training terms and source-content licensing before backfill.
-- Encrypt DB transport with certificate verification in production; current app DB config sets `ssl_verify_cert=False` (`config.py:187-196`).
+- Application, vector, and WordPress DB TLS and CA/verification settings are now
+  explicit. Existing-compatible verification-off defaults are documented; external
+  production databases should supply a mounted CA and enable certificate/identity
+  verification.
 - Log hashes and IDs rather than full URLs where practical, never full bodies or vectors.
 - Limit WP application-password and direct-DB privileges. Publication reconciliation should need only the minimum post/meta access.
 
@@ -1097,6 +1103,26 @@ Each phase is intentionally deployable and reversible on its own.
   evidence, inspect material-update overlap and false positives, and decide whether
   a versioned shadow-only candidate policy merits separate implementation review.
 - No runtime threshold or enforcement is inherited from Phase 6C2B output.
+
+### Deployment Phase 7A/7B: production readiness and packaging
+
+- Phase 7A completed the repository-only deployment audit without live access.
+- Phase 7B is implemented locally and not deployed. The production package uses a
+  non-root immutable web image, read-only root filesystem, persistent `/data`, and
+  separate edge/internal networks. Compose manages only private MariaDB 11.8 vector
+  storage; application and WordPress databases remain external.
+- Web startup validates core configuration offline in production, keeps APScheduler
+  off, and performs no migrations or pipeline/provider work. `/health` is static;
+  `/ready` checks application DB connectivity and vector DB only when enabled, not
+  provider or schema/migration state.
+- Publication is Bearer-token protected, production API docs default off, logging
+  is container-native, file logging is opt-in, DB TLS controls are explicit, and
+  runtime dependencies are pinned. Every existing feature flag remains false and
+  image search remains V1.
+- The complete Phase 7B contract is in
+  `docs/GETNEWSAPI_PRODUCTION_ENVIRONMENT.md`.
+- Phase 7C remains planned and separate: migration plan/check/apply/verify, backup
+  gates, and bounded external one-shot job scheduling are not implemented here.
 
 ### Phase 6: enforce high-confidence duplicate blocking
 

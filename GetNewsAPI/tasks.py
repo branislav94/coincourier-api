@@ -3,20 +3,21 @@
 from __future__ import annotations
 
 import logging
+import os
 import sys
 
+from runtime.logging_config import configure_logging
 
-logging.basicConfig(
-    level=logging.INFO,
-    format="%(asctime)s %(levelname)s %(message)s",
-)
+
+configure_logging()
 
 logger = logging.getLogger(__name__)
 
 USAGE = (
     "Usage: python tasks.py "
     "[fetch|process|publish|chained|embedding_ingest [limit]|"
-    "embedding_worker [limit]|embedding_backfill [source|generated] [limit]]"
+    "embedding_worker [limit]|embedding_backfill [source|generated] [limit]|"
+    "config_check [web|pipeline|publish|embedding]]"
 )
 
 
@@ -104,6 +105,26 @@ def run_embedding_backfill(
     return result
 
 
+def run_config_check(profile: str = "web") -> bool:
+    """Validate environment configuration without opening external connections."""
+
+    from runtime.config_validation import (
+        format_config_issues,
+        validate_runtime_config,
+    )
+
+    environment = dict(os.environ)
+    issues = validate_runtime_config(environment, profile=profile)
+    if not issues:
+        print(f"Configuration valid for profile: {profile}")
+        return True
+
+    rendered = format_config_issues(issues)
+    print(f"Configuration invalid for profile: {profile}", file=sys.stderr)
+    print(rendered, file=sys.stderr)
+    return False
+
+
 def _optional_positive_int(index: int) -> int | None:
     if len(sys.argv) <= index:
         return None
@@ -144,6 +165,10 @@ def main() -> int:
         source = sys.argv[2] if len(sys.argv) > 2 else "source"
         run_embedding_backfill(source, _optional_positive_int(3))
         return 0
+
+    if command == "config_check":
+        profile = sys.argv[2] if len(sys.argv) > 2 else "web"
+        return 0 if run_config_check(profile) else 1
 
     print(USAGE)
     return 2
