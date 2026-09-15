@@ -18,6 +18,11 @@ from .evaluation import (
     load_evaluation_fixture,
 )
 from .service import SemanticRetrievalService
+from .shadow import (
+    DEFAULT_SEMANTIC_EVIDENCE_VERSION,
+    SemanticShadowRunResult,
+    run_semantic_shadow,
+)
 
 __all__ = [
     "SemanticCandidate",
@@ -32,6 +37,9 @@ __all__ = [
     "SemanticRetrievalService",
     "SemanticRetrievalSettings",
     "SemanticRetrievalStatus",
+    "SemanticShadowRunResult",
+    "DEFAULT_SEMANTIC_EVIDENCE_VERSION",
     "evaluate_retrieval",
     "load_evaluation_fixture",
+    "run_semantic_shadow",
 ]

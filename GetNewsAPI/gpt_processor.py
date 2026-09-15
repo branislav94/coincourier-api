@@ -10,6 +10,8 @@ from config import (
     GROK_TEXT_MODEL,
     LLM_FALLBACK_PROVIDER,
     DUPLICATE_SHADOW_ENABLED,
+    SEMANTIC_SHADOW_ENABLED,
+    VECTOR_ENABLED,
     OPENAI_API_KEY,
     OPENAI_MAX_OUTPUT_TOKENS,
     OPENAI_REASONING_EFFORT,
@@ -21,6 +23,7 @@ from config import (
     get_grok_reasoning_effort,
 )
 from duplicate_detection.shadow import analyze_duplicates_in_shadow
+from semantic_retrieval.shadow import run_semantic_shadow
 from repositories.raw_news import RawNewsRepository
 from repositories.state import claim_prefix, safe_error_message
 import time, random
@@ -1882,12 +1885,45 @@ def _run_duplicate_shadow_fail_open(raw: dict) -> None:
             raw.get("id"),
         )
 
+
+def _run_semantic_shadow_fail_open(raw: dict) -> None:
+    article_id = raw.get("id")
+    if not VECTOR_ENABLED:
+        logging.info(
+            "[SEMANTIC-SHADOW] semantic_shadow_disabled=true article_id=%s "
+            "reason=vector_disabled decision=continue",
+            article_id,
+        )
+        return
+    if not SEMANTIC_SHADOW_ENABLED:
+        logging.info(
+            "[SEMANTIC-SHADOW] semantic_shadow_disabled=true article_id=%s "
+            "reason=semantic_disabled decision=continue",
+            article_id,
+        )
+        return
+    try:
+        run_semantic_shadow(
+            int(article_id),
+            vector_enabled=True,
+            semantic_enabled=True,
+        )
+    except Exception as error:
+        logging.error(
+            "[SEMANTIC-SHADOW] semantic_shadow_error=true article_id=%s "
+            "error_type=%s reason=unexpected_runner_failure persisted=false "
+            "decision=continue",
+            article_id,
+            type(error).__name__,
+        )
+
 def process_one(raw, *, mark_complete=True, on_error=None):
     """
     Process a single raw cryptonewsapi row through the GPT enrichment pipeline.
 
     Steps:
         - Run optional fail-open deterministic duplicate shadow analysis
+        - Run optional fail-open semantic evidence shadow
         - Optionally enrich via search (enrich_with_search)
         - Detect/normalize YouTube video URL (_maybe_video_url)
         - Rewrite/classify to strict JSON (classify_and_rewrite)
@@ -1906,6 +1942,7 @@ def process_one(raw, *, mark_complete=True, on_error=None):
     """
     try:
         _run_duplicate_shadow_fail_open(raw)
+        _run_semantic_shadow_fail_open(raw)
         extra = enrich_with_search(raw)
         video_url = _maybe_video_url(raw)
         draft, text_provider = classify_and_rewrite(raw, extra, video_url)

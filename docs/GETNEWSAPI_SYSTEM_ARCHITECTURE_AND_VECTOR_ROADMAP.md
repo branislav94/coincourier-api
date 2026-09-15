@@ -31,10 +31,10 @@ Phase 6A vector storage, Phase 6B1 deterministic chunking/job processing, and
 Phase 6B2 controlled ingestion/worker/backfill operations are **IMPLEMENTED
 LOCALLY BUT DISABLED**. They use a separate MariaDB boundary and explicit lazy
 task commands; none is wired into fetch, process, publish, image, scheduler, or
-duplicate behavior. Production scheduling, provider rollout, and all semantic
-duplicate behavior remain planned. Phase 6C1 bounded source-only semantic
-retrieval and synthetic labeled evaluation are **IMPLEMENTED LOCALLY BUT
-DISABLED**; they have no automatic caller and make no duplicate decision.
+  duplicate behavior. Production scheduling and provider rollout remain planned.
+  Phase 6C1 bounded retrieval/evaluation and Phase 6C2A fail-open semantic evidence
+  collection are **IMPLEMENTED LOCALLY BUT DISABLED**. When explicitly enabled,
+  processing stores neighbors for audit but makes no duplicate decision.
 
 ## 1. Purpose and scope
 
@@ -824,9 +824,10 @@ enqueued/existing jobs, claimed/completed/reconciled/retryable/failed/lost jobs,
 provider calls, embedded chunks, and token usage when supplied. No article text
 or vector is logged. External cron may eventually run `embedding_ingest` then
 `embedding_worker` every few minutes; no scheduler or deployment change exists.
-Phase 6C1 now provides isolated semantic retrieval and offline evaluation.
-Automatic duplicate-shadow evaluation remains Phase 6C2 and must not be inferred
-from Phase 6B storage, embedding completion, or a retrieved neighbor.
+Phase 6C1 provides isolated semantic retrieval and offline evaluation. Phase 6C2A
+adds optional fail-open invocation and durable evidence, but a retrieved neighbor
+still carries no duplicate classification or publication effect. Calibration and
+policy comparison remain Phase 6C2B.
 
 ## 26. Retrieval use cases
 
@@ -858,7 +859,7 @@ vector result alone must never be presented as factual confirmation.
 
 ## 27. Shadow-mode rollout
 
-**PHASE 6C1 OFFLINE/DISABLED; PHASE 6C2 SHADOW INTEGRATION PLANNED**
+**PHASE 6C2A EVIDENCE COLLECTION IMPLEMENTED LOCALLY/DISABLED; 6C2B PLANNED**
 
 Current and future switches:
 
@@ -878,13 +879,22 @@ EMBEDDING_MAX_CHUNKS_PER_JOB=100
 SEMANTIC_SHADOW_ENABLED=false
 SEMANTIC_LOOKBACK_HOURS=72
 SEMANTIC_TOP_K=10
+SEMANTIC_EVIDENCE_VERSION=semantic-shadow-v1
 VECTOR_DUPLICATE_MODE=off
 ```
 
-The vector and embedding settings exist with disabled source defaults. The
-Phase 6C1 semantic flag is also false and is read only by direct package use.
-Explicit embedding task commands read the embedding flags; no automatic fetch,
-process, publish, duplicate, or scheduler path invokes semantic retrieval.
+The vector, embedding, and semantic settings have disabled source defaults.
+When vector and semantic flags are both true, `process_one()` invokes the
+evidence-only shadow after deterministic Phase 5 and before enrichment. It does
+not consult `EMBEDDING_ENABLED`: already-completed vectors remain readable while
+paid embedding generation is disabled. Fetch, publish, duplicate policy, tasks,
+and scheduler modules do not invoke semantic retrieval.
+
+Migration `003_semantic_shadow_assessments.sql` stores bounded neighbor evidence
+in the vector database under a null-safe source/document/embedding/semantic-version
+identity. `not_ready` can reconcile to `retrieved` after an asynchronous worker
+finishes. Retrieval and write failures fail open; neither operation shares the
+application claim transaction or holds an application row lock.
 
 The proposed future `VECTOR_DUPLICATE_MODE` contract is `off|shadow|enforce`:
 
@@ -896,7 +906,7 @@ Rollout order is exact constraints/idempotency first, event and lexical shadow n
 
 ## 28. Metrics and evaluation
 
-**PHASE 6B2 RUN COUNTS AND PHASE 6C1 OFFLINE EVALUATION IMPLEMENTED LOCALLY**
+**PHASE 6B2 COUNTS, 6C1 EVALUATION, AND 6C2A AUDIT METRICS IMPLEMENTED LOCALLY**
 
 The explicit ingestion, worker, and backfill tasks emit bounded count-only run
 summaries. Phase 6C1 loads a versioned synthetic JSON relationship fixture and
@@ -907,6 +917,10 @@ same-event relevance additionally includes material updates. Unavailable queries
 are reported and excluded from Recall/MRR and coverage denominators, while a
 valid no-candidates result remains an evaluated retrieval miss. Real labels,
 dashboards, production alerts, and threshold calibration remain planned.
+
+Phase 6C2A logs bounded attempted/disabled/not-ready/no-candidate/retrieved/error
+outcomes, candidate count, best native distance, persistence state, and error type.
+It logs no vector, article/chunk body, credential, or claim token.
 
 Build a labeled set containing exact duplicates, same-event duplicates, legitimate updates, and broad topical overlap. Include the suspicious log groups but label them only after source/DB inspection. Evaluate at pair and publication-decision level.
 
@@ -1034,19 +1048,31 @@ Each phase is intentionally deployable and reversible on its own.
   provenance, source-identity exclusion, distinct article aggregation, native
   cosine ordering/index plan, bounded work, Recall@K/MRR, and availability rules.
 - Switch: `SEMANTIC_SHADOW_ENABLED=false`; there is no automatic task or pipeline
-  hook, threshold, decision, or durable semantic assessment.
+  hook, threshold, decision, or durable semantic assessment in Phase 6C1 itself.
 - Rollback: leave the switch false or remove the isolated package; existing
   deterministic and publication behavior is independent.
 
-### Phase 6C2: semantic duplicate shadow mode
+### Implementation Phase 6C2A: fail-open semantic evidence shadow
 
-- Files: semantic retrieval/reranking service; selection/processor preflight hooks; audit repository; tests.
-- Migration: `duplicate_assessments`; possibly retrieval-audit table.
-- Tests: labeled exact/event/update/topic corpus, missing embeddings, provider outage fail-open, model-version isolation.
-- Logs/metrics: top match and all feature scores, policy version, shadow decision, human outcome.
-- Switch: `VECTOR_DUPLICATE_MODE=shadow`.
-- Rollback: `off`; no publication decisions were blocked.
-- Risk: medium.
+- Status: implemented locally, disabled, not deployed, and evidence-only.
+- Integration: one guarded `process_one()` call after deterministic Phase 5 and
+  before enrichment; vector and semantic flags are required, embedding generation
+  is not. Claims are committed before this work begins.
+- Migration: `003_semantic_shadow_assessments.sql` in the independent vector DB.
+  It records bounded statuses/evidence with idempotent version-aware identity.
+- Failure contract: unavailable asynchronous embeddings record `not_ready`; vector
+  retrieval or persistence errors are bounded and fail open. No provider work is
+  triggered synchronously.
+- Behavior: no threshold, semantic classification, suppression, scheduling change,
+  or selected/processed/published/publication-status mutation.
+- Rollback: leave `SEMANTIC_SHADOW_ENABLED=false`; deterministic and publication
+  behavior is independent.
+
+### Phase 6C2B: semantic calibration and shadow-policy comparison
+
+- Planned only: real labels, deterministic/semantic feature comparison, threshold
+  research, human review, and an explicitly versioned shadow policy.
+- No enforcement or publication decision is authorized by Phase 6C2A evidence.
 
 ### Phase 6: enforce high-confidence duplicate blocking
 

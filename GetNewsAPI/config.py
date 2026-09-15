@@ -233,13 +233,17 @@ EMBEDDING_MAX_CHUNKS_PER_JOB = int(
     os.getenv("EMBEDDING_MAX_CHUNKS_PER_JOB", "100")
 )
 
-# Phase 6C1 retrieval is offline/directly invoked only. It has no threshold,
-# decision, scheduler, or pipeline integration.
+# Phase 6C2A can persist retrieval evidence during processing only when both the
+# vector and semantic flags are true. It has no threshold or decision authority.
 SEMANTIC_SHADOW_ENABLED = _env_bool("SEMANTIC_SHADOW_ENABLED", False)
 SEMANTIC_LOOKBACK_HOURS = int(
     os.getenv("SEMANTIC_LOOKBACK_HOURS", str(DUPLICATE_LOOKBACK_HOURS))
 )
 SEMANTIC_TOP_K = int(os.getenv("SEMANTIC_TOP_K", "10"))
+SEMANTIC_EVIDENCE_VERSION = (
+    os.getenv("SEMANTIC_EVIDENCE_VERSION", "semantic-shadow-v1").strip()
+    or "semantic-shadow-v1"
+)
 
 # WordPress REST API credentials
 WP_API_URL = os.getenv("WP_API_URL")

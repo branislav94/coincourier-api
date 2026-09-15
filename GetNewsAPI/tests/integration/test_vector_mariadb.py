@@ -10,6 +10,7 @@ import unittest
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from typing import Any
+from unittest.mock import patch
 
 import mysql.connector
 
@@ -23,6 +24,10 @@ if str(PROJECT_DIR) not in sys.path:
 from vector_store.db import VectorSchemaError, verify_vector_schema
 from vector_store.models import SourceType, VECTOR_DIMENSIONS, VectorDocumentDraft
 from vector_store.repository import VectorRepository, serialize_embedding
+from vector_store.semantic_assessments import (
+    SemanticAssessmentRepository,
+    SemanticAssessmentStatus,
+)
 from semantic_retrieval.evaluation import (
     EvaluationFixture,
     LabeledRelationship,
@@ -32,6 +37,7 @@ from semantic_retrieval.evaluation import (
 )
 from semantic_retrieval.models import SemanticRetrievalSettings, SemanticRetrievalStatus
 from semantic_retrieval.service import SemanticRetrievalService
+from semantic_retrieval.shadow import run_semantic_shadow
 
 
 RUN_INTEGRATION = os.getenv("RUN_VECTOR_MARIADB_INTEGRATION", "false").strip().lower() in {
@@ -83,7 +89,12 @@ def _drop_vector_tables() -> None:
     connection = _connect(autocommit=True)
     cursor = connection.cursor()
     try:
-        for table in ("embedding_jobs", "vector_chunks", "vector_documents"):
+        for table in (
+            "semantic_shadow_assessments",
+            "embedding_jobs",
+            "vector_chunks",
+            "vector_documents",
+        ):
             cursor.execute(f"DROP TABLE IF EXISTS {table}")
     finally:
         cursor.close()
@@ -110,6 +121,7 @@ class VectorMariaDBIntegrationTests(unittest.TestCase):
         _drop_vector_tables()
         self.apply("001_vector_schema.sql")
         self.apply("002_vector_indexes.sql")
+        self.apply("003_semantic_shadow_assessments.sql")
         self.repository = VectorRepository(connect=_connect)
 
     def apply(self, filename: str) -> None:
@@ -193,10 +205,13 @@ class VectorMariaDBIntegrationTests(unittest.TestCase):
                 """
                 SELECT COUNT(*) FROM information_schema.TABLES
                 WHERE TABLE_SCHEMA=DATABASE()
-                  AND TABLE_NAME IN ('vector_documents','vector_chunks','embedding_jobs')
+                  AND TABLE_NAME IN (
+                      'vector_documents','vector_chunks','embedding_jobs',
+                      'semantic_shadow_assessments'
+                  )
                 """
             ),
-            3,
+            4,
         )
         self.assertEqual(
             self.scalar(
@@ -214,11 +229,12 @@ class VectorMariaDBIntegrationTests(unittest.TestCase):
                 SELECT COUNT(*) FROM information_schema.REFERENTIAL_CONSTRAINTS
                 WHERE CONSTRAINT_SCHEMA=DATABASE()
                   AND CONSTRAINT_NAME IN (
-                      'fk_vector_chunks_document', 'fk_embedding_jobs_document'
+                      'fk_vector_chunks_document', 'fk_embedding_jobs_document',
+                      'fk_semantic_shadow_query_document'
                   )
                 """
             ),
-            2,
+            3,
         )
         self.assertEqual(
             self.scalar(
@@ -230,7 +246,25 @@ class VectorMariaDBIntegrationTests(unittest.TestCase):
                       'uq_vector_documents_key_version',
                       'uq_vector_chunks_position_version',
                       'uq_vector_chunks_hash_version',
-                      'uq_embedding_jobs_document_version'
+                       'uq_embedding_jobs_document_version',
+                       'uq_semantic_shadow_identity'
+                  )
+                """
+            ),
+            5,
+        )
+        self.assertEqual(
+            self.scalar(
+                """
+                SELECT COUNT(DISTINCT INDEX_NAME)
+                FROM information_schema.STATISTICS
+                WHERE TABLE_SCHEMA=DATABASE()
+                  AND TABLE_NAME='semantic_shadow_assessments'
+                  AND INDEX_NAME IN (
+                      'uq_semantic_shadow_identity',
+                      'idx_semantic_shadow_source_version',
+                      'idx_semantic_shadow_document_version',
+                      'idx_semantic_shadow_status_updated'
                   )
                 """
             ),
@@ -243,12 +277,14 @@ class VectorMariaDBIntegrationTests(unittest.TestCase):
                     (SELECT COUNT(*) FROM vector_documents)
                   + (SELECT COUNT(*) FROM vector_chunks)
                   + (SELECT COUNT(*) FROM embedding_jobs)
+                  + (SELECT COUNT(*) FROM semantic_shadow_assessments)
                 """
             ),
             0,
         )
         self.apply("001_vector_schema.sql")
         self.apply("002_vector_indexes.sql")
+        self.apply("003_semantic_shadow_assessments.sql")
         connection = _connect()
         try:
             verify_vector_schema(connection)
@@ -702,6 +738,206 @@ class VectorMariaDBIntegrationTests(unittest.TestCase):
             connection.close()
         chunk_plan = next(row for row in plan if row["table"] == "vector_chunks")
         self.assertEqual(chunk_plan["key"], "idx_vector_chunks_embedding_cosine")
+
+    def test_semantic_shadow_reconciles_document_registration_idempotently(self) -> None:
+        query_time = datetime(2026, 9, 1, 12, 0, 0)
+        first_version = "synthetic:test:1536:chunk-v1"
+        second_version = "synthetic:test-v2:1536:chunk-v1"
+        semantic_version = "semantic-shadow-v1"
+        # The application owns this source ID before vector registration catches up.
+        application_source_article_id = 980
+        self.assertIsNone(
+            self.repository.get_latest_source_document(application_source_article_id)
+        )
+        candidate_id = self.repository.upsert_document(
+            self.source_document(
+                981,
+                title="Historical semantic candidate",
+                published_at=query_time - timedelta(hours=1),
+            )
+        )
+        self.add_chunk(
+            candidate_id,
+            vector=fake_vector(0.99, 0.01),
+            text="Historical candidate facts",
+            version=first_version,
+        )
+        assessments = SemanticAssessmentRepository(connect=_connect)
+        settings = SemanticRetrievalSettings(
+            vector_enabled=True,
+            semantic_enabled=True,
+            embedding_version=first_version,
+            lookback_hours=72,
+            top_k=3,
+        )
+
+        with patch("embeddings.provider.OpenAIEmbeddingProvider") as provider:
+            not_ready = run_semantic_shadow(
+                application_source_article_id,
+                vector_enabled=True,
+                semantic_enabled=True,
+                semantic_version=semantic_version,
+                settings=settings,
+                vector_repository=self.repository,
+                assessment_repository=assessments,
+            )
+            self.assertEqual(not_ready.status, SemanticAssessmentStatus.NOT_READY)
+            first = assessments.get_assessment(
+                application_source_article_id,
+                None,
+                first_version,
+                semantic_version,
+            )
+            self.assertIsNotNone(first)
+            self.assertEqual(first.status, SemanticAssessmentStatus.NOT_READY)
+            self.assertEqual(first.reason, "source_document_not_found")
+            self.assertIsNone(first.query_document_id)
+            self.assertEqual(first.evaluation_count, 1)
+            self.assertEqual(
+                self.scalar(
+                    "SELECT COUNT(*) FROM semantic_shadow_assessments "
+                    "WHERE query_source_article_id=980"
+                ),
+                1,
+            )
+
+            query_id = self.repository.upsert_document(
+                self.source_document(
+                    application_source_article_id,
+                    title="Late vector registration query",
+                    published_at=query_time,
+                )
+            )
+
+            self.add_chunk(
+                query_id,
+                vector=fake_vector(1.0),
+                text="Late query facts",
+                version=first_version,
+            )
+            self.mark_embedding_complete(query_id, version=first_version)
+            retrieved = run_semantic_shadow(
+                application_source_article_id,
+                vector_enabled=True,
+                semantic_enabled=True,
+                semantic_version=semantic_version,
+                settings=settings,
+                vector_repository=self.repository,
+                assessment_repository=assessments,
+            )
+            reconciled = assessments.get_assessment(
+                application_source_article_id,
+                query_id,
+                first_version,
+                semantic_version,
+            )
+            self.assertEqual(retrieved.status, SemanticAssessmentStatus.RETRIEVED)
+            self.assertEqual(reconciled.id, first.id)
+            self.assertEqual(reconciled.status, SemanticAssessmentStatus.RETRIEVED)
+            self.assertEqual(reconciled.evaluation_count, 2)
+            self.assertEqual(reconciled.candidate_count, 1)
+            self.assertIsNone(
+                assessments.get_assessment(
+                    application_source_article_id,
+                    None,
+                    first_version,
+                    semantic_version,
+                )
+            )
+            self.assertEqual(
+                self.scalar(
+                    "SELECT COUNT(*) FROM semantic_shadow_assessments "
+                    "WHERE query_source_article_id=980 "
+                    "AND embedding_version='synthetic:test:1536:chunk-v1' "
+                    "AND semantic_version='semantic-shadow-v1'"
+                ),
+                1,
+            )
+            self.assertEqual(
+                reconciled.evidence[0]["candidate_source_article_id"],
+                981,
+            )
+
+            run_semantic_shadow(
+                application_source_article_id,
+                vector_enabled=True,
+                semantic_enabled=True,
+                semantic_version=semantic_version,
+                settings=settings,
+                vector_repository=self.repository,
+                assessment_repository=assessments,
+            )
+            replayed = assessments.get_assessment(
+                application_source_article_id,
+                query_id,
+                first_version,
+                semantic_version,
+            )
+            self.assertEqual(replayed.id, first.id)
+            self.assertEqual(replayed.evaluation_count, 3)
+            self.assertEqual(replayed.candidate_count, 1)
+            self.assertEqual(
+                self.scalar(
+                    "SELECT COUNT(*) FROM semantic_shadow_assessments "
+                    "WHERE query_source_article_id=980 "
+                    "AND embedding_version='synthetic:test:1536:chunk-v1' "
+                    "AND semantic_version='semantic-shadow-v1'"
+                ),
+                1,
+            )
+
+            for document_id, vector, text in (
+                (query_id, fake_vector(1.0), "Second-version query facts"),
+                (candidate_id, fake_vector(0.99, 0.01), "Second-version candidate facts"),
+            ):
+                self.add_chunk(
+                    document_id,
+                    vector=vector,
+                    text=text,
+                    version=second_version,
+                )
+            self.mark_embedding_complete(query_id, version=second_version)
+            second_settings = SemanticRetrievalSettings(
+                vector_enabled=True,
+                semantic_enabled=True,
+                embedding_version=second_version,
+                lookback_hours=72,
+                top_k=3,
+            )
+            second = run_semantic_shadow(
+                application_source_article_id,
+                vector_enabled=True,
+                semantic_enabled=True,
+                semantic_version=semantic_version,
+                settings=second_settings,
+                vector_repository=self.repository,
+                assessment_repository=assessments,
+            )
+        provider.assert_not_called()
+        self.assertEqual(second.status, SemanticAssessmentStatus.RETRIEVED)
+        second_record = assessments.get_assessment(
+            application_source_article_id,
+            query_id,
+            second_version,
+            semantic_version,
+        )
+        self.assertNotEqual(second_record.id, first.id)
+        self.assertEqual(
+            self.scalar("SELECT COUNT(*) FROM semantic_shadow_assessments"),
+            2,
+        )
+        self.assertEqual(
+            self.scalar(
+                "SELECT COUNT(*) FROM semantic_shadow_assessments "
+                "WHERE JSON_VALID(evidence_json)=1"
+            ),
+            2,
+        )
+        self.apply("003_semantic_shadow_assessments.sql")
+        self.assertEqual(
+            self.scalar("SELECT COUNT(*) FROM semantic_shadow_assessments"),
+            2,
+        )
 
 
 if __name__ == "__main__":

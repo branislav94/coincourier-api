@@ -10,12 +10,18 @@ integration tests:
 
 1. `001_vector_schema.sql`
 2. `002_vector_indexes.sql`
-3. Run the application schema verifier before enabling any vector connection.
+3. `003_semantic_shadow_assessments.sql`
+4. Run the application schema verifier before enabling any vector connection.
 
-Both scripts are rerunnable on a compatible schema. `CREATE TABLE IF NOT EXISTS`
+All scripts are rerunnable on a compatible schema. `CREATE TABLE IF NOT EXISTS`
 does not validate an incompatible pre-existing table, so a successful rerun is
 not proof of compatibility. The verifier checks required provenance columns,
 `VECTOR(1536)`, and the cosine `VECTOR` index.
+
+Migration 003 adds bounded, evidence-only semantic shadow assessments. Its
+null-safe identity reconciles retries for one source/document/embedding/semantic
+version while retaining separate rows when either version changes. Apply it
+before enabling `SEMANTIC_SHADOW_ENABLED`; it does not classify or suppress news.
 
 The 1536-dimensional physical contract was exercised on MariaDB 11.8.9 with
 synthetic vectors. The provider, model, and long-lived dimension decision is

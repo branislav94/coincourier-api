@@ -528,13 +528,34 @@ and representative mocked request/response fixtures before implementation.
 - Behavior change: none in fetch, selection, processing, deterministic duplicate
   analysis, publishing, or scheduling.
 
-### Phase 6C2: Semantic duplicate shadow integration
+### Phase 6C2A: Fail-open semantic shadow evidence
 
-- Planned only: automatic fail-open invocation, durable retrieval/assessment audit,
-  deterministic feature comparison, real labeled calibration, and an explicitly
-  reviewed shadow policy.
+- Status: implemented locally, source-default disabled, and not deployed.
+- Processing integration: after deterministic Phase 5 and before enrichment,
+  `process_one()` invokes semantic retrieval only when both `VECTOR_ENABLED` and
+  `SEMANTIC_SHADOW_ENABLED` are true. The application claim transaction is already
+  committed; no application row lock is held during vector work.
+- Storage: vector migration `003_semantic_shadow_assessments.sql` adds an independent
+  evidence-only audit table. Identity is source article + nullable immutable query
+  document + embedding version + `semantic-shadow-v1`; replay reconciles the row,
+  while embedding or semantic-version changes retain separate rows.
+- Availability/failure: asynchronous `not_ready`, disabled, no-candidate, retrieved,
+  and bounded safe-error outcomes are explicit. Retrieval or persistence failure
+  logs and continues normal processing. No synchronous embedding, provider call,
+  enqueue, wait, or polling exists in this path.
+- Evidence: only bounded Phase 6C1 source-article neighbors and native distance
+  provenance are stored. Generated content, full text, chunks, and vectors are
+  excluded. No threshold, classification, suppression, or publication-state effect
+  exists.
+- Re-evaluation: process replay or direct service invocation refreshes late vectors;
+  no new task or scheduler command was needed for Phase 6C2A.
+
+### Phase 6C2B: Semantic calibration and policy comparison
+
+- Planned only: real labeled calibration, deterministic-versus-semantic comparison,
+  reviewed policy/version changes, and measured shadow analysis.
 - No production threshold, semantic duplicate classification, suppression, or
-  publication-eligibility effect is part of Phase 6C1.
+  publication-eligibility effect is part of Phase 6C2A.
 
 ### Phase 8: Optional gpt_processor extraction
 

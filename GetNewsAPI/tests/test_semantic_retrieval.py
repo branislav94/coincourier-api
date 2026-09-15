@@ -621,17 +621,25 @@ class SemanticIsolationTests(unittest.TestCase):
         self.assertIn("SEMANTIC_TOP_K=10", env_example)
         self.assertNotIn("SEMANTIC_THRESHOLD", source + env_example)
 
-    def test_no_pipeline_or_phase5_semantic_import_exists(self):
+    def test_only_phase6c2a_process_boundary_imports_semantic_retrieval(self):
         for relative_path in (
-            "GetNewsAPI/gpt_processor.py",
             "GetNewsAPI/fetcher.py",
             "GetNewsAPI/scheduler.py",
             "GetNewsAPI/publish_to_wp.py",
+            "GetNewsAPI/tasks.py",
             "GetNewsAPI/duplicate_detection/policy.py",
             "GetNewsAPI/duplicate_detection/shadow.py",
         ):
             source = (REPOSITORY_DIR / relative_path).read_text(encoding="utf-8")
             self.assertNotIn("semantic_retrieval", source, relative_path)
+        processor_source = (
+            REPOSITORY_DIR / "GetNewsAPI/gpt_processor.py"
+        ).read_text(encoding="utf-8")
+        self.assertIn(
+            "from semantic_retrieval.shadow import run_semantic_shadow",
+            processor_source,
+        )
+        self.assertEqual(processor_source.count("run_semantic_shadow("), 1)
 
 
 if __name__ == "__main__":
