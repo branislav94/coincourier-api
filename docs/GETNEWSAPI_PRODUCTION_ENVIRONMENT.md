@@ -2,10 +2,10 @@
 
 ## Scope
 
-This document describes the Phase 7B package. It is a configuration contract,
-not a deployment runbook. No deployment has been performed. Database migration
-planning, apply/verify commands, backup gates, and scheduled one-shot job
-orchestration remain Phase 7C work.
+This document describes the Phase 7B package and preliminary Phase 7C1 migration
+operations. It is a configuration and command contract, not the final deployment
+runbook. No deployment has been performed. External scheduling and recurring job
+ownership remain Phase 7C2 work.
 
 ## Topology
 
@@ -69,7 +69,8 @@ SEMANTIC_SHADOW_ENABLED
 ```
 
 `IMAGE_SEARCH_ENGINE` remains `v1` by default. Enabling schema-dependent flags
-before Phase 7C migration verification is not authorized by this package.
+before successful Phase 7C1 migration verification and an explicit rollout decision
+is not authorized by this package.
 
 ## API Contract
 
@@ -140,17 +141,72 @@ The immutable application image includes the reviewed operational SQL under
 `/app/maintenance/vector_migrations`. Test-only database fixtures under
 `maintenance/testing` are not packaged. Including these files does not execute
 them: the image has no migration entrypoint, startup hook, or automatic apply
-behavior. Phase 7C must define the ordered check/apply/verify mechanism before any
-schema-dependent feature is enabled.
+behavior. The repository-owned manifests pin every SQL resource by ID, target,
+kind, dependency, order, and SHA-256 checksum.
 
-## Phase 7C Boundary
+The application forward chain is `001` preflight, `002`, `003` preflight, `004`,
+`006` preflight, and `007`. Migration `005` is a claimed-state recovery utility;
+it is never part of normal apply. Both `maintenance/sql/fresh_start_*` utilities
+and the test-only baseline are also excluded. The vector forward chain is exactly
+`001`, `002`, `003` and is guarded for the separate MariaDB 11.8 vector database.
 
-Before any schema-dependent feature is enabled, Phase 7C must define and verify:
+## Migration Commands
 
-- application and vector migration plan/check/apply/verify commands;
-- backup and restore confirmation gates;
-- migration ordering and operational deployment services;
-- externally scheduled, bounded one-shot fetch/process/publish/embedding jobs;
-- single-owner concurrency and activation procedures.
+Use the same immutable application image for one-shot operations. No source or SQL
+bind mount and no special migration image are required:
 
-Phase 7B intentionally contains none of those execution paths.
+```text
+docker compose --env-file /secure/path/getnewsapi.env \
+  -f docker-compose.prod.yml run --rm getnewsapi-web \
+  python tasks.py migration_plan app
+```
+
+Replace the final arguments with any of:
+
+```text
+python tasks.py migration_plan [app|vector|all]
+python tasks.py migration_check [app|vector|all]
+python tasks.py migration_verify [app|vector|all]
+python tasks.py migration_apply [app|vector|all] \
+  --backup-confirmed --restore-tested
+python tasks.py feature_readiness
+```
+
+`migration_plan`, `migration_check`, `migration_verify`, and `feature_readiness`
+perform read-only database inspection. Only `migration_apply` mutates. A production
+apply refuses to connect until both CLI switches are present. These switches are
+operator attestations that an off-server backup exists and restore capability was
+tested; GetNewsAPI does not technically verify either assertion.
+
+Local integration uses `APP_ENV=test`, `MIGRATION_TEST_MODE=true`, an explicitly
+named `*_test` database, and `--allow-disposable`. This mode is not accepted as a
+substitute for production attestations. `MIGRATION_LOCK_TIMEOUT_SECONDS` controls a
+bounded target-specific MariaDB advisory lock and defaults to five seconds. App and
+vector locks are distinct.
+
+The migration ledger is stored in each target database as
+`getnewsapi_migration_ledger`. A row is written only after a script executes and its
+specific artifacts verify. Checksums must continue to match the immutable manifest.
+Schema artifacts without ledger rows are reported as `untracked_applied` or
+`ambiguous` and block apply; there is no automatic baseline/adoption operation.
+Likewise, a ledger row cannot substitute for columns, indexes, constraints, foreign
+keys, native vector support, or the semantic assessment schema.
+
+Apply is deterministic and fail-fast. MariaDB DDL can commit implicitly, so a
+multi-DDL migration is not represented as transactionally atomic. On SQL or
+verification failure, later migrations stop and no automatic recovery/rollback or
+fresh-start utility runs. Operators must investigate partial effects. Successful
+outcomes distinguish `APPLIED_AND_VERIFIED` from the nonzero
+`APPLY_SUCCEEDED_VERIFY_FAILED`; a repeated successful apply reports
+`NO_PENDING_MIGRATIONS` without duplicate mutation.
+
+`feature_readiness` reports prerequisites for durable processing, durable
+publishing, duplicate shadow, vector, embedding, and semantic shadow. It neither
+contacts providers nor changes any feature flag.
+
+## Phase 7C2 Boundary
+
+Phase 7C2 still owns external cron/Dokploy schedules, bounded one-shot recurring
+fetch/process/publish/embedding wiring, job concurrency, and rollout activation.
+Phase 7C1 adds none of those behaviors. Web startup remains non-mutating and does
+not run migration commands automatically.

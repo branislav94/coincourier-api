@@ -573,7 +573,7 @@ and representative mocked request/response fixtures before implementation.
   shadow-policy evidence. Any threshold or policy wiring requires separate review;
   Phase 6C2B does not authorize enforcement.
 
-### Deployment Phase 7A/7B: Audit and production packaging
+### Deployment Phase 7A/7B/7C1: Packaging and migration operations
 
 - Phase 7A status: read-only deployment readiness audit completed; no environment
   or live service was accessed.
@@ -588,10 +588,17 @@ and representative mocked request/response fixtures before implementation.
   writable-state paths, explicit DB TLS controls, and pinned runtime dependencies.
 - Safety: all existing rollout flags remain false and image search remains V1.
   Startup runs no migration, task, provider request, embedding, or backfill.
+- Phase 7C1 status: repository-owned app/vector migration manifests, immutable
+  checksums, read-only plan/check/verify, explicit apply, operator backup/restore
+  attestations, per-target MariaDB advisory locks, ledger/drift detection, complete
+  schema verification, and feature-readiness evidence are implemented locally.
+- Safety: `005`, fresh-start utilities, and test fixtures are excluded from normal
+  apply. Untracked or partial schema blocks; no automatic baseline or rollback is
+  attempted, and MariaDB DDL is not claimed to be transactionally atomic.
 - Contract: `docs/GETNEWSAPI_PRODUCTION_ENVIRONMENT.md` describes required secrets,
-  reverse-proxy attachment, state ownership, TLS, and the remaining Phase 7C gate.
-- Phase 7C remains planned: migration plan/check/apply/verify, backup gates, and
-  external one-shot scheduler/job orchestration are intentionally absent.
+  reverse-proxy attachment, state ownership, TLS, and preliminary migration commands.
+- Phase 7C2 remains planned: external one-shot scheduler/job orchestration,
+  job-specific concurrency, and activation are intentionally absent.
 
 ### Phase 8: Optional gpt_processor extraction
 

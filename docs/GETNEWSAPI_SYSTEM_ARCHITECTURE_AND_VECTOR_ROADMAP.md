@@ -1104,7 +1104,7 @@ Each phase is intentionally deployable and reversible on its own.
   a versioned shadow-only candidate policy merits separate implementation review.
 - No runtime threshold or enforcement is inherited from Phase 6C2B output.
 
-### Deployment Phase 7A/7B: production readiness and packaging
+### Deployment Phase 7A/7B/7C1: packaging and migration operations
 
 - Phase 7A completed the repository-only deployment audit without live access.
 - Phase 7B is implemented locally and not deployed. The production package uses a
@@ -1121,8 +1121,16 @@ Each phase is intentionally deployable and reversible on its own.
   image search remains V1.
 - The complete Phase 7B contract is in
   `docs/GETNEWSAPI_PRODUCTION_ENVIRONMENT.md`.
-- Phase 7C remains planned and separate: migration plan/check/apply/verify, backup
-  gates, and bounded external one-shot job scheduling are not implemented here.
+- Phase 7C1 is implemented locally and not deployed. Explicit app/vector manifests
+  pin order, target, kind, dependency, and checksum. Read-only plan/check/verify,
+  explicit apply, operator backup/restore attestations, target guards, MariaDB
+  advisory locks, per-database ledgers, drift/untracked-state blocking, full current
+  schema verification, and non-activating feature readiness use the same image.
+- Normal apply excludes `005`, fresh-start utilities, and test fixtures. It is
+  fail-fast, verifies before recording, never auto-baselines or auto-rolls back, and
+  explicitly acknowledges MariaDB's non-atomic multi-DDL boundary.
+- Phase 7C2 remains planned and separate: bounded external one-shot scheduling,
+  job concurrency ownership, and feature activation are not implemented here.
 
 ### Phase 6: enforce high-confidence duplicate blocking
 

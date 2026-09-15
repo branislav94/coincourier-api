@@ -8,9 +8,6 @@ import mysql.connector
 
 from config import VECTOR_DB_CONFIG, VECTOR_ENABLED
 
-from .models import VECTOR_DIMENSIONS
-
-
 PRODUCTION_VECTOR_DATABASE = "coincourier_vectors"
 
 
@@ -44,58 +41,17 @@ def connect_vector_db():
 
 
 def verify_vector_schema(connection: Any) -> None:
-    """Reject missing or incompatible Phase 6A vector schemas."""
+    """Reject missing or incompatible vector migrations 001 through 003."""
     cursor = connection.cursor()
     try:
         cursor.execute("SELECT DATABASE()")
         database = assert_vector_database_name(cursor.fetchone()[0])
-
-        cursor.execute(
-            """
-            SELECT TABLE_NAME, COLUMN_NAME, COLUMN_TYPE
-            FROM information_schema.COLUMNS
-            WHERE TABLE_SCHEMA = %s
-              AND TABLE_NAME IN ('vector_documents','vector_chunks','embedding_jobs')
-            """,
-            (database,),
-        )
-        columns = {
-            (table_name, column_name): column_type.lower()
-            for table_name, column_name, column_type in cursor.fetchall()
-        }
-        required_columns = {
-            ("vector_documents", "document_key"),
-            ("vector_documents", "source_type"),
-            ("vector_documents", "source_article_id"),
-            ("vector_documents", "rich_article_id"),
-            ("vector_documents", "content_version"),
-            ("vector_chunks", "document_id"),
-            ("vector_chunks", "embedding_version"),
-            ("embedding_jobs", "document_id"),
-            ("embedding_jobs", "status"),
-        }
-        missing = sorted(required_columns - set(columns))
-        if missing:
-            raise VectorSchemaError(f"vector schema is missing columns: {missing}")
-
-        embedding_type = columns.get(("vector_chunks", "embedding"))
-        if embedding_type != f"vector({VECTOR_DIMENSIONS})":
-            raise VectorSchemaError(
-                f"vector_chunks.embedding must be vector({VECTOR_DIMENSIONS}), "
-                f"found {embedding_type or 'missing'}"
-            )
-
-        cursor.execute(
-            """
-            SELECT INDEX_NAME, INDEX_TYPE
-            FROM information_schema.STATISTICS
-            WHERE TABLE_SCHEMA = %s AND TABLE_NAME = 'vector_chunks'
-              AND INDEX_NAME = 'idx_vector_chunks_embedding_cosine'
-            """,
-            (database,),
-        )
-        index_row = cursor.fetchone()
-        if not index_row or str(index_row[1]).upper() != "VECTOR":
-            raise VectorSchemaError("cosine VECTOR index is missing from vector_chunks")
     finally:
         cursor.close()
+
+    from deployment.verification import verify_vector_schema_contract
+
+    try:
+        verify_vector_schema_contract(connection, database)
+    except RuntimeError as exc:
+        raise VectorSchemaError(str(exc)) from exc
