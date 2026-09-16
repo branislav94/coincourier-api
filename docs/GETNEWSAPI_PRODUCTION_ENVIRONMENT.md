@@ -2,10 +2,10 @@
 
 ## Scope
 
-This document describes the Phase 7B package and preliminary Phase 7C1 migration
-operations. It is a configuration and command contract, not the final deployment
-runbook. No deployment has been performed. External scheduling and recurring job
-ownership remain Phase 7C2 work.
+This document describes the Phase 7B package, Phase 7C1 migration operations, and
+the Phase 7C2 external one-shot job contract. It is a configuration and command
+contract, not the final deployment runbook. No deployment has been performed and
+no scheduler product has been configured.
 
 ## Topology
 
@@ -45,7 +45,8 @@ GETNEWSAPI_ENV_FILE=/secure/path/getnewsapi.env docker compose \
 `.env.example` is the complete sanitized reference. Blank values in that file are
 secrets or environment-specific inputs. `python tasks.py config_check web` validates
 the effective web configuration without opening a network or database connection.
-Additional offline profiles are `pipeline`, `publish`, and `embedding`.
+Additional offline profiles are `fetch`, `process`, `pipeline`, `publish`,
+`embedding`, `embedding_ingest`, `embedding_worker`, and `embedding_backfill`.
 
 The web profile requires application DB settings and `PUBLISH_API_TOKEN`. Pipeline
 and publishing profiles add only the credentials their operations need. Disabled
@@ -204,9 +205,93 @@ outcomes distinguish `APPLIED_AND_VERIFIED` from the nonzero
 publishing, duplicate shadow, vector, embedding, and semantic shadow. It neither
 contacts providers nor changes any feature flag.
 
-## Phase 7C2 Boundary
+## External One-Shot Job Contract
 
-Phase 7C2 still owns external cron/Dokploy schedules, bounded one-shot recurring
-fetch/process/publish/embedding wiring, job concurrency, and rollout activation.
-Phase 7C1 adds none of those behaviors. Web startup remains non-mutating and does
-not run migration commands automatically.
+Production has exactly one scheduler owner: an external scheduler chosen by
+DevOps. `getnewsapi-web` serves HTTP only, fixes `ENABLE_APSCHEDULER=false`, and
+does not start recurring work. Production configuration rejects
+`APP_ENV=production` with `ENABLE_APSCHEDULER=true`. Development may retain the
+in-process APScheduler compatibility path.
+
+The explicit catalog is available without network or database access:
+
+```text
+python tasks.py job_catalog
+```
+
+The supported jobs are:
+
+| Job | Class | Work and external activity | Bound | Concurrency contract |
+|---|---|---|---|---|
+| `fetch_once` | recurring | application DB; CryptoNews fetches; OpenAI scoring | at most three 100-item article pulls, optional 50-item video pull, `FETCH_POOL_SIZE`, and `FETCH_SCORE_LIMIT` | existing application-DB `news_fetcher_lock`; overlap skips |
+| `pipeline_once` | recurring | process against application DB and text/search providers, then publish against application/WordPress DB, WordPress REST, and image providers | `PROCESS_BATCH_MIN..PROCESS_BATCH_MAX` within `PROCESS_LOOKAHEAD_MINUTES`, then `PUBLISH_BATCH_MAX` | application-DB `pipeline-workflow` job lock; overlap skips |
+| `process` | manual | application DB and configured text/search providers | processing bounds above | shares `pipeline-workflow` |
+| `publish` | manual | application/WordPress DB, WordPress REST, and configured image providers | `PUBLISH_BATCH_MAX` | shares `pipeline-workflow`, then retains `wp_publisher_lock` |
+| `embedding_ingest` | rollout decision | application and vector DB; no embedding provider call | default `EMBEDDING_INGEST_LIMIT=25`, maximum 1000 | vector-DB `embedding-registration` job lock |
+| `embedding_worker` | rollout decision | application/vector DB and configured embedding provider | default `EMBEDDING_WORK_LIMIT=5`, maximum 100 jobs; `EMBEDDING_MAX_CHUNKS_PER_JOB=100` by default | no global job lock; durable row claims support parallel workers |
+| `embedding_backfill` | manual | application and vector DB; no embedding provider call | default limit 25, maximum 1000; keyset pages default to 100 | shares vector-DB `embedding-registration` |
+
+Every command performs one bounded run and terminates. No command creates an
+internal loop, daemon, or recurring scheduler. The recommended production
+commands are:
+
+```text
+python tasks.py fetch_once
+python tasks.py pipeline_once
+python tasks.py embedding_ingest [limit]
+python tasks.py embedding_worker [limit]
+python tasks.py embedding_backfill [source|generated] [limit]
+```
+
+`process`, `publish`, and `embedding_backfill` are controlled manual commands,
+not independent recurring schedules. The legacy `fetch` and `chained` names remain
+compatibility aliases for `fetch_once` and `pipeline_once`.
+
+The current-equivalent baseline is `fetch_once` every 30 minutes and
+`pipeline_once` every 30 minutes approximately three minutes after fetch. A
+pipeline run always attempts process first and publish second. Publish still runs
+when processing finds no work or fails, preserving backlog draining; any failed
+stage makes the overall result nonzero and identifies the stage. No embedding
+cadence has been approved. Scheduling `embedding_ingest` or `embedding_worker`
+remains a rollout decision, while backfill remains manual.
+
+New job locks use stable names of the form
+`getnewsapi:job:v1:<conflict-group>:<database-scope-hash>`. They are distinct from
+migration locks, use a dedicated MariaDB connection with autocommit enabled, and
+wait for `JOB_LOCK_TIMEOUT_SECONDS` (default one second; allowed range 1-60).
+There is no open SQL transaction during provider work. A busy conflict group
+returns `SKIPPED_ALREADY_RUNNING`; the lock is released in `finally`, and MariaDB
+also releases it when the owning connection disconnects.
+
+Structured command output uses `SUCCESS`, `NO_WORK`,
+`SKIPPED_ALREADY_RUNNING`, `DISABLED`, `CONFIGURATION_ERROR`, or `FAILED`, with
+bounded counts, duration, stage, and reason type. Success, no work, expected
+overlap, and a disabled feature exit 0. Configuration, database, provider, job,
+or partial-pipeline failure exits 1. Invalid CLI usage exits 2. Output omits
+credentials, article bodies, vectors, and provider payloads.
+
+Use the same immutable image, environment file, networks, read-only root, `/tmp`,
+and persistent `/data` mounts as the web service. No source mount or special worker
+image is required:
+
+```text
+docker compose --env-file /secure/path/getnewsapi.env \
+  -f docker-compose.prod.yml run --rm getnewsapi-web \
+  python tasks.py fetch_once
+
+docker compose --env-file /secure/path/getnewsapi.env \
+  -f docker-compose.prod.yml run --rm getnewsapi-web \
+  python tasks.py pipeline_once
+```
+
+Compose intentionally defines no permanent worker or scheduler service. One-shot
+jobs never run migrations, change feature flags, or enable vector, embedding,
+semantic, durable-state, duplicate-shadow, or Image Search V2 behavior.
+
+## Phase 7D Boundary
+
+Phase 7D remains responsible for the final operator runbook: scheduler-product
+configuration, real secret and network placement, migration and backup/restore
+steps, staged feature activation, monitoring, rollback, and production ownership.
+Phase 7C2 does not deploy, access Dokploy, choose embedding cadence, or activate
+anything.

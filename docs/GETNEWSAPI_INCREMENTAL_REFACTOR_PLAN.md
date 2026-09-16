@@ -490,9 +490,9 @@ and representative mocked request/response fixtures before implementation.
   skipped documents, enqueued/existing jobs, worker outcomes, provider calls,
   chunks, and provider token usage when available. Bodies and vectors are never
   logged.
-- Eventual external cron order is `embedding_ingest` followed by
-  `embedding_worker` every few minutes. No APScheduler or production cron change
-  is included, and historical backfill remains an operator-run command.
+- Phase 7C2 exposes bounded `embedding_ingest` and `embedding_worker` one-shot
+  commands, but their external cadence remains an explicit rollout decision.
+  Historical backfill remains an operator-run command.
 - Compatibility boundary: fetch, process, publish, image, and duplicate paths do
   not import or invoke embedding operations; article processing and publishing
   do not wait for vectors. Only the explicit lazy `tasks.py` commands import the
@@ -573,7 +573,7 @@ and representative mocked request/response fixtures before implementation.
   shadow-policy evidence. Any threshold or policy wiring requires separate review;
   Phase 6C2B does not authorize enforcement.
 
-### Deployment Phase 7A/7B/7C1: Packaging and migration operations
+### Deployment Phase 7A/7B/7C1/7C2: Packaging and operations
 
 - Phase 7A status: read-only deployment readiness audit completed; no environment
   or live service was accessed.
@@ -596,9 +596,17 @@ and representative mocked request/response fixtures before implementation.
   apply. Untracked or partial schema blocks; no automatic baseline or rollback is
   attempted, and MariaDB DDL is not claimed to be transactionally atomic.
 - Contract: `docs/GETNEWSAPI_PRODUCTION_ENVIRONMENT.md` describes required secrets,
-  reverse-proxy attachment, state ownership, TLS, and preliminary migration commands.
-- Phase 7C2 remains planned: external one-shot scheduler/job orchestration,
-  job-specific concurrency, and activation are intentionally absent.
+  reverse-proxy attachment, state ownership, TLS, migration commands, and jobs.
+- Phase 7C2 status: an explicit bounded job catalog and deterministic JSON results
+  expose `fetch_once`, process-then-publish `pipeline_once`, embedding ingest/worker,
+  and controlled manual commands from the same immutable image. Production rejects
+  in-process APScheduler ownership. Versioned, database-scoped advisory conflict
+  groups protect unsafe overlap while durable embedding row claims continue to
+  support parallel workers. Existing fetch/publish locks remain in place.
+- Scheduling: the external baseline preserves fetch every 30 minutes and pipeline
+  about three minutes later. Embedding cadence is deliberately a rollout decision;
+  backfill remains manual. No scheduler product, deployment, migration, or feature
+  activation is included. Phase 7D remains the final operator runbook.
 
 ### Phase 8: Optional gpt_processor extraction
 

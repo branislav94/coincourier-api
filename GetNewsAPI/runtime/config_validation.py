@@ -28,7 +28,19 @@ WORDPRESS_DB_FIELDS = (
     "WP_DB_HOST",
     "WP_DB_NAME",
 )
-PROFILES = frozenset({"web", "pipeline", "publish", "embedding"})
+PROFILES = frozenset(
+    {
+        "web",
+        "fetch",
+        "process",
+        "pipeline",
+        "publish",
+        "embedding",
+        "embedding_ingest",
+        "embedding_worker",
+        "embedding_backfill",
+    }
+)
 @dataclass(frozen=True)
 class ConfigIssue:
     field: str
@@ -157,6 +169,36 @@ def _validate_provider_keys(
         issues.append(ConfigIssue("OPENAI_API_KEY", "is required for OpenAI routing"))
 
 
+def _validate_image_provider_keys(
+    environment: Mapping[str, str],
+    issues: list[ConfigIssue],
+) -> None:
+    providers = {_value(environment, "PRIMARY_IMAGE_PROVIDER") or "grok"}
+    fallback_enabled = _boolean(
+        environment,
+        "OPENAI_IMAGE_FALLBACK",
+        True,
+        issues,
+    )
+    if fallback_enabled:
+        providers.add(_value(environment, "IMAGE_FALLBACK_PROVIDER") or "openai")
+    unsupported = sorted(providers - {"grok", "openai"})
+    if unsupported:
+        issues.append(
+            ConfigIssue(
+                "PRIMARY_IMAGE_PROVIDER",
+                "must resolve only to grok or openai",
+            )
+        )
+    if "grok" in providers and not (
+        _value(environment, "GROK_API_KEY")
+        or _value(environment, "XAI_API_KEY")
+    ):
+        issues.append(ConfigIssue("GROK_API_KEY", "is required for Grok image routing"))
+    if "openai" in providers and not _value(environment, "OPENAI_API_KEY"):
+        issues.append(ConfigIssue("OPENAI_API_KEY", "is required for OpenAI image routing"))
+
+
 def validate_runtime_config(
     environment: Mapping[str, str] | None = None,
     *,
@@ -169,7 +211,7 @@ def validate_runtime_config(
     issues: list[ConfigIssue] = []
 
     if normalized_profile not in PROFILES:
-        return (ConfigIssue("profile", "must be web, pipeline, publish, or embedding"),)
+        return (ConfigIssue("profile", "is not a supported runtime profile"),)
 
     app_env = (_value(env, "APP_ENV") or "development").lower()
     if app_env not in {"development", "test", "production"}:
@@ -191,6 +233,14 @@ def validate_runtime_config(
     semantic_enabled = _boolean(env, "SEMANTIC_SHADOW_ENABLED", False, issues)
 
     scheduler_enabled = _boolean(env, "ENABLE_APSCHEDULER", False, issues)
+    scheduler_profile = normalized_profile == "web" and scheduler_enabled
+    if app_env == "production" and scheduler_enabled:
+        issues.append(
+            ConfigIssue(
+                "ENABLE_APSCHEDULER",
+                "must be false in production; an external scheduler owns recurrence",
+            )
+        )
     for flag in (
         "PROCESS_DURABLE_CLAIMS_ENABLED",
         "PUBLISH_DURABLE_STATE_ENABLED",
@@ -205,14 +255,23 @@ def validate_runtime_config(
         _positive_integer(env, "VECTOR_DB_CONNECT_TIMEOUT_SECONDS", 5, issues)
         _validate_tls(env, "VECTOR_DB", issues, default_enabled=True)
 
-    if embedding_enabled or normalized_profile == "embedding":
+    embedding_profiles = {
+        "embedding",
+        "embedding_ingest",
+        "embedding_worker",
+        "embedding_backfill",
+    }
+    if embedding_enabled or normalized_profile in embedding_profiles:
         if not vector_enabled:
             issues.append(
                 ConfigIssue("VECTOR_ENABLED", "must be true when embeddings are enabled")
             )
         if (_value(env, "EMBEDDING_PROVIDER") or "openai").lower() != "openai":
             issues.append(ConfigIssue("EMBEDDING_PROVIDER", "must be openai"))
-        if not _value(env, "OPENAI_API_KEY"):
+        if (
+            embedding_enabled
+            or normalized_profile in {"embedding", "embedding_worker"}
+        ) and not _value(env, "OPENAI_API_KEY"):
             issues.append(
                 ConfigIssue("OPENAI_API_KEY", "is required for OpenAI embeddings")
             )
@@ -234,15 +293,34 @@ def validate_runtime_config(
             )
         )
 
-    if normalized_profile == "pipeline" or scheduler_enabled:
-        _require(env, ("CRYPTO_NEWS_TOKEN", "GOOGLE_API_KEY"), issues)
+    if normalized_profile == "fetch" or scheduler_profile:
+        _require(env, ("CRYPTO_NEWS_TOKEN", "OPENAI_API_KEY"), issues)
+
+    if normalized_profile in {"process", "pipeline"} or scheduler_profile:
+        _require(env, ("GOOGLE_API_KEY",), issues)
         _validate_provider_keys(env, issues)
 
-    if normalized_profile == "publish" or scheduler_enabled:
+    if normalized_profile in {"publish", "pipeline"} or scheduler_profile:
         _require(env, WORDPRESS_REST_FIELDS + WORDPRESS_DB_FIELDS, issues)
         _positive_integer(env, "WP_DB_PORT", 3306, issues, maximum=65535)
         _positive_integer(env, "WP_DB_CONNECT_TIMEOUT_SECONDS", 5, issues)
         _validate_tls(env, "WP_DB", issues, default_enabled=True)
+        _validate_image_provider_keys(env, issues)
+
+    if normalized_profile in {
+        "process",
+        "pipeline",
+        "publish",
+        "embedding_ingest",
+        "embedding_backfill",
+    } or scheduler_profile:
+        _positive_integer(
+            env,
+            "JOB_LOCK_TIMEOUT_SECONDS",
+            1,
+            issues,
+            maximum=60,
+        )
 
     return tuple(issues)
 

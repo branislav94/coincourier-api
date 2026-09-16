@@ -1743,7 +1743,7 @@ class WordPressPublisher:
 
 
 # ---------- Main publisher ---------------------------------------------------
-def publish_news_to_wp() -> None:
+def publish_news_to_wp() -> dict[str, int | str]:
     """
     Publish due enriched news items to WordPress (featured image + Yoast SEO meta).
 
@@ -1770,7 +1770,7 @@ def publish_news_to_wp() -> None:
         None
 
     Returns:
-        None
+        A bounded operational status and attempted/succeeded/failed counters.
     """
     # single-run guard (prevents overlapping scheduler/API runs)
     lock_conn = None
@@ -1788,7 +1788,12 @@ def publish_news_to_wp() -> None:
                 print(f"[WP] Could not inspect advisory lock 'wp_publisher_lock': {exc}")
             holder_suffix = f" (connection id={lock_holder})" if lock_holder else ""
             print(f"[WP] MySQL advisory lock 'wp_publisher_lock' is held by another DB session{holder_suffix}; skipping.")
-            return
+            return {
+                "status": "skipped_already_running",
+                "attempted": 0,
+                "succeeded": 0,
+                "failed": 0,
+            }
         lock_acquired = True
         print("[WP] Acquired MySQL advisory lock 'wp_publisher_lock'.")
 
@@ -1798,7 +1803,12 @@ def publish_news_to_wp() -> None:
         due = _count_due_now()
         if due == 0:
             print("No new news items to publish.")
-            return
+            return {
+                "status": "no_work",
+                "attempted": 0,
+                "succeeded": 0,
+                "failed": 0,
+            }
 
         # cap per-run (env with sensible default)
         batch_cap = int(os.getenv("PUBLISH_BATCH_MAX", "10"))
@@ -1823,16 +1833,32 @@ def publish_news_to_wp() -> None:
             durable_result = service.publish_due(min(due, batch_cap))
             if durable_result["attempted"] == 0:
                 print("No new news items to publish.")
-            return
+            return {
+                "status": (
+                    "no_work"
+                    if durable_result["attempted"] == 0
+                    else "failed"
+                    if durable_result["failed"]
+                    else "success"
+                ),
+                **durable_result,
+            }
 
         news_items = fetch_unpublished(limit=min(due, batch_cap))
         if not news_items:
             print("No new news items to publish.")
-            return
+            return {
+                "status": "no_work",
+                "attempted": 0,
+                "succeeded": 0,
+                "failed": 0,
+            }
 
         now_utc = datetime.utcnow().replace(tzinfo=timezone.utc)
         context = PublicationContext(published_at_utc=now_utc)
         wordpress_publisher = WordPressPublisher()
+        succeeded = 0
+        failed = 0
 
         for item in news_items:
             featured_id, image_meta = upload_image(
@@ -1851,6 +1877,16 @@ def publish_news_to_wp() -> None:
             result = wordpress_publisher.publish(article, image, context)
             if result.success:
                 mark_news_as_published(item["news_url"])
+                succeeded += 1
+            else:
+                failed += 1
+
+        return {
+            "status": "failed" if failed else "success",
+            "attempted": len(news_items),
+            "succeeded": succeeded,
+            "failed": failed,
+        }
 
     finally:
         try:

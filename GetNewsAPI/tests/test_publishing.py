@@ -91,7 +91,10 @@ class CompatibilityTests(unittest.TestCase):
             )
             result = publish_to_wp.publish_news_to_wp()
 
-        self.assertIsNone(result)
+        self.assertEqual(
+            result,
+            {"status": "success", "attempted": 1, "succeeded": 1, "failed": 0},
+        )
         adapter_type.assert_called_once_with()
         published_article, published_image, context = adapter.publish.call_args.args
         self.assertEqual(published_article.title, ARTICLE_ROW["title"])
@@ -117,20 +120,22 @@ class CompatibilityTests(unittest.TestCase):
             patch.object(publisher, "mark_news_as_published") as mark_published,
             patch.object(publisher, "WordPressPublisher", return_value=adapter),
         ):
-            publish_to_wp.publish_news_to_wp()
+            result = publish_to_wp.publish_news_to_wp()
+        self.assertEqual(
+            result,
+            {"status": "failed", "attempted": 1, "succeeded": 0, "failed": 1},
+        )
         mark_published.assert_not_called()
 
-    def test_tasks_resolves_same_publish_entry_point(self):
-        with patch.object(publish_to_wp, "publish_news_to_wp", return_value=None) as publish:
-            tasks.run_publish()
-        publish.assert_called_once_with()
+    def test_tasks_routes_publish_through_operational_job(self):
+        with patch.object(tasks, "_run_operational_job", return_value=0) as run:
+            self.assertEqual(tasks.run_publish(), 0)
+        run.assert_called_once_with("publish")
 
-    def test_scheduler_resolves_same_publish_entry_point(self):
+    def test_scheduler_routes_chained_job_through_pipeline_contract(self):
         fake_fetcher = types.ModuleType("fetcher")
         fake_fetcher.start_scheduler = Mock()
         fake_fetcher.stop_scheduler = Mock()
-        fake_processor = types.ModuleType("gpt_processor")
-        fake_processor.process_news_with_gpt = Mock()
 
         spec = importlib.util.spec_from_file_location("scheduler_contract_test", SCHEDULER_PATH)
         self.assertIsNotNone(spec)
@@ -140,16 +145,17 @@ class CompatibilityTests(unittest.TestCase):
             sys.modules,
             {
                 "fetcher": fake_fetcher,
-                "gpt_processor": fake_processor,
-                "publish_to_wp": publish_to_wp,
             },
         ):
             spec.loader.exec_module(scheduler_module)
 
-        self.assertIs(
-            scheduler_module.publish_news_to_wp,
-            publish_to_wp.publish_news_to_wp,
-        )
+        result = Mock(exit_code=0)
+        with (
+            patch.object(scheduler_module, "run_job", return_value=result) as run,
+            patch.object(scheduler_module, "render_job_result", return_value="{}"),
+        ):
+            self.assertIs(scheduler_module.chained_job(), result)
+        run.assert_called_once_with("pipeline_once")
 
     def test_publication_article_maps_only_current_fields(self):
         article = PublicationArticle.from_mapping(ARTICLE_ROW)
@@ -538,7 +544,8 @@ class AdvisoryLockTests(unittest.TestCase):
             patch.object(publisher, "_release_lock") as release_lock,
             patch.object(publisher, "_count_due_now") as count_due,
         ):
-            publisher.publish_news_to_wp()
+            result = publisher.publish_news_to_wp()
+        self.assertEqual(result["status"], "skipped_already_running")
         get_lock.assert_called_once_with(lock_conn, "wp_publisher_lock", 1)
         lock_cursor.execute.assert_called_once_with(
             "SELECT IS_USED_LOCK(%s)",
@@ -557,7 +564,8 @@ class AdvisoryLockTests(unittest.TestCase):
             patch.object(publisher, "_release_lock", return_value=True) as release_lock,
             patch.object(publisher, "_count_due_now", return_value=0),
         ):
-            publisher.publish_news_to_wp()
+            result = publisher.publish_news_to_wp()
+        self.assertEqual(result["status"], "no_work")
         get_lock.assert_called_once_with(lock_conn, "wp_publisher_lock", 1)
         release_lock.assert_called_once_with(lock_conn, "wp_publisher_lock")
         lock_conn.close.assert_called_once_with()

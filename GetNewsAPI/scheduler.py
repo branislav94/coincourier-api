@@ -2,10 +2,11 @@
 
 
 """
-APScheduler orchestration.
+Development-only APScheduler compatibility orchestration.
 
 Starts the fetcher scheduler and runs a chained processor/publisher job on an interval.
 The chained job processes stored news with GPT and then publishes the results to WordPress.
+Production rejects ENABLE_APSCHEDULER=true and delegates recurrence to an external scheduler.
 
 Side effects:
 - Spawns background scheduler threads via APScheduler.
@@ -19,8 +20,7 @@ from datetime import datetime, timedelta
 
 from fetcher import start_scheduler as start_fetcher_scheduler
 from fetcher import stop_scheduler as stop_fetcher_scheduler
-from gpt_processor import process_news_with_gpt
-from publish_to_wp import publish_news_to_wp
+from operations.jobs import render_job_result, run_job
 from runtime.logging_config import configure_logging
 
 
@@ -33,48 +33,15 @@ _scheduler_lock = threading.Lock()
 
 
 def chained_job():
-    """
-    Run the processing and publishing pipeline in sequence.
+    """Run the repository-owned process-then-publish one-shot contract."""
 
-    Executes:
-        1) `process_news_with_gpt()` to transform/prepare stored news content.
-        2) `publish_news_to_wp()` to publish prepared items to WordPress.
-
-    Behavior:
-        - Logs start/end markers for each stage.
-        - Catches and logs exceptions for each stage independently so a failure in
-          processing does not prevent the publish stage from attempting to run.
-
-    Args:
-        None
-
-    Returns:
-        None
-    """
-    logging.info("▶ starting chained job")
-    logging.info("Starting process_news_with_gpt job.")
-    try:
-        result = process_news_with_gpt()
-        attempted = int((result or {}).get("attempted", 0))
-        succeeded = int((result or {}).get("succeeded", 0))
-        failed = int((result or {}).get("failed", 0))
-        if attempted == 0:
-            logging.info("Finished processing news with GPT: no eligible articles.")
-        elif failed == 0:
-            logging.info("Finished processing news with GPT successfully: %s", result)
-        elif succeeded == 0:
-            logging.error("Finished processing news with GPT: all attempted articles failed: %s", result)
-        else:
-            logging.warning("Finished processing news with GPT with partial failures: %s", result)
-    except Exception:
-        logging.exception("Error during process_news_with_gpt")
-
-    logging.info("Starting publish_news_to_wp job.")
-    try:
-        publish_news_to_wp()
-        logging.info("Finished publishing news to WordPress successfully.")
-    except Exception:
-        logging.exception("Error during publish_news_to_wp")
+    result = run_job("pipeline_once")
+    rendered = render_job_result(result)
+    if result.exit_code:
+        logging.error("Legacy APScheduler pipeline one-shot failed result=%s", rendered)
+    else:
+        logging.info("Legacy APScheduler pipeline one-shot finished result=%s", rendered)
+    return result
 
         
 def start_scheduler():

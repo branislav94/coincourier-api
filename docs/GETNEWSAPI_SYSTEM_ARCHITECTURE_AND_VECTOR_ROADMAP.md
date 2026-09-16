@@ -361,17 +361,22 @@ stateDiagram-v2
 
 Before migration the rich/raw relationship remains a URL join. The additive migration backfills and uniquely indexes `raw_article_id` only after collision preflight, and adds local WordPress identity without removing legacy fields.
 
-## 16. Scheduler, cron and advisory locks
+## 16. Scheduler, one-shot jobs and advisory locks
 
 **CURRENT**
 
-| Stage | In-process overlap control | Cross-process control | Scope/gap |
+| Job | Production owner | Cross-process control | Contract |
 |---|---|---|---|
-| Fetch | APScheduler `max_instances=1` | MariaDB `news_fetcher_lock` | robust while lock connection lives (`fetcher.py:1146-1279`) |
-| Process | chained scheduler `max_instances=1` only | none | external cron/manual calls can select the same rows concurrently |
-| Publish | chained scheduler `max_instances=1` | MariaDB `wp_publisher_lock` | prevents overlap, not post-create crash duplicates (`publish_to_wp.py:1671-1790`) |
+| Fetch | external `fetch_once` schedule | existing app-DB `news_fetcher_lock` | one bounded run; contention skips |
+| Process/publish | external `pipeline_once` schedule | app-DB `getnewsapi:job:v1:pipeline-workflow:*`; publish retains `wp_publisher_lock` | process then publish; unsafe overlaps and manual process/publish conflicts skip |
+| Embedding ingest/backfill | external rollout/manual invocation | vector-DB `getnewsapi:job:v1:embedding-registration:*` | serialized registration scans |
+| Embedding worker | external rollout invocation | durable row claims | parallel workers supported; no global job lock |
 
-Both local and CLI chained modes isolate processing failure from publishing (`scheduler.py:46-69`; `tasks.py:43-56`). This is intentional backlog-draining behavior. No checked-in server cron definition proves whether APScheduler and cron are mutually exclusive in deployment; operators must ensure only one orchestration mode is enabled.
+Production rejects `ENABLE_APSCHEDULER=true`; the web container serves HTTP only.
+The local APScheduler remains for development compatibility and now delegates its
+chained run to the same `pipeline_once` contract. New advisory locks use dedicated
+autocommit connections, bounded waits, `finally` release, and disconnect release;
+their namespace is distinct from migration locks.
 
 ## 17. Failure handling and retries
 
@@ -822,8 +827,9 @@ dated articles. Backfill remains a separate manual invocation.
 Each operation logs count-only run metrics: scanned/registered/skipped documents,
 enqueued/existing jobs, claimed/completed/reconciled/retryable/failed/lost jobs,
 provider calls, embedded chunks, and token usage when supplied. No article text
-or vector is logged. External cron may eventually run `embedding_ingest` then
-`embedding_worker` every few minutes; no scheduler or deployment change exists.
+or vector is logged. Phase 7C2 exposes `embedding_ingest` and `embedding_worker`
+as bounded one-shot commands; no embedding cadence has been approved and
+scheduling remains a rollout decision.
 Phase 6C1 provides isolated semantic retrieval and offline evaluation. Phase 6C2A
 adds optional fail-open invocation and durable evidence, but a retrieved neighbor
 still carries no duplicate classification or publication effect. Calibration and
@@ -1047,9 +1053,9 @@ Each phase is intentionally deployable and reversible on its own.
   metrics are implemented locally. They are disabled and not deployed.
 - Switches: `VECTOR_ENABLED=false` and `EMBEDDING_ENABLED=false`; only explicit
   embedding task commands read them. No automatic pipeline path reads either one.
-- Eventual external cron sequence: run `embedding_ingest`, then
-  `embedding_worker`, every few minutes. Keep `embedding_backfill` manual and
-  separately bounded. APScheduler and deployment configuration remain unchanged.
+- Phase 7C2 external sequence: run bounded `embedding_ingest` before bounded
+  `embedding_worker` if those jobs are scheduled. Their cadence remains a rollout
+  decision. Keep `embedding_backfill` manual and separately bounded.
 - Rollback: leave the separate service absent/disabled; the application DB and
   deterministic pipeline remain independent.
 
@@ -1104,7 +1110,7 @@ Each phase is intentionally deployable and reversible on its own.
   a versioned shadow-only candidate policy merits separate implementation review.
 - No runtime threshold or enforcement is inherited from Phase 6C2B output.
 
-### Deployment Phase 7A/7B/7C1: packaging and migration operations
+### Deployment Phase 7A/7B/7C1/7C2: packaging and operations
 
 - Phase 7A completed the repository-only deployment audit without live access.
 - Phase 7B is implemented locally and not deployed. The production package uses a
@@ -1129,8 +1135,16 @@ Each phase is intentionally deployable and reversible on its own.
 - Normal apply excludes `005`, fresh-start utilities, and test fixtures. It is
   fail-fast, verifies before recording, never auto-baselines or auto-rolls back, and
   explicitly acknowledges MariaDB's non-atomic multi-DDL boundary.
-- Phase 7C2 remains planned and separate: bounded external one-shot scheduling,
-  job concurrency ownership, and feature activation are not implemented here.
+- Phase 7C2 is implemented locally and not deployed. A static job catalog exposes
+  bounded fetch, process-then-publish, embedding, and controlled manual commands
+  from the same image with typed results and deterministic exit status. Production
+  rejects APScheduler ownership; the external baseline preserves the existing
+  30-minute fetch and pipeline cadence with an approximately three-minute offset.
+- App/vector MariaDB conflict groups serialize unsafe workflow and registration
+  overlap without holding SQL transactions during provider work. Existing fetch
+  and publish locks remain; embedding workers retain parallel durable row claims.
+  Embedding cadence, deployment, migration execution, and all feature activation
+  remain unapproved. Phase 7D is still the final operator runbook.
 
 ### Phase 6: enforce high-confidence duplicate blocking
 
