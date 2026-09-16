@@ -573,7 +573,7 @@ and representative mocked request/response fixtures before implementation.
   shadow-policy evidence. Any threshold or policy wiring requires separate review;
   Phase 6C2B does not authorize enforcement.
 
-### Deployment Phase 7A/7B/7C1/7C2: Packaging and operations
+### Deployment Phase 7A/7B/7C1/7C2/7D: Packaging and operations
 
 - Phase 7A status: read-only deployment readiness audit completed; no environment
   or live service was accessed.
@@ -595,8 +595,9 @@ and representative mocked request/response fixtures before implementation.
 - Safety: `005`, fresh-start utilities, and test fixtures are excluded from normal
   apply. Untracked or partial schema blocks; no automatic baseline or rollback is
   attempted, and MariaDB DDL is not claimed to be transactionally atomic.
-- Contract: `docs/GETNEWSAPI_PRODUCTION_ENVIRONMENT.md` describes required secrets,
-  reverse-proxy attachment, state ownership, TLS, migration commands, and jobs.
+- Contract: `docs/GETNEWSAPI_PRODUCTION_ENVIRONMENT.md` describes lower-level
+  packaging, environment, TLS, migration, and job behavior. The authoritative
+  operator procedure is `docs/GETNEWSAPI_DEPLOYMENT_RUNBOOK.md`.
 - Phase 7C2 status: an explicit bounded job catalog and deterministic JSON results
   expose `fetch_once`, process-then-publish `pipeline_once`, embedding ingest/worker,
   and controlled manual commands from the same immutable image. Production rejects
@@ -606,7 +607,12 @@ and representative mocked request/response fixtures before implementation.
 - Scheduling: the external baseline preserves fetch every 30 minutes and pipeline
   about three minutes later. Embedding cadence is deliberately a rollout decision;
   backfill remains manual. No scheduler product, deployment, migration, or feature
-  activation is included. Phase 7D remains the final operator runbook.
+  activation is included.
+- Phase 7D status: the final DevOps/operator runbook is implemented locally. It
+  consolidates environment ownership, read-only preflight, backup/restore gates,
+  app/vector migration, immutable artifact use, staged DEV and production
+  activation, historical backfill, monitoring, and recovery. No live service was
+  accessed and no rehearsal occurred; Phase 7E remains separate.
 
 ### Phase 8: Optional gpt_processor extraction
 

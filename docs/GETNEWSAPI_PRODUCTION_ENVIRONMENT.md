@@ -3,9 +3,10 @@
 ## Scope
 
 This document describes the Phase 7B package, Phase 7C1 migration operations, and
-the Phase 7C2 external one-shot job contract. It is a configuration and command
-contract, not the final deployment runbook. No deployment has been performed and
-no scheduler product has been configured.
+the Phase 7C2 external one-shot job contract. It remains the lower-level
+configuration and packaging reference. The authoritative procedural guide is
+`docs/GETNEWSAPI_DEPLOYMENT_RUNBOOK.md`. No deployment has been performed and no
+scheduler product has been configured.
 
 ## Topology
 
@@ -288,10 +289,15 @@ Compose intentionally defines no permanent worker or scheduler service. One-shot
 jobs never run migrations, change feature flags, or enable vector, embedding,
 semantic, durable-state, duplicate-shadow, or Image Search V2 behavior.
 
-## Phase 7D Boundary
+## Authoritative Deployment Runbook
 
-Phase 7D remains responsible for the final operator runbook: scheduler-product
-configuration, real secret and network placement, migration and backup/restore
-steps, staged feature activation, monitoring, rollback, and production ownership.
-Phase 7C2 does not deploy, access Dokploy, choose embedding cadence, or activate
-anything.
+Phase 7D is implemented locally as
+`docs/GETNEWSAPI_DEPLOYMENT_RUNBOOK.md`. That document is authoritative for
+environment ownership, DEV and production preflight, backup/restore gates,
+migration sequencing, one-shot jobs, staged feature activation, monitoring,
+disable/recovery actions, and DEV-to-production promotion. This file remains the
+lower-level environment contract.
+
+Phase 7D was documentation-only: it did not deploy, access Dokploy, connect to a
+live service, execute a migration, choose an embedding cadence, or activate a
+feature. Phase 7E remains the separate clean-room or remote-DEV rehearsal.

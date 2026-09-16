@@ -1110,7 +1110,7 @@ Each phase is intentionally deployable and reversible on its own.
   a versioned shadow-only candidate policy merits separate implementation review.
 - No runtime threshold or enforcement is inherited from Phase 6C2B output.
 
-### Deployment Phase 7A/7B/7C1/7C2: packaging and operations
+### Deployment Phase 7A/7B/7C1/7C2/7D: packaging and operations
 
 - Phase 7A completed the repository-only deployment audit without live access.
 - Phase 7B is implemented locally and not deployed. The production package uses a
@@ -1125,8 +1125,9 @@ Each phase is intentionally deployable and reversible on its own.
   is container-native, file logging is opt-in, DB TLS controls are explicit, and
   runtime dependencies are pinned. Every existing feature flag remains false and
   image search remains V1.
-- The complete Phase 7B contract is in
-  `docs/GETNEWSAPI_PRODUCTION_ENVIRONMENT.md`.
+- The lower-level Phase 7B environment contract is in
+  `docs/GETNEWSAPI_PRODUCTION_ENVIRONMENT.md`; the authoritative operator
+  procedure is `docs/GETNEWSAPI_DEPLOYMENT_RUNBOOK.md`.
 - Phase 7C1 is implemented locally and not deployed. Explicit app/vector manifests
   pin order, target, kind, dependency, and checksum. Read-only plan/check/verify,
   explicit apply, operator backup/restore attestations, target guards, MariaDB
@@ -1144,7 +1145,12 @@ Each phase is intentionally deployable and reversible on its own.
   overlap without holding SQL transactions during provider work. Existing fetch
   and publish locks remain; embedding workers retain parallel durable row claims.
   Embedding cadence, deployment, migration execution, and all feature activation
-  remain unapproved. Phase 7D is still the final operator runbook.
+  remain unapproved.
+- Phase 7D is implemented locally as a documentation-only deployment runbook. It
+  defines local-against-remote-DEV, remote DEV, and production procedures;
+  independent migration preflight; backup/restore attestations; staged feature
+  enablement; bounded backfill; monitoring; and disable/recovery actions. No live
+  rehearsal or activation occurred. Phase 7E remains separate.
 
 ### Phase 6: enforce high-confidence duplicate blocking
 
