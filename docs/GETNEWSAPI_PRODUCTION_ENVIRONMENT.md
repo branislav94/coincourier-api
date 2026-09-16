@@ -34,18 +34,25 @@ database only after that feature is explicitly enabled.
 
 ## Production Environment
 
-Keep the real production environment file outside the repository and Docker build
-context. Supply its path explicitly, for example:
+Keep two production files outside the repository and Docker build context:
+
+- an application runtime file based on `.env.example`;
+- a Compose interpolation/provisioning file based on
+  `.env.provisioning.example`.
+
+The provisioning file sets `GETNEWSAPI_RUNTIME_ENV_FILE` to the runtime file's
+absolute path. Validate from the repository root without rendering resolved
+environment values:
 
 ```text
-GETNEWSAPI_ENV_FILE=/secure/path/getnewsapi.env docker compose \
-  --env-file /secure/path/getnewsapi.env \
-  -f docker-compose.prod.yml config
+docker compose --env-file /secure/path/getnewsapi-provisioning.env \
+  -f docker-compose.prod.yml config --quiet
 ```
 
-`.env.example` is the complete sanitized reference. Blank values in that file are
-secrets or environment-specific inputs. `python tasks.py config_check web` validates
-the effective web configuration without opening a network or database connection.
+`.env.example` is the complete sanitized application-runtime reference. Blank
+values in that file are secrets or environment-specific inputs. From the
+repository root, `python GetNewsAPI/tasks.py config_check web` validates the
+effective web configuration without opening a network or database connection.
 Additional offline profiles are `fetch`, `process`, `pipeline`, `publish`,
 `embedding`, `embedding_ingest`, `embedding_worker`, and `embedding_backfill`.
 
@@ -53,6 +60,12 @@ The web profile requires application DB settings and `PUBLISH_API_TOKEN`. Pipeli
 and publishing profiles add only the credentials their operations need. Disabled
 vector, embedding, semantic, and provider integrations do not become startup
 credential requirements.
+
+WordPress REST calls use the centralized Requests timeout tuple
+`WP_HTTP_CONNECT_TIMEOUT_SECONDS=10` and `WP_HTTP_READ_TIMEOUT_SECONDS=60`.
+Configuration validation accepts only positive values up to 60 and 300 seconds,
+respectively. A mutating read timeout is not immediately retried; the next
+durable attempt runs existing post/media reconciliation first.
 
 ## Safe Initial State
 
@@ -122,7 +135,8 @@ are shipped by the image, and HTTPS provider verification is unchanged.
 
 ## Vector Provisioning
 
-Compose requires all provisioning values and supplies no password defaults:
+The protected provisioning file supplies these values only to Compose
+interpolation and the vector MariaDB service, with no password defaults:
 
 ```text
 VECTOR_MARIADB_DATABASE
@@ -131,10 +145,13 @@ VECTOR_MARIADB_PASSWORD
 VECTOR_MARIADB_ROOT_PASSWORD
 ```
 
-It maps database/name/user/password into the corresponding `VECTOR_DB_*`
-application settings and fixes `VECTOR_DB_HOST=getnewsapi-vector-mariadb` and
-`VECTOR_DB_PORT=3306`. The named `getnewsapi-vector-data` volume persists database
-files. The vector port is never published to the host.
+The separate runtime file supplies `VECTOR_DB_NAME`, `VECTOR_DB_USER`, and
+`VECTOR_DB_PASSWORD`; they must identify the same non-root application account
+created from the provisioning values. Compose fixes
+`VECTOR_DB_HOST=getnewsapi-vector-mariadb` and `VECTOR_DB_PORT=3306` for the web
+service. `VECTOR_MARIADB_ROOT_PASSWORD` never enters the web or one-shot job
+environment. The named `getnewsapi-vector-data` volume persists database files,
+and the vector port is never published to the host.
 
 ## Migration Resources
 
@@ -158,7 +175,7 @@ Use the same immutable application image for one-shot operations. No source or S
 bind mount and no special migration image are required:
 
 ```text
-docker compose --env-file /secure/path/getnewsapi.env \
+docker compose --env-file /secure/path/getnewsapi-provisioning.env \
   -f docker-compose.prod.yml run --rm getnewsapi-web \
   python tasks.py migration_plan app
 ```
@@ -230,11 +247,12 @@ The supported jobs are:
 | `publish` | manual | application/WordPress DB, WordPress REST, and configured image providers | `PUBLISH_BATCH_MAX` | shares `pipeline-workflow`, then retains `wp_publisher_lock` |
 | `embedding_ingest` | rollout decision | application and vector DB; no embedding provider call | default `EMBEDDING_INGEST_LIMIT=25`, maximum 1000 | vector-DB `embedding-registration` job lock |
 | `embedding_worker` | rollout decision | application/vector DB and configured embedding provider | default `EMBEDDING_WORK_LIMIT=5`, maximum 100 jobs; `EMBEDDING_MAX_CHUNKS_PER_JOB=100` by default | no global job lock; durable row claims support parallel workers |
-| `embedding_backfill` | manual | application and vector DB; no embedding provider call | default limit 25, maximum 1000; keyset pages default to 100 | shares vector-DB `embedding-registration` |
+| `embedding_backfill` | manual | application and vector DB; no embedding provider call | default/maximum changed registrations 25/1000; 100-row keyset pages do not impose a total scan ceiling | shares vector-DB `embedding-registration` |
 
-Every command performs one bounded run and terminates. No command creates an
-internal loop, daemon, or recurring scheduler. The recommended production
-commands are:
+Every command performs one terminating run. Output work is bounded as listed;
+historical backfill may scan prior history to find its bounded changed
+registrations. No command creates a daemon or recurring scheduler. The
+recommended production commands are:
 
 ```text
 python tasks.py fetch_once
@@ -276,11 +294,11 @@ and persistent `/data` mounts as the web service. No source mount or special wor
 image is required:
 
 ```text
-docker compose --env-file /secure/path/getnewsapi.env \
+docker compose --env-file /secure/path/getnewsapi-provisioning.env \
   -f docker-compose.prod.yml run --rm getnewsapi-web \
   python tasks.py fetch_once
 
-docker compose --env-file /secure/path/getnewsapi.env \
+docker compose --env-file /secure/path/getnewsapi-provisioning.env \
   -f docker-compose.prod.yml run --rm getnewsapi-web \
   python tasks.py pipeline_once
 ```

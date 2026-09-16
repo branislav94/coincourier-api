@@ -1698,6 +1698,7 @@ class WordPressPublisher:
         response = session.post(
             f"{WP_API_URL}/wp-json/wp/v2/posts",
             json=post_data,
+            timeout=wordpress_client.WP_HTTP_TIMEOUT,
         )
         if response.status_code != 201:
             error_text = response.text

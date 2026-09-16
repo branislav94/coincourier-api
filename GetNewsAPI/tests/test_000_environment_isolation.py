@@ -87,7 +87,7 @@ class EnvironmentIsolationTests(unittest.TestCase):
         self.assertEqual(environment["DB_NAME"], "explicit_disposable_test")
         self.assertEqual(environment["RUN_GROK_TEXT_SMOKE"], "false")
         self.assertEqual(environment["RUN_GROK_IMAGE_SMOKE"], "false")
-        self.assertEqual(environment["GETNEWSAPI_ENV_FILE"], ".env.example")
+        self.assertEqual(environment["GETNEWSAPI_RUNTIME_ENV_FILE"], ".env.example")
         self.assertNotIn("UNRELATED_PARENT_SECRET", environment)
 
 

@@ -175,6 +175,7 @@ class CompatibilityTests(unittest.TestCase):
         replacement.get.assert_called_once_with(
             "https://patched.example/wp-json/wp/v2/categories",
             params={"slug": "markets"},
+            timeout=client.WP_HTTP_TIMEOUT,
         )
 
     def test_new_media_owner_patch_controls_legacy_helper(self):
@@ -216,6 +217,7 @@ class WordPressClientTests(unittest.TestCase):
                 "Content-Type": "image/jpeg",
             },
             data=b"image-bytes",
+            timeout=client.WP_HTTP_TIMEOUT,
         )
 
     def test_media_retry_behavior_preserves_supported_statuses(self):
@@ -239,10 +241,10 @@ class WordPressClientTests(unittest.TestCase):
                 self.assertEqual(http_session.post.call_count, 2)
                 sleep.assert_called_once_with(10)
 
-    def test_media_retry_preserves_request_exception_behavior(self):
+    def test_connect_timeout_can_retry_before_mutation_is_sent(self):
         http_session = Mock()
         http_session.post.side_effect = [
-            requests.ConnectionError("temporary"),
+            requests.ConnectTimeout("connection not established"),
             response(status=201),
         ]
         with (
@@ -251,7 +253,38 @@ class WordPressClientTests(unittest.TestCase):
         ):
             result = client.post_with_retries(http_session, "https://wp.example/media")
         self.assertEqual(result.status_code, 201)
+        self.assertEqual(http_session.post.call_count, 2)
         sleep.assert_called_once_with(10)
+
+    def test_read_timeout_is_not_retried_after_ambiguous_mutation(self):
+        http_session = Mock()
+        http_session.post.side_effect = [
+            requests.ReadTimeout("response not received"),
+            response(status=201),
+        ]
+        with (
+            patch.object(client.time, "sleep") as sleep,
+            patch("builtins.print"),
+            self.assertRaises(requests.ReadTimeout),
+        ):
+            client.post_with_retries(http_session, "https://wp.example/media")
+        self.assertEqual(http_session.post.call_count, 1)
+        sleep.assert_not_called()
+
+    def test_generic_request_exception_is_not_retried(self):
+        http_session = Mock()
+        http_session.post.side_effect = [
+            requests.RequestException("ambiguous failure"),
+            response(status=201),
+        ]
+        with (
+            patch.object(client.time, "sleep") as sleep,
+            patch("builtins.print"),
+            self.assertRaises(requests.RequestException),
+        ):
+            client.post_with_retries(http_session, "https://wp.example/media")
+        self.assertEqual(http_session.post.call_count, 1)
+        sleep.assert_not_called()
 
     def test_media_retry_zero_attempts_preserves_implicit_none(self):
         http_session = Mock()
@@ -280,6 +313,7 @@ class WordPressClientTests(unittest.TestCase):
                 "caption": "c" * 500,
                 "description": "d" * 1000,
             },
+            timeout=client.WP_HTTP_TIMEOUT,
         )
         http_response.raise_for_status.assert_called_once_with()
 
@@ -296,6 +330,7 @@ class TaxonomyTests(unittest.TestCase):
         get.assert_called_once_with(
             f"{taxonomy.WP_API_URL}/wp-json/wp/v2/categories",
             params={"slug": "market-news"},
+            timeout=client.WP_HTTP_TIMEOUT,
         )
         post.assert_not_called()
 
@@ -311,6 +346,7 @@ class TaxonomyTests(unittest.TestCase):
         post.assert_called_once_with(
             f"{taxonomy.WP_API_URL}/wp-json/wp/v2/categories",
             json={"name": "Market News", "slug": "market-news"},
+            timeout=client.WP_HTTP_TIMEOUT,
         )
 
     def test_tag_creation_request_remains_equivalent(self):
@@ -325,10 +361,12 @@ class TaxonomyTests(unittest.TestCase):
         get.assert_called_once_with(
             f"{taxonomy.API_BASE}/wp-json/wp/v2/tags",
             params={"slug": "bitcoin-etf"},
+            timeout=client.WP_HTTP_TIMEOUT,
         )
         post.assert_called_once_with(
             f"{taxonomy.API_BASE}/wp-json/wp/v2/tags",
             json={"name": "Bitcoin ETF", "slug": "bitcoin-etf"},
+            timeout=client.WP_HTTP_TIMEOUT,
         )
 
 
@@ -491,6 +529,42 @@ class WordPressPublisherTests(unittest.TestCase):
             post.call_args.args[0],
             f"{publisher.WP_API_URL}/wp-json/wp/v2/posts",
         )
+        self.assertEqual(
+            post.call_args.kwargs["timeout"],
+            client.WP_HTTP_TIMEOUT,
+        )
+
+    def test_post_read_timeout_is_not_immediately_retried(self):
+        adapter = publisher.WordPressPublisher()
+        with (
+            patch.object(adapter, "reconcile", return_value=None),
+            patch.object(publisher, "ensure_category", return_value=21),
+            patch.object(publisher, "ensure_term", return_value=31),
+            patch.object(
+                publisher.session,
+                "post",
+                side_effect=requests.ReadTimeout("ambiguous post outcome"),
+            ) as post,
+            self.assertRaises(requests.ReadTimeout),
+        ):
+            adapter.publish(self.article, None, self.context)
+        post.assert_called_once()
+        self.assertEqual(post.call_args.kwargs["timeout"], client.WP_HTTP_TIMEOUT)
+
+    def test_reconciliation_short_circuits_post_creation(self):
+        reconciled = publisher.PublicationResult(
+            success=True,
+            external_id=101,
+            reconciled=True,
+        )
+        adapter = publisher.WordPressPublisher()
+        with (
+            patch.object(adapter, "reconcile", return_value=reconciled),
+            patch.object(publisher.session, "post") as post,
+        ):
+            result = adapter.publish(self.article, None, self.context)
+        self.assertIs(result, reconciled)
+        post.assert_not_called()
 
     def test_successful_post_returns_success_for_batch_state_update(self):
         result, _mocks, _connection, _events = self.publish_with_mocks()

@@ -98,6 +98,8 @@ secret channel.
 ### WordPress
 
 - [ ] DEV/production `WP_API_URL`, `WP_USERNAME`, and `WP_APP_PASSWORD`
+- [ ] `WP_HTTP_CONNECT_TIMEOUT_SECONDS` and `WP_HTTP_READ_TIMEOUT_SECONDS`
+  reviewed; defaults are 10 and 60 seconds
 - [ ] `WP_DB_HOST`, `WP_DB_PORT`, `WP_DB_NAME`, `WP_DB_USER`, and `WP_DB_PASSWORD`
 - [ ] WordPress DB TLS/CA/verification policy through `WP_DB_SSL_*`
 - [ ] REST HTTPS trust, network routes, and DB firewall access
@@ -108,6 +110,9 @@ secret channel.
 - [ ] MariaDB 11.8 with native vector capability
 - [ ] `VECTOR_DB_HOST`, `VECTOR_DB_PORT`, `VECTOR_DB_NAME`, `VECTOR_DB_USER`, and
   `VECTOR_DB_PASSWORD`
+- [ ] Separate `VECTOR_MARIADB_DATABASE`, `VECTOR_MARIADB_USER`,
+  `VECTOR_MARIADB_PASSWORD`, and `VECTOR_MARIADB_ROOT_PASSWORD` supplied only to
+  Compose provisioning; root credentials are absent from application runtime
 - [ ] Database name is `coincourier_vectors`, or a guarded disposable name that
   starts with `coincourier_vectors_` and ends with `_test`
 - [ ] TLS/CA/verification policy through `VECTOR_DB_SSL_*`
@@ -141,12 +146,14 @@ secret channel.
 
 ## Secrets And Local Environment Files
 
-For direct source execution, the runtime calls `load_dotenv()` with the standard
-filename. Run commands from `GetNewsAPI` and place the ignored local configuration
-at `GetNewsAPI/.env`. Do not invent `.env.dev.local`; the current runtime does not
-select it automatically. If `GetNewsAPI/.env` already exists, do not overwrite it.
-Use `.env.example` only as the sanitized field reference and populate secrets via
-the approved secret workflow.
+Run every checkout command in this runbook from the repository root. Direct
+source task commands use `python GetNewsAPI/tasks.py ...`; the web process uses
+`python GetNewsAPI/app.py`. The runtime calls `load_dotenv()` with the standard
+filename and finds the ignored configuration at `GetNewsAPI/.env`. Do not invent
+`.env.dev.local`; the current runtime does not select it automatically. If
+`GetNewsAPI/.env` already exists, do not overwrite it. Use `.env.example` only as
+the sanitized application-runtime reference and populate secrets through the
+approved secret workflow.
 
 The development `docker-compose.yml` reads the ignored repository-root `.env` and
 bind-mounts source. This is convenient for local development but is not the
@@ -188,9 +195,8 @@ docker image inspect getnewsapi:<git-sha> --format '{{json .RepoDigests}}'
 A local source process against remote DEV uses the local environment file:
 
 ```text
-cd GetNewsAPI
-python tasks.py config_check web
-python app.py
+python GetNewsAPI/tasks.py config_check web
+python GetNewsAPI/app.py
 ```
 
 An immutable local container against the same remote services uses:
@@ -202,20 +208,25 @@ docker run --rm --env-file GetNewsAPI/.env \
 
 Remote DEV uses the same image, command, and `/data` contract. DevOps changes only
 environment-specific endpoints, secrets, networks, storage, and proxy attachment.
-The production Compose file is the production-shaped reference and can run its
-bundled private vector service:
+Production Compose uses two external files: an application runtime file based on
+`.env.example`, and a Compose interpolation/provisioning file based on
+`.env.provisioning.example`. Only the runtime file enters `getnewsapi-web`; the
+provisioning file points to it through `GETNEWSAPI_RUNTIME_ENV_FILE` and supplies
+the vector MariaDB service credentials. From the repository root:
 
 ```text
-GETNEWSAPI_IMAGE=registry.example/getnewsapi:<git-sha> \
-GETNEWSAPI_ENV_FILE=/secure/path/getnewsapi.env \
-docker compose --env-file /secure/path/getnewsapi.env \
-  -f docker-compose.prod.yml config
+docker compose --env-file /secure/path/getnewsapi-provisioning.env \
+  -f docker-compose.prod.yml config --quiet
 
-GETNEWSAPI_IMAGE=registry.example/getnewsapi:<git-sha> \
-GETNEWSAPI_ENV_FILE=/secure/path/getnewsapi.env \
-docker compose --env-file /secure/path/getnewsapi.env \
+docker compose --env-file /secure/path/getnewsapi-provisioning.env \
   -f docker-compose.prod.yml up -d --no-build
 ```
+
+The protected provisioning file must set the immutable `GETNEWSAPI_IMAGE`,
+`GETNEWSAPI_RUNTIME_ENV_FILE=/secure/path/getnewsapi-runtime.env`, optional edge
+network, and `VECTOR_MARIADB_*` values. Never pass the provisioning file as a
+container `env_file`, and never place `VECTOR_MARIADB_ROOT_PASSWORD` in the
+runtime file.
 
 The unmodified production Compose contract fixes `VECTOR_DB_HOST` to its bundled
 `getnewsapi-vector-mariadb` service. A DevOps deployment using an external remote
@@ -227,8 +238,7 @@ Run one-shot commands from the immutable image with the same effective
 configuration. For the production Compose topology:
 
 ```text
-GETNEWSAPI_ENV_FILE=/secure/path/getnewsapi.env docker compose \
-  --env-file /secure/path/getnewsapi.env \
+docker compose --env-file /secure/path/getnewsapi-provisioning.env \
   -f docker-compose.prod.yml run --rm getnewsapi-web \
   python tasks.py job_catalog
 ```
@@ -252,11 +262,11 @@ five `VECTOR_DB_*` connection values and TLS settings locally and in remote DEV.
 GetNewsAPI owns the schema workflow:
 
 ```text
-python tasks.py migration_plan vector
-python tasks.py migration_check vector
-python tasks.py migration_verify vector
-python tasks.py migration_apply vector --backup-confirmed --restore-tested
-python tasks.py migration_verify vector
+python GetNewsAPI/tasks.py migration_plan vector
+python GetNewsAPI/tasks.py migration_check vector
+python GetNewsAPI/tasks.py migration_verify vector
+python GetNewsAPI/tasks.py migration_apply vector --backup-confirmed --restore-tested
+python GetNewsAPI/tasks.py migration_verify vector
 ```
 
 Run the first three commands before the apply command. A persistent remote DEV
@@ -293,7 +303,7 @@ For an explicitly disposable test database, set the Compose provisioning name to
 `APP_ENV=test` and `MIGRATION_TEST_MODE=true`, and apply only with:
 
 ```text
-python tasks.py migration_apply vector --allow-disposable
+python GetNewsAPI/tasks.py migration_apply vector --allow-disposable
 ```
 
 Non-production apply additionally refuses any connected database name that does
@@ -310,21 +320,21 @@ data. Local fallback success does not replace remote DEV verification.
 ## First Contact: Read-Only Preflight
 
 The first contact with each real DEV or production environment is read-only.
-From `GetNewsAPI`, or through the equivalent immutable-image wrapper, run:
+From the repository root, or through the equivalent immutable-image wrapper, run:
 
 ```text
-python tasks.py config_check web
-python tasks.py config_check pipeline
+python GetNewsAPI/tasks.py config_check web
+python GetNewsAPI/tasks.py config_check pipeline
 
-python tasks.py migration_plan app
-python tasks.py migration_check app
-python tasks.py migration_verify app
+python GetNewsAPI/tasks.py migration_plan app
+python GetNewsAPI/tasks.py migration_check app
+python GetNewsAPI/tasks.py migration_verify app
 
-python tasks.py migration_plan vector
-python tasks.py migration_check vector
-python tasks.py migration_verify vector
+python GetNewsAPI/tasks.py migration_plan vector
+python GetNewsAPI/tasks.py migration_check vector
+python GetNewsAPI/tasks.py migration_verify vector
 
-python tasks.py feature_readiness
+python GetNewsAPI/tasks.py feature_readiness
 ```
 
 `config_check` is offline. The migration inspection and readiness commands open
@@ -385,11 +395,11 @@ The exact application execution sequence is:
 Execute:
 
 ```text
-python tasks.py migration_plan app
-python tasks.py migration_check app
-python tasks.py migration_apply app --backup-confirmed --restore-tested
-python tasks.py migration_verify app
-python tasks.py migration_apply app --backup-confirmed --restore-tested
+python GetNewsAPI/tasks.py migration_plan app
+python GetNewsAPI/tasks.py migration_check app
+python GetNewsAPI/tasks.py migration_apply app --backup-confirmed --restore-tested
+python GetNewsAPI/tasks.py migration_verify app
+python GetNewsAPI/tasks.py migration_apply app --backup-confirmed --restore-tested
 ```
 
 The second apply must report `NO_PENDING_MIGRATIONS` and perform no duplicate
@@ -424,11 +434,11 @@ backup/restore gate, approval, and vector-dependent flags off.
 Execute:
 
 ```text
-python tasks.py migration_plan vector
-python tasks.py migration_check vector
-python tasks.py migration_apply vector --backup-confirmed --restore-tested
-python tasks.py migration_verify vector
-python tasks.py migration_apply vector --backup-confirmed --restore-tested
+python GetNewsAPI/tasks.py migration_plan vector
+python GetNewsAPI/tasks.py migration_check vector
+python GetNewsAPI/tasks.py migration_apply vector --backup-confirmed --restore-tested
+python GetNewsAPI/tasks.py migration_verify vector
+python GetNewsAPI/tasks.py migration_apply vector --backup-confirmed --restore-tested
 ```
 
 Verification must cover all three migrations, including the native index and
@@ -471,22 +481,23 @@ Do not add or assume a new authentication system during this rollout.
 
 ## Operational Jobs And Scheduler
 
-Every job is bounded, runs once, emits structured JSON, and exits. Inspect the
-offline catalog with:
+Every job runs once, emits structured JSON, and exits. Output work is bounded as
+listed below; historical backfill can scan older rows to find that bounded work.
+Inspect the offline catalog with:
 
 ```text
-python tasks.py job_catalog
+python GetNewsAPI/tasks.py job_catalog
 ```
 
 | Command | Class | Key behavior |
 |---|---|---|
-| `python tasks.py fetch_once` | Recurring baseline | Fetch, score, persist, and schedule one bounded candidate pool |
-| `python tasks.py pipeline_once` | Recurring baseline | Process one bounded due batch, then publish one bounded due batch |
-| `python tasks.py embedding_ingest [limit]` | Rollout decision | Register recent source/generated documents and jobs; no embedding provider call |
-| `python tasks.py embedding_worker [limit]` | Rollout decision | Claim and execute bounded embedding jobs; provider calls occur |
-| `python tasks.py process` | Manual | Process one bounded due batch |
-| `python tasks.py publish` | Manual | Publish one bounded due batch |
-| `python tasks.py embedding_backfill [source|generated] [limit]` | Manual | Register a bounded deterministic historical scan; no provider call |
+| `python GetNewsAPI/tasks.py fetch_once` | Recurring baseline | Fetch, score, persist, and schedule one bounded candidate pool |
+| `python GetNewsAPI/tasks.py pipeline_once` | Recurring baseline | Process one bounded due batch, then publish one bounded due batch |
+| `python GetNewsAPI/tasks.py embedding_ingest [limit]` | Rollout decision | Register recent source/generated documents and jobs; no embedding provider call |
+| `python GetNewsAPI/tasks.py embedding_worker [limit]` | Rollout decision | Claim and execute bounded embedding jobs; provider calls occur |
+| `python GetNewsAPI/tasks.py process` | Manual | Process one bounded due batch |
+| `python GetNewsAPI/tasks.py publish` | Manual | Publish one bounded due batch |
+| `python GetNewsAPI/tasks.py embedding_backfill [source|generated] [limit]` | Manual | Register up to the limit of changed versions while scanning deterministic history; no provider call |
 
 `fetch` aliases `fetch_once`; `chained` aliases `pipeline_once`. Prefer the
 explicit names in scheduler configuration.
@@ -522,17 +533,17 @@ Revert or stop at the first unexplained result.
 Keep every rollout flag false and APScheduler off.
 
 ```text
-python tasks.py config_check web
-python tasks.py config_check pipeline
-python tasks.py migration_plan app
-python tasks.py migration_check app
-python tasks.py migration_verify app
-python tasks.py migration_plan vector
-python tasks.py migration_check vector
-python tasks.py migration_verify vector
-python tasks.py feature_readiness
-python tasks.py job_catalog
-python tasks.py --help
+python GetNewsAPI/tasks.py config_check web
+python GetNewsAPI/tasks.py config_check pipeline
+python GetNewsAPI/tasks.py migration_plan app
+python GetNewsAPI/tasks.py migration_check app
+python GetNewsAPI/tasks.py migration_verify app
+python GetNewsAPI/tasks.py migration_plan vector
+python GetNewsAPI/tasks.py migration_check vector
+python GetNewsAPI/tasks.py migration_verify vector
+python GetNewsAPI/tasks.py feature_readiness
+python GetNewsAPI/tasks.py job_catalog
+python GetNewsAPI/tasks.py --help
 ```
 
 Validate `/health`, `/ready`, approved DB/VPN/TLS routes, proxy behavior, log
@@ -546,8 +557,8 @@ After migrations are verified and an explicit live DEV/provider/WordPress test i
 approved, invoke from the selected source checkout or immutable image:
 
 ```text
-python tasks.py fetch_once
-python tasks.py pipeline_once
+python GetNewsAPI/tasks.py fetch_once
+python GetNewsAPI/tasks.py pipeline_once
 ```
 
 Inspect bounded counts, exit status, raw article persistence, scoring and schedule
@@ -624,24 +635,29 @@ uses eligible selected source rows and generated rich rows. `generated` backfill
 requires source linkage. Both registration commands are idempotent and make no
 provider call; the worker performs embedding calls.
 
-Use bounded waves, never an unbounded all-at-once run:
+Use small controlled registration waves. The limit bounds changed document/job
+registrations, not total historical rows scanned; a run may traverse prior
+history to find eligible changed versions:
 
 ```text
-python tasks.py embedding_backfill source 10
-python tasks.py embedding_worker 5
-python tasks.py migration_verify vector
+python GetNewsAPI/tasks.py embedding_backfill source 10
+python GetNewsAPI/tasks.py embedding_worker 5
+python GetNewsAPI/tasks.py migration_verify vector
 
-python tasks.py embedding_backfill source 100
-python tasks.py embedding_worker 10
-python tasks.py migration_verify vector
+python GetNewsAPI/tasks.py embedding_backfill source 100
+python GetNewsAPI/tasks.py embedding_worker 10
+python GetNewsAPI/tasks.py migration_verify vector
 ```
 
-The source/ingest/backfill default is 25 documents and maximum is 1000 per run;
-backfill keyset pages default to 100. The worker default is 5 and maximum is 100
-jobs per run, with 100 chunks per job by default. Choose each next wave only after
-reviewing registered/existing job counts, completed/retryable/failed/lost claims,
-provider calls and spend, dimensions, index behavior, latency, and storage growth.
-Repeat controlled waves until the approved high-water mark is complete.
+The ingest limit bounds documents considered for recent registration. For
+backfill, the default 25 and maximum 1000 bound changed registrations; the
+`EMBEDDING_BACKFILL_PAGE_SIZE=100` default controls each keyset read, not a total
+scan/page ceiling. Begin with small runs and measure DEV rows scanned, duration,
+database load, and cost behavior before approving larger registration limits.
+The worker default is 5 and maximum is 100 jobs per run, with 100 chunks per job
+by default. Choose each next wave only after reviewing registered/existing job
+counts, completed/retryable/failed/lost claims, provider calls and spend,
+dimensions, index behavior, latency, and storage growth.
 
 `source_article` is independent candidate evidence. `coincourier_generated` is
 derivative content and must never be treated as independent factual
@@ -659,7 +675,7 @@ VECTOR_ENABLED=true
 Restart/redeploy, check `/ready`, then run:
 
 ```text
-python tasks.py feature_readiness
+python GetNewsAPI/tasks.py feature_readiness
 ```
 
 Vector enablement makes vector-dependent paths and the vector readiness probe
@@ -681,9 +697,9 @@ EMBEDDING_ENABLED=true
 Start small:
 
 ```text
-python tasks.py config_check embedding
-python tasks.py embedding_ingest 10
-python tasks.py embedding_worker 5
+python GetNewsAPI/tasks.py config_check embedding
+python GetNewsAPI/tasks.py embedding_ingest 10
+python GetNewsAPI/tasks.py embedding_worker 5
 ```
 
 Verify `vector_documents`, durable jobs, completed chunks, exact model/version,
@@ -781,15 +797,15 @@ DEV success does not authorize production mutation. Start production with every
 rollout flag off and independently run:
 
 ```text
-python tasks.py config_check web
-python tasks.py config_check pipeline
-python tasks.py migration_plan app
-python tasks.py migration_check app
-python tasks.py migration_verify app
-python tasks.py migration_plan vector
-python tasks.py migration_check vector
-python tasks.py migration_verify vector
-python tasks.py feature_readiness
+python GetNewsAPI/tasks.py config_check web
+python GetNewsAPI/tasks.py config_check pipeline
+python GetNewsAPI/tasks.py migration_plan app
+python GetNewsAPI/tasks.py migration_check app
+python GetNewsAPI/tasks.py migration_verify app
+python GetNewsAPI/tasks.py migration_plan vector
+python GetNewsAPI/tasks.py migration_check vector
+python GetNewsAPI/tasks.py migration_verify vector
+python GetNewsAPI/tasks.py feature_readiness
 ```
 
 Production may be `pending`, `untracked_applied`, `ambiguous`, or `drift` even when
@@ -800,13 +816,13 @@ all blocked states through a separately reviewed plan.
 Only after approval, apply and verify one target at a time:
 
 ```text
-python tasks.py migration_apply app --backup-confirmed --restore-tested
-python tasks.py migration_verify app
-python tasks.py migration_apply app --backup-confirmed --restore-tested
+python GetNewsAPI/tasks.py migration_apply app --backup-confirmed --restore-tested
+python GetNewsAPI/tasks.py migration_verify app
+python GetNewsAPI/tasks.py migration_apply app --backup-confirmed --restore-tested
 
-python tasks.py migration_apply vector --backup-confirmed --restore-tested
-python tasks.py migration_verify vector
-python tasks.py migration_apply vector --backup-confirmed --restore-tested
+python GetNewsAPI/tasks.py migration_apply vector --backup-confirmed --restore-tested
+python GetNewsAPI/tasks.py migration_verify vector
+python GetNewsAPI/tasks.py migration_apply vector --backup-confirmed --restore-tested
 ```
 
 Both repeated applies must report `NO_PENDING_MIGRATIONS`. Stop on any nonzero
@@ -922,7 +938,8 @@ destinations where practical.
 - Do not enable every feature simultaneously.
 - Do not enable production APScheduler alongside an external scheduler.
 - Do not expose MariaDB publicly.
-- Do not run historical embedding backfill unbounded.
+- Do not run historical embedding backfill without a small controlled
+  registration limit and DEV scan/load measurement.
 - Do not treat CoinCourier-generated content as independent corroboration.
 - Do not choose a semantic duplicate cutoff from synthetic calibration data.
 - Do not use production as the first end-to-end validation environment.
@@ -931,27 +948,27 @@ destinations where practical.
 
 ## Command Quick Reference
 
-Run direct source commands from `GetNewsAPI`:
+Run direct source commands from the repository root:
 
 ```text
-python tasks.py config_check [web|fetch|process|pipeline|publish|embedding]
+python GetNewsAPI/tasks.py config_check [web|fetch|process|pipeline|publish|embedding]
 
-python tasks.py migration_plan [app|vector|all]
-python tasks.py migration_check [app|vector|all]
-python tasks.py migration_verify [app|vector|all]
-python tasks.py migration_apply [app|vector|all] \
+python GetNewsAPI/tasks.py migration_plan [app|vector|all]
+python GetNewsAPI/tasks.py migration_check [app|vector|all]
+python GetNewsAPI/tasks.py migration_verify [app|vector|all]
+python GetNewsAPI/tasks.py migration_apply [app|vector|all] \
   --backup-confirmed --restore-tested
-python tasks.py migration_apply [app|vector|all] --allow-disposable
-python tasks.py feature_readiness
+python GetNewsAPI/tasks.py migration_apply [app|vector|all] --allow-disposable
+python GetNewsAPI/tasks.py feature_readiness
 
-python tasks.py job_catalog
-python tasks.py fetch_once
-python tasks.py pipeline_once
-python tasks.py process
-python tasks.py publish
-python tasks.py embedding_ingest [limit]
-python tasks.py embedding_worker [limit]
-python tasks.py embedding_backfill [source|generated] [limit]
+python GetNewsAPI/tasks.py job_catalog
+python GetNewsAPI/tasks.py fetch_once
+python GetNewsAPI/tasks.py pipeline_once
+python GetNewsAPI/tasks.py process
+python GetNewsAPI/tasks.py publish
+python GetNewsAPI/tasks.py embedding_ingest [limit]
+python GetNewsAPI/tasks.py embedding_worker [limit]
+python GetNewsAPI/tasks.py embedding_backfill [source|generated] [limit]
 ```
 
 The disposable apply form also requires `APP_ENV=test`,
@@ -966,12 +983,10 @@ docker build --tag getnewsapi:<git-sha> .
 docker run --rm --env-file GetNewsAPI/.env \
   getnewsapi:<git-sha> python tasks.py <supported-command>
 
-GETNEWSAPI_ENV_FILE=/secure/path/getnewsapi.env docker compose \
-  --env-file /secure/path/getnewsapi.env \
-  -f docker-compose.prod.yml config
+docker compose --env-file /secure/path/getnewsapi-provisioning.env \
+  -f docker-compose.prod.yml config --quiet
 
-GETNEWSAPI_ENV_FILE=/secure/path/getnewsapi.env docker compose \
-  --env-file /secure/path/getnewsapi.env \
+docker compose --env-file /secure/path/getnewsapi-provisioning.env \
   -f docker-compose.prod.yml run --rm getnewsapi-web \
   python tasks.py <supported-command>
 
@@ -980,9 +995,11 @@ docker compose -f maintenance/vector/docker-compose.vector.yml ps
 docker compose -f maintenance/vector/docker-compose.vector.yml down
 ```
 
-Replace `<supported-command>` with one of the exact `tasks.py` forms above. The
-production Compose environment file must set `GETNEWSAPI_ENV_FILE` to its own
-external path and supply required `VECTOR_MARIADB_*` provisioning values.
+Replace `<supported-command>` with the command arguments from one of the source
+forms above, omitting the host-side `GetNewsAPI/` path inside the image. The
+production provisioning file must set `GETNEWSAPI_RUNTIME_ENV_FILE` to the
+separate external runtime file and supply required `VECTOR_MARIADB_*` values.
+Only the runtime file is injected into web and one-shot job containers.
 
 ## DEV To Production Promotion Checklist
 

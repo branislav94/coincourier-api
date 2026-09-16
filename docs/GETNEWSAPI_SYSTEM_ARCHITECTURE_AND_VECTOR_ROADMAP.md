@@ -36,6 +36,12 @@ task commands; none is wired into fetch, process, publish, image, scheduler, or
   and Phase 6C2B offline calibration are **IMPLEMENTED LOCALLY**. Runtime semantic
   collection remains disabled; calibration reads evidence but makes no decision.
 
+Pre-DEV P0 hardening is **IMPLEMENTED LOCALLY, NOT DEPLOYED**: Gemini credentials
+use header transport plus safe failure rendering; all WordPress REST requests use
+validated connect/read timeouts; production Compose separates application runtime
+from vector provisioning/root credentials; and the deployment runbook uses
+repository-root commands and secret-safe Compose validation.
+
 ## 1. Purpose and scope
 
 **CURRENT**

@@ -4,6 +4,7 @@ from datetime import datetime
 from db import get_db_connection
 from openai import OpenAI
 from config import (
+    GOOGLE_API_KEY,
     GROK_API_KEY,
     GROK_BASE_URL,
     GROK_MAX_OUTPUT_TOKENS,
@@ -88,11 +89,10 @@ PROCESS_BATCH_MIN = int(os.getenv("PROCESS_BATCH_MIN", "3"))
 PROCESS_BATCH_MAX = int(os.getenv("PROCESS_BATCH_MAX", "12"))
 
 # -----------------------------------------------------------------------------
-GOOGLE_API_KEY = os.getenv("GOOGLE_API_KEY")   # <-- add this
 GEMINI_SEARCH_MODEL = "models/gemini-2.5-flash"  # or gemini-1.5-pro-search
 GEMINI_URL = (
     f"https://generativelanguage.googleapis.com/v1beta/"
-    f"{GEMINI_SEARCH_MODEL}:generateContent?key={GOOGLE_API_KEY}"
+    f"{GEMINI_SEARCH_MODEL}:generateContent"
 )
 
 import time, random
@@ -505,9 +505,15 @@ def _llm_provider_order() -> list[str]:
 
 def _safe_ai_reason(exc: Exception) -> str:
     text = str(exc)
-    for secret in (GROK_API_KEY, OPENAI_API_KEY):
+    for secret in (GOOGLE_API_KEY, GROK_API_KEY, OPENAI_API_KEY):
         if secret:
             text = text.replace(secret, "[redacted]")
+    text = re.sub(r"(?i)([?&]key=)[^&\s]+", r"\1[redacted]", text)
+    text = re.sub(
+        r"(?i)(x-goog-api-key\s*[:=]\s*)[^\s,;]+",
+        r"\1[redacted]",
+        text,
+    )
     text = re.sub(r"sk-[A-Za-z0-9_-]+", "[redacted]", text)
     text = re.sub(r"xai-[A-Za-z0-9_-]+", "[redacted]", text)
     text = " ".join(text.split())
@@ -1119,7 +1125,9 @@ def call_openai(
 
 
 
-# before: GEMINI_URL = "https://…/v1beta/models/gemini-1.5-flash-latest:generateContent?key=…"
+class GeminiRequestError(RuntimeError):
+    """A credential-safe Gemini transport or HTTP failure."""
+
 
 def call_gemini_search(prompt: str) -> str:
     """
@@ -1159,8 +1167,24 @@ def call_gemini_search(prompt: str) -> str:
         # ,"temperature": 0.1
     }
 
+    if not GOOGLE_API_KEY:
+        raise GeminiRequestError("Gemini API key is not configured")
+
+    headers = {"x-goog-api-key": GOOGLE_API_KEY}
     for attempt in range(1, MAX_RETRIES + 1):
-        r = requests.post(GEMINI_URL, json=body, timeout=45)
+        try:
+            r = requests.post(
+                GEMINI_URL,
+                headers=headers,
+                json=body,
+                timeout=45,
+            )
+        except requests.RequestException as exc:
+            error_type = type(exc).__name__ or "RequestException"
+            logging.error("Gemini request failed error_type=%s", error_type)
+            raise GeminiRequestError(
+                f"Gemini request failed ({error_type})"
+            ) from None
         if r.status_code == 200:
             return r.json()["candidates"][0]["content"]["parts"][0]["text"].strip()
         if r.status_code in (429, 503):
@@ -1168,9 +1192,10 @@ def call_gemini_search(prompt: str) -> str:
             print(f"⚠️  Gemini {r.status_code} – retrying in {wait:.1f}s")
             time.sleep(wait)
             continue
-        # any other error
-        print("❌ Gemini response:", r.text)
-        r.raise_for_status()
+        logging.error("Gemini request failed status=%s", r.status_code)
+        raise GeminiRequestError(
+            f"Gemini request failed with HTTP status {r.status_code}"
+        )
 
     raise RuntimeError("Gemini search preview repeatedly failed")
 

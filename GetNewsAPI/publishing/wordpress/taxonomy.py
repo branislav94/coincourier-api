@@ -6,7 +6,7 @@ import re
 
 from config import WP_API_URL
 
-from .client import API_BASE, session
+from .client import API_BASE, WP_HTTP_TIMEOUT, session
 
 
 def slugify(text: str) -> str:
@@ -26,6 +26,7 @@ def ensure_category(
     response = active_session.get(
         f"{active_api_url}/wp-json/wp/v2/categories",
         params={"slug": slug},
+        timeout=WP_HTTP_TIMEOUT,
     )
     response.raise_for_status()
     if response.json():
@@ -34,6 +35,7 @@ def ensure_category(
     response = active_session.post(
         f"{active_api_url}/wp-json/wp/v2/categories",
         json={"name": name, "slug": slug},
+        timeout=WP_HTTP_TIMEOUT,
     )
     response.raise_for_status()
     return response.json()["id"]
@@ -52,6 +54,7 @@ def ensure_term(
     response = active_session.get(
         f"{active_api_base}/wp-json/wp/v2/{taxonomy}",
         params={"slug": slug},
+        timeout=WP_HTTP_TIMEOUT,
     )
     response.raise_for_status()
     if response.json():
@@ -59,6 +62,7 @@ def ensure_term(
     response = active_session.post(
         f"{active_api_base}/wp-json/wp/v2/{taxonomy}",
         json={"name": name, "slug": slug},
+        timeout=WP_HTTP_TIMEOUT,
     )
     response.raise_for_status()
     return response.json()["id"]

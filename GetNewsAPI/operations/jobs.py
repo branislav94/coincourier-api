@@ -112,7 +112,10 @@ JOB_CATALOG: tuple[JobSpec, ...] = (
     ),
     JobSpec(
         name="embedding_backfill",
-        description="Manually scan a bounded, deterministic historical source page sequence.",
+        description=(
+            "Manually register bounded changed versions from a deterministic "
+            "historical scan."
+        ),
         command="python tasks.py embedding_backfill [source|generated] [limit]",
         executor="embedding_backfill",
         schedule_class=ScheduleClass.MANUAL,

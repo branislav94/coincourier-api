@@ -19,6 +19,8 @@ SAFE_TEST_ENVIRONMENT = {
     "WP_API_URL": "https://wordpress.example.invalid",
     "WP_USERNAME": "unit_test",
     "WP_APP_PASSWORD": "unit_test_only",
+    "WP_HTTP_CONNECT_TIMEOUT_SECONDS": "10",
+    "WP_HTTP_READ_TIMEOUT_SECONDS": "60",
     "WP_DB_USER": "unit_test",
     "WP_DB_PASSWORD": "unit_test_only",
     "WP_DB_HOST": "127.0.0.1",
@@ -48,11 +50,7 @@ SAFE_TEST_ENVIRONMENT = {
     "FILE_LOGGING_ENABLED": "false",
     "RUN_GROK_TEXT_SMOKE": "false",
     "RUN_GROK_IMAGE_SMOKE": "false",
-    "GETNEWSAPI_ENV_FILE": ".env.example",
-    "VECTOR_MARIADB_DATABASE": "coincourier_vectors_test",
-    "VECTOR_MARIADB_USER": "unit_test",
-    "VECTOR_MARIADB_PASSWORD": "unit_test_only",
-    "VECTOR_MARIADB_ROOT_PASSWORD": "unit_test_only",
+    "GETNEWSAPI_RUNTIME_ENV_FILE": ".env.example",
 }
 
 SUBPROCESS_PASSTHROUGH_VARIABLES = {

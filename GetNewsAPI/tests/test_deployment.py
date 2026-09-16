@@ -2,10 +2,13 @@ from __future__ import annotations
 
 from contextlib import redirect_stderr, redirect_stdout
 import io
+import json
 import logging
 import os
 from pathlib import Path
 import re
+import shutil
+import subprocess
 import sys
 import unittest
 from unittest.mock import patch
@@ -25,9 +28,14 @@ DOCKERIGNORE_PATH = REPOSITORY_DIR / ".dockerignore"
 DOCKERFILE_PATH = REPOSITORY_DIR / "Dockerfile"
 PRODUCTION_COMPOSE_PATH = REPOSITORY_DIR / "docker-compose.prod.yml"
 ENV_EXAMPLE_PATH = REPOSITORY_DIR / ".env.example"
+PROVISIONING_ENV_EXAMPLE_PATH = REPOSITORY_DIR / ".env.provisioning.example"
 CONFIG_PATH = PROJECT_DIR / "config.py"
 APP_PATH = PROJECT_DIR / "app.py"
 REQUIREMENTS_PATH = PROJECT_DIR / "requirements.txt"
+RUNBOOK_PATH = REPOSITORY_DIR / "docs" / "GETNEWSAPI_DEPLOYMENT_RUNBOOK.md"
+PRODUCTION_ENVIRONMENT_PATH = (
+    REPOSITORY_DIR / "docs" / "GETNEWSAPI_PRODUCTION_ENVIRONMENT.md"
+)
 
 
 def minimal_web_environment() -> dict[str, str]:
@@ -130,15 +138,114 @@ class DockerPackagingTests(unittest.TestCase):
         ):
             self.assertIn(f"${{{name}:?", self.compose)
 
-    def test_vector_application_connection_is_wired_to_service_identity(self):
+    def test_vector_application_connection_uses_runtime_credentials(self):
+        runtime_example = ENV_EXAMPLE_PATH.read_text(encoding="utf-8")
         self.assertIn("VECTOR_DB_HOST: getnewsapi-vector-mariadb", self.compose)
-        self.assertIn("VECTOR_DB_NAME: ${VECTOR_MARIADB_DATABASE:?", self.compose)
-        self.assertIn("VECTOR_DB_USER: ${VECTOR_MARIADB_USER:?", self.compose)
-        self.assertIn("VECTOR_DB_PASSWORD: ${VECTOR_MARIADB_PASSWORD:?", self.compose)
+        self.assertIn('VECTOR_DB_PORT: "3306"', self.compose)
+        for name in ("VECTOR_DB_NAME", "VECTOR_DB_USER", "VECTOR_DB_PASSWORD"):
+            self.assertIn(f"{name}=", runtime_example)
+
+    def test_runtime_and_provisioning_environment_contracts_are_separate(self):
+        runtime_example = ENV_EXAMPLE_PATH.read_text(encoding="utf-8")
+        provisioning_example = PROVISIONING_ENV_EXAMPLE_PATH.read_text(encoding="utf-8")
+        self.assertTrue(PROVISIONING_ENV_EXAMPLE_PATH.is_file())
+        self.assertIn("GETNEWSAPI_RUNTIME_ENV_FILE", self.compose)
+        for name in (
+            "VECTOR_MARIADB_DATABASE",
+            "VECTOR_MARIADB_USER",
+            "VECTOR_MARIADB_PASSWORD",
+            "VECTOR_MARIADB_ROOT_PASSWORD",
+        ):
+            self.assertNotIn(name, runtime_example)
+            self.assertIn(name, provisioning_example)
+
+        web_block = self.compose.split("  getnewsapi-web:", 1)[1].split(
+            "  getnewsapi-vector-mariadb:", 1
+        )[0]
+        self.assertNotIn("VECTOR_MARIADB_", web_block)
+        self.assertNotIn("MARIADB_ROOT_PASSWORD", web_block)
+
+    def test_resolved_compose_scopes_vector_provisioning_to_database(self):
+        if shutil.which("docker") is None:
+            self.skipTest("Docker CLI is not installed")
+
+        version = subprocess.run(
+            ["docker", "compose", "version"],
+            cwd=REPOSITORY_DIR,
+            capture_output=True,
+            text=True,
+            check=False,
+        )
+        if version.returncode != 0:
+            self.skipTest("Docker Compose is not available")
+
+        resolved = subprocess.run(
+            [
+                "docker",
+                "compose",
+                "--env-file",
+                str(PROVISIONING_ENV_EXAMPLE_PATH),
+                "-f",
+                str(PRODUCTION_COMPOSE_PATH),
+                "config",
+                "--format",
+                "json",
+            ],
+            cwd=REPOSITORY_DIR,
+            capture_output=True,
+            text=True,
+            check=False,
+        )
+
+        self.assertEqual(
+            resolved.returncode,
+            0,
+            msg="resolved Compose configuration failed",
+        )
+        services = json.loads(resolved.stdout)["services"]
+        self.assertEqual(
+            set(services),
+            {"getnewsapi-web", "getnewsapi-vector-mariadb"},
+        )
+        web_environment = set(services["getnewsapi-web"]["environment"])
+        vector_environment = set(
+            services["getnewsapi-vector-mariadb"]["environment"]
+        )
+        self.assertTrue(
+            {"VECTOR_DB_HOST", "VECTOR_DB_PORT", "VECTOR_DB_NAME",
+             "VECTOR_DB_USER", "VECTOR_DB_PASSWORD"} <= web_environment
+        )
+        self.assertTrue(
+            {"MARIADB_DATABASE", "MARIADB_USER", "MARIADB_PASSWORD",
+             "MARIADB_ROOT_PASSWORD"} <= vector_environment
+        )
+        self.assertFalse(
+            {"VECTOR_MARIADB_ROOT_PASSWORD", "MARIADB_ROOT_PASSWORD"}
+            & web_environment
+        )
+        self.assertNotIn("ports", services["getnewsapi-vector-mariadb"])
+
+        for flag in (
+            "PROCESS_DURABLE_CLAIMS_ENABLED",
+            "PUBLISH_DURABLE_STATE_ENABLED",
+            "DUPLICATE_SHADOW_ENABLED",
+            "VECTOR_ENABLED",
+            "EMBEDDING_ENABLED",
+            "SEMANTIC_SHADOW_ENABLED",
+        ):
+            self.assertEqual(
+                services["getnewsapi-web"]["environment"][flag],
+                "false",
+            )
+
+    def test_one_shot_jobs_inherit_only_the_web_service_environment(self):
+        self.assertNotIn("worker:", self.compose)
+        self.assertNotIn("scheduler:", self.compose)
+        self.assertIn("run --rm getnewsapi-web", RUNBOOK_PATH.read_text(encoding="utf-8"))
 
     def test_all_safe_feature_defaults_remain_false(self):
         config_source = CONFIG_PATH.read_text(encoding="utf-8")
-        compose = self.compose
+        environment_example = ENV_EXAMPLE_PATH.read_text(encoding="utf-8")
         for name in (
             "ENABLE_APSCHEDULER",
             "PROCESS_DURABLE_CLAIMS_ENABLED",
@@ -149,7 +256,8 @@ class DockerPackagingTests(unittest.TestCase):
             "SEMANTIC_SHADOW_ENABLED",
         ):
             self.assertIn(f'_env_bool("{name}", False)', config_source)
-            self.assertRegex(compose, rf"{name}: (?:\"false\"|\$\{{{name}:-false\}})")
+            self.assertIn(f"{name}=false", environment_example)
+        self.assertIn('ENABLE_APSCHEDULER: "false"', self.compose)
 
     def test_image_search_v1_remains_the_source_default(self):
         source = CONFIG_PATH.read_text(encoding="utf-8")
@@ -191,6 +299,30 @@ class DockerPackagingTests(unittest.TestCase):
 
 
 class ConfigurationValidationTests(unittest.TestCase):
+    def test_wordpress_http_timeout_defaults_are_explicit(self):
+        import config
+
+        self.assertEqual(config.WP_HTTP_CONNECT_TIMEOUT_SECONDS, 10)
+        self.assertEqual(config.WP_HTTP_READ_TIMEOUT_SECONDS, 60)
+        environment_example = ENV_EXAMPLE_PATH.read_text(encoding="utf-8")
+        self.assertIn("WP_HTTP_CONNECT_TIMEOUT_SECONDS=10", environment_example)
+        self.assertIn("WP_HTTP_READ_TIMEOUT_SECONDS=60", environment_example)
+
+    def test_wordpress_http_timeouts_are_positive_and_bounded(self):
+        cases = (
+            ("WP_HTTP_CONNECT_TIMEOUT_SECONDS", "0"),
+            ("WP_HTTP_CONNECT_TIMEOUT_SECONDS", "61"),
+            ("WP_HTTP_READ_TIMEOUT_SECONDS", "0"),
+            ("WP_HTTP_READ_TIMEOUT_SECONDS", "301"),
+            ("WP_HTTP_READ_TIMEOUT_SECONDS", "not-a-number"),
+        )
+        for name, value in cases:
+            with self.subTest(name=name, value=value):
+                environment = minimal_web_environment()
+                environment[name] = value
+                rendered = format_config_issues(validate_runtime_config(environment))
+                self.assertIn(f"{name}: must be a positive integer", rendered)
+
     def test_config_check_accepts_valid_minimal_web_configuration(self):
         environment = minimal_web_environment()
         self.assertEqual(validate_runtime_config(environment), ())
@@ -310,6 +442,40 @@ class ConfigurationValidationTests(unittest.TestCase):
 
 
 class RuntimeContractTests(unittest.TestCase):
+    def test_runbook_uses_repository_root_for_checkout_commands(self):
+        runbook = RUNBOOK_PATH.read_text(encoding="utf-8")
+        self.assertIn("Run every checkout command in this runbook from the repository root", runbook)
+        self.assertNotRegex(runbook, r"(?m)^python tasks\.py")
+        self.assertIn("python GetNewsAPI/tasks.py job_catalog", runbook)
+        self.assertIn("python -m unittest GetNewsAPI.tests.test_semantic_retrieval", runbook)
+        self.assertIn(
+            "docker compose -f maintenance/vector/docker-compose.vector.yml",
+            runbook,
+        )
+
+    def test_documented_compose_validation_is_quiet_and_uses_provisioning_file(self):
+        documents = (
+            RUNBOOK_PATH.read_text(encoding="utf-8"),
+            PRODUCTION_ENVIRONMENT_PATH.read_text(encoding="utf-8"),
+        )
+        for document in documents:
+            self.assertNotIn("GETNEWSAPI_ENV_FILE", document)
+            self.assertNotRegex(
+                document,
+                r"(?m)^\s*-f docker-compose\.prod\.yml config\s*$",
+            )
+            self.assertIn("-f docker-compose.prod.yml config --quiet", document)
+            self.assertIn("getnewsapi-provisioning.env", document)
+
+    def test_backfill_documentation_does_not_claim_a_total_scan_bound(self):
+        runbook = RUNBOOK_PATH.read_text(encoding="utf-8")
+        production_environment = PRODUCTION_ENVIRONMENT_PATH.read_text(
+            encoding="utf-8"
+        )
+        self.assertIn("limit bounds changed document/job", runbook)
+        self.assertIn("not a total\nscan/page ceiling", runbook)
+        self.assertIn("do not impose a total scan ceiling", production_environment)
+
     def test_stdout_logging_is_default_and_file_logging_is_opt_in(self):
         environment_example = ENV_EXAMPLE_PATH.read_text(encoding="utf-8")
         self.assertIn("LOG_LEVEL=INFO", environment_example)

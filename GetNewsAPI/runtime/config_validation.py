@@ -223,6 +223,20 @@ def validate_runtime_config(
     _positive_integer(env, "DB_PORT", 3306, issues, maximum=65535)
     _positive_integer(env, "DB_CONNECT_TIMEOUT_SECONDS", 5, issues)
     _positive_integer(env, "READINESS_DB_TIMEOUT_SECONDS", 3, issues)
+    _positive_integer(
+        env,
+        "WP_HTTP_CONNECT_TIMEOUT_SECONDS",
+        10,
+        issues,
+        maximum=60,
+    )
+    _positive_integer(
+        env,
+        "WP_HTTP_READ_TIMEOUT_SECONDS",
+        60,
+        issues,
+        maximum=300,
+    )
     _validate_tls(env, "DB", issues, default_enabled=True)
 
     if normalized_profile == "web":

@@ -146,6 +146,9 @@ OPENAI_REASONING_EFFORT = os.getenv("OPENAI_REASONING_EFFORT", "minimal").strip(
 OPENAI_MAX_OUTPUT_TOKENS = int(os.getenv("OPENAI_MAX_OUTPUT_TOKENS", "4096"))
 SEO_PLUGIN = os.getenv("SEO_PLUGIN", "yoast").strip().lower()
 
+# Google Gemini search grounding.
+GOOGLE_API_KEY = os.getenv("GOOGLE_API_KEY")
+
 USE_API_IMAGES = int(os.getenv("USE_API_IMAGES", "1"))
 OPENAI_IMAGE_MODEL = os.getenv("OPENAI_IMAGE_MODEL", os.getenv("IMAGE_MODEL", "gpt-image-1"))
 IMAGE_MODEL = OPENAI_IMAGE_MODEL
@@ -294,6 +297,12 @@ SEMANTIC_EVIDENCE_VERSION = (
 WP_API_URL = os.getenv("WP_API_URL")
 WP_USERNAME = os.getenv("WP_USERNAME")
 WP_APP_PASSWORD = os.getenv("WP_APP_PASSWORD")
+WP_HTTP_CONNECT_TIMEOUT_SECONDS = int(
+    os.getenv("WP_HTTP_CONNECT_TIMEOUT_SECONDS", "10")
+)
+WP_HTTP_READ_TIMEOUT_SECONDS = int(
+    os.getenv("WP_HTTP_READ_TIMEOUT_SECONDS", "60")
+)
 
 # MySQL configuration for the application API and pipeline.
 DB_CONNECT_TIMEOUT_SECONDS = int(os.getenv("DB_CONNECT_TIMEOUT_SECONDS", "5"))

@@ -8,7 +8,7 @@ from typing import Any
 
 from config import WP_API_URL
 
-from .client import API_BASE, session
+from .client import API_BASE, WP_HTTP_TIMEOUT, session
 
 
 def upload_media(
@@ -27,6 +27,7 @@ def upload_media(
         f"{API_BASE if api_base is None else api_base}/wp-json/wp/v2/media",
         headers=headers,
         data=content,
+        timeout=WP_HTTP_TIMEOUT,
     )
     return response.json()["id"]
 
@@ -50,9 +51,13 @@ def set_media_details(
         active_session.post(
             f"{WP_API_URL if api_url is None else api_url}/wp-json/wp/v2/media/{media_id}",
             json=payload,
+            timeout=WP_HTTP_TIMEOUT,
         ).raise_for_status()
     except Exception as exc:
-        print(f"Could not set media details for media {media_id}: {exc}")
+        print(
+            f"Could not set media details for media {media_id}: "
+            f"{type(exc).__name__}"
+        )
 
 
 def set_media_alt(
@@ -67,6 +72,10 @@ def set_media_alt(
         active_session.post(
             f"{WP_API_URL if api_url is None else api_url}/wp-json/wp/v2/media/{media_id}",
             json={"alt_text": (alt_text or "")[:120]},
+            timeout=WP_HTTP_TIMEOUT,
         ).raise_for_status()
     except Exception as exc:
-        print(f"⚠️  Could not set alt text for media {media_id}: {exc}")
+        print(
+            f"Could not set alt text for media {media_id}: "
+            f"{type(exc).__name__}"
+        )

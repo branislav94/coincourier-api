@@ -613,6 +613,12 @@ and representative mocked request/response fixtures before implementation.
   app/vector migration, immutable artifact use, staged DEV and production
   activation, historical backfill, monitoring, and recovery. No live service was
   accessed and no rehearsal occurred; Phase 7E remains separate.
+- Pre-DEV P0 hardening: Gemini REST authentication uses the provider-supported
+  header and credential-safe failures; WordPress REST calls use validated bounded
+  connect/read timeouts without immediate retry after ambiguous mutating
+  outcomes; runbook commands use repository-root paths and quiet Compose
+  validation; vector root/provisioning credentials are isolated from web and
+  one-shot runtime environments. These changes are local and not deployed.
 
 ### Phase 8: Optional gpt_processor extraction
 
