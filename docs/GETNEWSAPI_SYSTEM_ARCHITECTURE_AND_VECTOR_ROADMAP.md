@@ -4,7 +4,8 @@ Audit date: 2026-07-26
 
 Branch audited: `pipeline-throughput-hybrid-images`
 
-Code baseline: `f0c2945 Add provider-neutral image search v2`
+Pushed code baseline: `ea3ba334 Add embedding ingestion and worker operations`,
+plus the uncommitted Phase 6C1 retrieval/evaluation foundation described here.
 
 Operational evidence: `getnewsapi-20260726_085522.log.txt` (2026-07-25T19:19:02Z through an incomplete run beginning 2026-07-26T00:47:30Z)
 
@@ -16,6 +17,30 @@ Status labels used throughout this document:
 - **OPTIONAL FUTURE**: useful later, but not required for the duplicate-defense objective.
 
 Repository evidence is authoritative only for the checked-in code and schema artifacts. No database, WordPress, CryptoNews, or model-provider connection was made for this audit. The checked-in SQL dump is older than the runtime code, so any statement about a newer runtime column is an inference from SQL issued by the application, not a claim that the production schema was inspected.
+
+Phase 2 durable claims and WordPress reconciliation are now **IMPLEMENTED BUT
+DISABLED**. Their additive migration is manual and both source-default feature
+flags remain false until an operator applies and verifies it.
+
+Deterministic Phase 5 duplicate analysis is also **IMPLEMENTED BUT DISABLED**.
+`DUPLICATE_SHADOW_ENABLED=false` is the source default. When explicitly enabled
+after its manual migration, it records pairwise evidence before LLM work but never
+changes selection, processing, or publication eligibility.
+
+Phase 6A vector storage, Phase 6B1 deterministic chunking/job processing, and
+Phase 6B2 controlled ingestion/worker/backfill operations are **IMPLEMENTED
+LOCALLY BUT DISABLED**. They use a separate MariaDB boundary and explicit lazy
+task commands; none is wired into fetch, process, publish, image, scheduler, or
+  duplicate behavior. Production scheduling and provider rollout remain planned.
+  Phase 6C1 bounded retrieval/evaluation, Phase 6C2A fail-open semantic evidence,
+  and Phase 6C2B offline calibration are **IMPLEMENTED LOCALLY**. Runtime semantic
+  collection remains disabled; calibration reads evidence but makes no decision.
+
+Pre-DEV P0 hardening is **IMPLEMENTED LOCALLY, NOT DEPLOYED**: Gemini credentials
+use header transport plus safe failure rendering; all WordPress REST requests use
+validated connect/read timeouts; production Compose separates application runtime
+from vector provisioning/root credentials; and the deployment runbook uses
+repository-root commands and secret-safe Compose validation.
 
 ## 1. Purpose and scope
 
@@ -30,7 +55,10 @@ This document answers four operational questions:
 3. Why can separate URLs covering the same event both be selected and published?
 4. How should exact, event, lexical, semantic, topic, and publication defenses be introduced without making the main pipeline depend on embeddings?
 
-It is an architecture and roadmap artifact only. No application behavior, environment setting, database schema, provider, model, route, or infrastructure was changed during this audit.
+This document began as a read-only architecture audit. The current Phase 5 update
+adds only disabled-by-default deterministic shadow code, configuration, tests, and
+manual additive migration files. It changes no provider/model/image routing,
+selection decision, publication behavior, route, or infrastructure.
 
 ## 2. High-level system diagram
 
@@ -43,6 +71,8 @@ flowchart LR
     C --> D[API and hosted-AI scoring]
     D --> E[chosen_for_publish and scheduled_for]
     E --> F[gpt_processor.process_news_with_gpt]
+    F -. DUPLICATE_SHADOW_ENABLED=true .-> R[(duplicate_assessments)]
+    R -. always continue .-> G
     F --> G[Gemini search enrichment]
     F --> H[Grok or OpenAI rewrite and validation]
     G --> H
@@ -58,7 +88,12 @@ flowchart LR
     P --> Q[rich_crpytonews.published = 1]
 ```
 
-The current state path is keyed primarily by `news_url`, not by an immutable raw ID or provider event ID. The principal duplicate gap is between ingestion and publication: exact identities are checked only within a single pull or by URL uniqueness, while selection, processing, and publication do not compare event identity or semantic meaning.
+The persistent source path is still keyed primarily by `news_url`. Pull-local
+identity checks and raw URL uniqueness remain unchanged as eligibility controls.
+The optional Phase 5 hook compares deterministic exact/event/fact/lexical evidence
+before expensive LLM work, but its results are audit-only and cannot close the
+selection or publication duplicate gap until a separately reviewed enforcement
+phase.
 
 ## 3. Repository/module map
 
@@ -81,16 +116,17 @@ The current state path is keyed primarily by `news_url`, not by an immutable raw
 | `GetNewsAPI/crypto_news_db.sql` | Historical schema/data dump, not a current migration | generated for MariaDB 10.4 at lines 1-8; table definitions 30-44 and 70-84; URL unique keys 110-120 |
 | `maintenance/sql/fresh_start_*.sql` | Manual queue inspection and cutoff cleanup | dry-run checks 5-149; apply transaction/default rollback 6-66 |
 | `Dockerfile` | Python 3.11 image and application startup | lines 2-12 |
-| `docker-compose.yml` | One Flask application service with bind mount | lines 1-17 |
+| `docker-compose.yml` | Legacy production-shaped application configuration without a source mount | lines 1-22 |
+| `docker-compose.dev.yml` | Legacy development source mount and external Dokploy network | lines 1-33 |
 | `.env.example` | Sanitized runtime/throughput/provider/DB setting inventory | lines 1-116 |
 
 There is no migration framework, current schema snapshot, cron declaration, CI configuration, or prior architecture README in the audited repository. SQL conventions consist of one old dump and manually reviewed maintenance scripts, with the destructive fresh-start script defaulting to `ROLLBACK`.
 
 ## 4. Runtime and deployment modes
 
-**CURRENT - Flask-only container**
+**CURRENT - legacy application containers**
 
-`docker-compose.yml:1-17` builds one Python 3.11 service, maps host port 5001 to container port 5000, bind-mounts `GetNewsAPI` to `/app`, and runs `python app.py`. `.env.example:2` sets `ENABLE_APSCHEDULER=false`, so the example deployment serves Flask without background jobs unless explicitly overridden. There is no database service, health check, worker service, or cron service in the compose file.
+`docker-compose.yml` retains the legacy production-shaped service with `APP_ENV=production`, host port `5000:5000`, and no source mount. `docker-compose.dev.yml` retains `APP_ENV=development`, host port `5001:5000`, the `GetNewsAPI:/app` source mount, and the existing external `dokploy-network`. Both read the ignored repository-root `.env` and run `python app.py`; neither defines persistent `/data`, a database service, a Compose healthcheck, a worker service, or a cron service. The supported remote DEV/production contract is the hardened `docker-compose.prod.yml` and deployment runbook, which retain the reviewed image, persistence, health, and network controls.
 
 **CURRENT - local APScheduler**
 
@@ -117,6 +153,7 @@ When `ENABLE_APSCHEDULER=true`, `app.py:56-67` starts the scheduler once with Fl
 | Search enrichment | `GOOGLE_API_KEY`; search itself is a code constant `USE_WEB_SEARCH=1` | `gpt_processor.py:73-93` |
 | Image mode | API/source flags, `hybrid`, `stock_first`, generated-image primary/fallback | `config.py:112-127` |
 | Image search | default engine `v1`; V2 providers, dimensions, limits, license allowlist, retry/exhaustion behavior | `config.py:129-180` |
+| Duplicate shadow | disabled by default; 72-hour lookback and `v1` policy version | `config.py` |
 | WordPress | REST URL/user/application password and separate WP DB settings | `config.py:182-205` |
 | Application DB | user/password/host/port/name; TLS verification is disabled in the connector dictionary | `config.py:187-196` |
 
@@ -131,11 +168,17 @@ Secrets are environment sourced and must remain absent from logs and documentati
 | Pull | Parameters relevant to identity |
 |---|---|
 | Rank-sorted multi-ticker | `extra-fields=id,eventid,rankscore` (`fetcher.py:487-495`) |
-| General category | no `extra-fields` parameter (`fetcher.py:498-503`) |
+| General category | `extra-fields=id,eventid,rankscore` (`fetcher.py:489-494`) |
 | Multi-ticker | `extra-fields=id,eventid,rankscore` (`fetcher.py:505-511`) |
 | Optional video | same extra fields, but `ALLOW_VIDEO=False` (`fetcher.py:513-523`) |
 
-CryptoNews event ID is therefore explicitly requested on two active feeds and the optional video feed. The code reads `eventid` and writes it to `cryptonewsapi.event_id` (`fetcher.py:757-797`). The supplied log does not print payload identities, so it cannot prove that `eventid` was returned or populated. The general category request does not explicitly request it. Event ID is stored when returned but is never consulted by scoring, selection, processing, or publishing.
+CryptoNews event ID is explicitly requested on all three active feeds and the
+optional video feed. The code reads `eventid` and writes it to nullable runtime
+`cryptonewsapi.event_id`; when a later provider item omits it, the upsert preserves
+an existing non-null value. The supplied log cannot prove provider population.
+Event ID remains absent from scoring and selection and is used only as shadow
+classification evidence before processing when the disabled-by-default hook is
+enabled.
 
 **CURRENT - pull-local exact dedupe**
 
@@ -145,13 +188,25 @@ Within one aggregated pull, the first candidate wins when any of these exact val
 - `_clean_url(news_url)`;
 - SHA-256 of the lowercased, outer-whitespace-trimmed title.
 
-`_clean_url()` removes a limited tracker list, dangling separators, repeated slashes, and a trailing slash (`fetcher.py:164-190`). It does not fully canonicalize host casing, default ports, fragments, query ordering, arbitrary tracking keys, percent encoding, redirects, AMP variants, or publisher canonical tags. Title hashing does not normalize punctuation, Unicode, internal whitespace, or wording.
+The pull-local `_clean_url()` and title hash retain their legacy behavior so this
+shadow phase cannot change ingestion eligibility. The separate Phase 5 identity
+module uses conservative parser-based canonicalization: scheme and host are
+lowercased, fragments/default ports are removed, a terminal slash is normalized,
+and only `utm_*` plus a fixed obvious-tracker allowlist is removed. Meaningful query
+parameters and publisher-specific paths are preserved. Its title comparison uses
+NFKC, case folding, punctuation/separator normalization, and whitespace collapse
+while retaining words, names, dates, and numbers; the stored source title is not
+mutated.
 
 **CURRENT - persistence**
 
 The retained pool is pre-ranked and truncated to `POOL_SIZE` before persistence (`fetcher.py:550-552`). `_insert_or_update()` inserts raw content and the news/event/rank/title identities, then uses `ON DUPLICATE KEY UPDATE` (`fetcher.py:734-800`). The repository schema declares only `news_url` unique (`crypto_news_db.sql:110-120`); it declares no unique provider news ID, canonical URL, title hash, event ID, or content hash. The live schema has additional columns because the runtime SQL uses them, but their indexes cannot be verified without a current schema artifact.
 
-There is no body/content hash. `event_id` should not itself become an exact-rejection key because separate sources and legitimate updates may share an event. It is immediately useful as a cluster key and selection signal.
+There is no persistent raw body/content-hash column. Phase 5 computes SHA-256 from
+NFKC/case-folded, HTML-text-extracted, whitespace-normalized source text only when
+at least 80 characters exist. The hash never contains source text, remains separate
+from event similarity, and only pairwise equality is persisted. `event_id` is a
+classification signal, never an exact-rejection key.
 
 ## 7. Scoring, selection and scheduling
 
@@ -179,14 +234,17 @@ The daily counter counts selected rows, not successfully published posts (`fetch
 
 **CURRENT**
 
-Automatic batch size is the number due within the lookahead, clamped to `PROCESS_BATCH_MIN..PROCESS_BATCH_MAX` (`gpt_processor.py:144-179` and 1926-1931). Eligible rows are unprocessed, chosen, optionally within the fresh-start cutoff, and due within the lookahead; order is `scheduled_for`, then `selected_at` (`gpt_processor.py:1933-1964`). There is no processing advisory lock or transactional row claim.
+Automatic batch size is the number due within the lookahead, clamped to `PROCESS_BATCH_MIN..PROCESS_BATCH_MAX`. The source-default legacy path retains its existing eligible-row query and has no processing advisory lock or transactional claim. When `PROCESS_DURABLE_CLAIMS_ENABLED=true` after migration, `RawNewsRepository` selects the same eligible order under `FOR UPDATE`, assigns an owner token, and commits before LLM work. Claims expire after `PROCESS_CLAIM_TIMEOUT_MINUTES`.
 
-For each row (`gpt_processor.py:1848-1895`):
+For each row:
 
-1. Gemini search grounding requests up to three recent facts when the code constant is enabled (`gpt_processor.py:1121-1198`).
-2. The rewrite tries the configured primary LLM and then the configured fallback (`gpt_processor.py:876-921`). Defaults are Grok then OpenAI (`config.py:65-70`, `config.py:105-109`).
-3. The provider that produced the valid rewrite becomes sticky for repair (`gpt_processor.py:1353-1368`, `gpt_processor.py:1532-1625`). A short body may first receive same-provider expansion (`gpt_processor.py:747-811`).
-4. On failure, the row remains `processed=0` and is retryable (`gpt_processor.py:1888-1895`).
+1. When explicitly enabled, deterministic duplicate shadow analysis reads recent
+   selected/processed candidates, records classifications, and always continues.
+   Any repository or policy error is caught and logged before continuing.
+2. Gemini search grounding requests up to three recent facts when the code constant is enabled (`gpt_processor.py:1121-1198`).
+3. The rewrite tries the configured primary LLM and then the configured fallback (`gpt_processor.py:876-921`). Defaults are Grok then OpenAI (`config.py:65-70`, `config.py:105-109`).
+4. The provider that produced the valid rewrite becomes sticky for repair (`gpt_processor.py:1353-1368`, `gpt_processor.py:1532-1625`). A short body may first receive same-provider expansion (`gpt_processor.py:747-811`).
+5. On legacy-path failure, the row remains `processed=0`. On the durable path it also becomes `processing_status='retryable'`, clears its claim, and stores a bounded error class; success still sets `processed=1`.
 
 Provider HTTP calls use bounded retry/backoff. Grok retries up to seven times with jitter (`gpt_processor.py:591-669`); OpenAI handles network/transient statuses and malformed/truncated output (`gpt_processor.py:947-1115`); Gemini retries only 429/503 (`gpt_processor.py:1159-1172`).
 
@@ -208,7 +266,7 @@ The prompt examples repeatedly use `bitcoin dominance` as the SEO-focus example 
 
 Important persistence properties:
 
-- There is no `raw_article_id` foreign key in the insert; raw and rich rows join by `news_url`.
+- The legacy path still joins raw/rich by unique `news_url`. After migration, the durable path also writes `raw_article_id`; preflight proves that the URL backfill maps each rich row to one raw row before a unique index is added. No foreign key is inferred.
 - There is no check by raw ID, provider news ID, title, slug, event, or content similarity.
 - Rich insertion commits before raw `processed=1` is committed through a separate connection (`gpt_processor.py:1745-1748`, `gpt_processor.py:1776-1793`, `gpt_processor.py:1883-1887`).
 - A crash between those commits leaves a rich row with the raw row retryable. URL uniqueness prevents a second rich row for that same URL, but the expensive rewrite can repeat.
@@ -250,7 +308,7 @@ Openverse requests CC0, PDM, and CC BY works and normalizes work title, creator,
 
 ## 13. Image reuse, licensing and attribution
 
-**CURRENT**
+**CURRENT default; durable path IMPLEMENTED BUT DISABLED**
 
 Stock reuse is tracked in a local JSON file and checked for a configurable rolling window. V2-compatible usage records include provider asset/canonical/source identities, URL/content/perceptual hashes, creator/license attribution, post ID, title, and time (`image_search/reuse.py:86-121`). That common recorder is called after a successful post for stock images in either engine (`publish_to_wp.py:1759-1763`). Consequently, a V1 run can emit `[IMG-V2] recorded image usage`; the prefix does not prove that V2 search ran.
 
@@ -264,30 +322,34 @@ V1 checks local usage and recent WordPress attachments. V2 adds canonical identi
 
 The publisher takes the `wp_publisher_lock` advisory lock (`publish_to_wp.py:1642-1690`), counts due rich rows, and fetches up to `PUBLISH_BATCH_MAX` rows where the joined raw row is chosen, scheduled, due, and within any fresh-start cutoff (`publish_to_wp.py:226-260`, `publish_to_wp.py:683-722`, `publish_to_wp.py:1691-1704`).
 
-For each row it:
+The default-off legacy path preserves the Phase 1 order. With
+`PUBLISH_DURABLE_STATE_ENABLED=true` after migration, the same advisory lock
+wraps `PublishingService`, which claims one due rich row at a time before any
+external work. For a new post it:
 
 1. selects/generates and uploads media before creating the post;
 2. ensures categories and tags through WordPress REST;
 3. modifies article HTML with market/category links;
 4. posts immediately with title, content, slug, current `date_gmt`, terms, and optional featured media (`publish_to_wp.py:1709-1754`);
-5. on HTTP 201, records stock-image usage, writes Yoast values directly to the WordPress DB, then sets `rich_crpytonews.published=1` (`publish_to_wp.py:1754-1775`).
+5. on HTTP 201, writes CoinCourier identity postmeta and attempts to persist the local `wp_post_id` before image-usage and Yoast writes, then completes both `publish_status='published'` and legacy `published=1`.
 
-Media upload has transient HTTP retries (`publish_to_wp.py:1049-1087`); post creation uses one direct `session.post`. The publisher does not query WordPress by raw ID, rich ID, source URL, exact title, slug, or idempotency key. It does not persist `wp_post_id` in the application DB.
+The durable adapter checks a saved local `wp_post_id`, then direct WordPress postmeta for `_coincourier_publication_key`; it never uses title or slug as identity. It persists post/raw/rich/source metadata and can recover media by `_coincourier_media_publication_key` before image selection.
 
-**Critical idempotency gap:** after WordPress creates a post, any lost response, process crash, image-usage failure, WP DB metadata failure, or app-DB update failure can leave `rich_crpytonews.published=0`. The next run will create another post because no durable post ID or reconciliation key exists. The advisory lock prevents simultaneous publisher runs; it does not make one publication attempt crash-idempotent. An error before post creation can also leave orphaned media.
+The durable path recovers a post when either the WordPress identity write or local ID write survives a later failure, including Yoast or local completion failure. The two writes cannot be atomic with REST creation: a hard kill immediately after HTTP 201 but before either durable write remains a narrow residual gap. The default legacy path retains its former duplicate risk until migration and explicit enablement.
 
 ## 15. Database tables and state transitions
 
 **CURRENT - schema evidence limitation**
 
-The checked-in dump was generated against MariaDB 10.4 in April 2025 (`crypto_news_db.sql:1-8`). It lists only basic columns plus a unique `news_url` on each table (`crypto_news_db.sql:30-44`, `crypto_news_db.sql:70-84`, `crypto_news_db.sql:110-120`). Runtime SQL proves that the deployed schema must contain additional columns, but no current DDL or migration history is in the repository.
+The checked-in dump was generated against MariaDB 10.4 in April 2025 (`crypto_news_db.sql:1-8`). It lists only basic columns plus a unique `news_url` on each table. Phase 2 adds the repository's first versioned manual migration sequence under `maintenance/migrations/`; it is not evidence that any deployed schema has been migrated.
 
 **Runtime columns inferred from code**
 
 | Table | Key runtime fields used by code |
 |---|---|
-| `cryptonewsapi` | `id`, `news_url`, `canonical_url`, `title`, `full_text`, `publish_date`, source/topics/tickers/image, `news_id`, `event_id`, `rank_score`, `title_hash`, `fetch_batch_id`, `gpt_importance`, `is_breaking`, `recency_score`, `source_weight`, `final_importance`, `chosen_for_publish`, `selected_at`, `scheduled_for`, `processed`, `insertDate` |
-| `rich_crpytonews` | `id`, `news_url`, title/body, processing-time `publish_date`, source/category/hashtags/sentiment/tickers/image, `seo_focus`, `seo_slug`, `seo_meta`, `published`, `insertDate`; code may read `schema_jsonld` but does not write it |
+| `cryptonewsapi` | Existing runtime fields plus additive `processing_status`, claim token/time, attempt count, and safe last error after Phase 2 migration; `processed` remains |
+| `rich_crpytonews` | Existing runtime fields plus `raw_article_id`, publication claim state, `publication_key`, WP post/media IDs and metadata, external URL/timestamps after Phase 2 migration; `published` remains |
+| `duplicate_assessments` | Phase 5 pair IDs, five-way classification, exact/event/lexical/fact/time evidence, reason JSON, policy version, and audit timestamps; unique per directed article/candidate/policy tuple |
 
 ```mermaid
 stateDiagram-v2
@@ -304,19 +366,24 @@ stateDiagram-v2
     WPPostCreated --> PublishDue: crash before published flag (duplicate risk)
 ```
 
-The rich/raw relationship is a URL join, not a declared foreign key in the repository artifact. Published WordPress identity is not represented in the app schema.
+Before migration the rich/raw relationship remains a URL join. The additive migration backfills and uniquely indexes `raw_article_id` only after collision preflight, and adds local WordPress identity without removing legacy fields.
 
-## 16. Scheduler, cron and advisory locks
+## 16. Scheduler, one-shot jobs and advisory locks
 
 **CURRENT**
 
-| Stage | In-process overlap control | Cross-process control | Scope/gap |
+| Job | Production owner | Cross-process control | Contract |
 |---|---|---|---|
-| Fetch | APScheduler `max_instances=1` | MariaDB `news_fetcher_lock` | robust while lock connection lives (`fetcher.py:1146-1279`) |
-| Process | chained scheduler `max_instances=1` only | none | external cron/manual calls can select the same rows concurrently |
-| Publish | chained scheduler `max_instances=1` | MariaDB `wp_publisher_lock` | prevents overlap, not post-create crash duplicates (`publish_to_wp.py:1671-1790`) |
+| Fetch | external `fetch_once` schedule | existing app-DB `news_fetcher_lock` | one bounded run; contention skips |
+| Process/publish | external `pipeline_once` schedule | app-DB `getnewsapi:job:v1:pipeline-workflow:*`; publish retains `wp_publisher_lock` | process then publish; unsafe overlaps and manual process/publish conflicts skip |
+| Embedding ingest/backfill | external rollout/manual invocation | vector-DB `getnewsapi:job:v1:embedding-registration:*` | serialized registration scans |
+| Embedding worker | external rollout invocation | durable row claims | parallel workers supported; no global job lock |
 
-Both local and CLI chained modes isolate processing failure from publishing (`scheduler.py:46-69`; `tasks.py:43-56`). This is intentional backlog-draining behavior. No checked-in server cron definition proves whether APScheduler and cron are mutually exclusive in deployment; operators must ensure only one orchestration mode is enabled.
+Production rejects `ENABLE_APSCHEDULER=true`; the web container serves HTTP only.
+The local APScheduler remains for development compatibility and now delegates its
+chained run to the same `pipeline_once` contract. New advisory locks use dedicated
+autocommit connections, bounded waits, `finally` release, and disconnect release;
+their namespace is distinct from migration locks.
 
 ## 17. Failure handling and retries
 
@@ -334,7 +401,7 @@ Both local and CLI chained modes isolate processing failure from publishing (`sc
 | Image search/generation failure | post can proceed without featured image |
 | Media metadata failure | swallowed; post proceeds, attribution may be missing |
 | WP post non-201 | row remains unpublished; uploaded media can be orphaned |
-| WP post created, later step fails | row can remain unpublished and create a duplicate on retry |
+| WP post created, later step fails | durable path reconciles by local ID or WP publication meta; default legacy path retains duplicate risk |
 
 **CURRENT - fresh-start and backlog**
 
@@ -355,21 +422,29 @@ A rich row becomes publishable when its URL joins a chosen raw row whose schedul
 | Scoring | candidate itself must remain unchosen for blended-score update | state guard, not duplicate detection (`fetcher.py:847-853`) |
 | Selection | candidate must have `chosen_for_publish=0` | prevents reselection of one row; does not compare rows (`fetcher.py:955-963`, `fetcher.py:1031-1040`) |
 | Processing | `processed=0` and `chosen=1`; rich URL upsert | retries one URL into one rich row; no process claim (`gpt_processor.py:1953-1964`, `gpt_processor.py:1717-1729`) |
+| Phase 5 processor preflight | provider ID, canonical URL, normalized source hash, event ID, token Jaccard, entities, dates, numbers, actions, and publication distance | optional 72-hour selected/processed shadow window; records only and always continues |
 | Publishing | rich `published=0`, joined due schedule, global advisory lock | prevents normal republish after app flag is set; not crash-idempotent (`publish_to_wp.py:683-722`, `publish_to_wp.py:1671-1775`) |
 | Images | recent asset/source URL checks; V2 adds license, connected identities, SHA-256 and perceptual hash | image reuse only, not article duplicate defense |
 
-No stage computes a normalized body hash or compares a new story to selected, processed, or published content by event or meaning.
+No eligibility stage uses a body hash or compares event meaning. The disabled-by-
+default Phase 5 processor hook now computes normalized source hashes and compares
+deterministic event/lexical facts against recent selected or processed raw rows,
+but it only records observations.
 
-## 19. Current same-event/semantic duplicate gaps
+## 19. Remaining same-event/semantic duplicate gaps
 
 **CURRENT gaps**
 
-1. `event_id` is requested and stored but not used, and is not explicitly requested on the category pull.
+1. `event_id` is now requested and stored on every relevant pull, but provider
+   coverage remains unmeasured and the value is shadow evidence only.
 2. There is no provider-news-ID or canonical/content-hash unique constraint visible in repository DDL.
-3. URL normalization is too narrow to represent a publisher canonical identity safely.
+3. Conservative URL/title/content identity exists, but no new database uniqueness
+   or enforcement policy uses it.
 4. Multiple URLs for one event can all be scored and set `chosen_for_publish=1`.
 5. Selection has no lookback across selected, processed, rich, or published rows and no topic/source quota.
-6. LLM processing spends search/rewrite cost before any lexical, event, or semantic duplicate check.
+6. With the source-default shadow flag off, LLM processing retains its previous
+   path. With it on, deterministic analysis runs first; semantic/vector comparison
+   is still absent.
 7. Processing has no claim/lease, so overlapping cron/manual workers can process the same raw row.
 8. Rich persistence has no raw-ID foreign key and is not atomic with `processed=1`.
 9. Publication stores neither a WP post ID nor an idempotency key and does no WP reconciliation.
@@ -472,16 +547,20 @@ Provider IDs and URLs can be logged as hashes when operations do not need the cl
 
 ## 21. Duplicate terminology and policy
 
-**PLANNED**
+**CURRENT classifications; all actions remain planned**
 
 | Category | Definition | Initial action |
 |---|---|---|
-| Exact duplicate | same provider news ID, trusted canonical source URL, or normalized body/content hash | reject automatically using deterministic constraints; no vector threshold required |
-| Same-event duplicate | separate sources/titles reporting substantially the same facts and event state | cluster and keep the strongest candidate; semantic enforcement starts only after shadow evaluation |
-| Legitimate update | same event but materially new decisions, outcomes, numbers, participants, or timestamps | allow, link to prior coverage, record `relationship=update`, and require a non-repetitive angle |
-| Broad topical overlap | same topic/entity but a different event | allow, subject to topic/entity frequency and angle-diversity policy |
+| `exact_duplicate` | same non-empty provider news ID, conservative canonical source URL, or normalized source-content hash | record only |
+| `same_event_duplicate` | same non-null event ID without new structured facts, or matching key entity plus date/number, title Jaccard >= 0.60, and bounded time | record only |
+| `material_update` | same explicit/inferred event with a new date, numeric value, named participant, or action/status | record only |
+| `related_event` | shared event-level entity but different date/action or insufficient same-event evidence | record only |
+| `broad_topic_overlap` | only generic asset/topic overlap or no event-level identity | record only |
 
-Event ID is a clustering signal, not automatically an exact-duplicate key. Vector similarity is also a signal, not a complete policy. Exact, event, update, and topic decisions require different evidence combinations and thresholds.
+Event ID is a clustering signal, not an exact-duplicate key. Null IDs never match,
+and different non-null IDs do not prevent deterministic inferred-event matching.
+Source names are labeled evidence but do not count as key event entities. Vector
+similarity remains future work and would be another signal, not a complete policy.
 
 ## 22. Recommended layered duplicate architecture
 
@@ -538,12 +617,13 @@ Run before Gemini/rewrite cost. Query recent raw title/summary vectors first, th
 
 ### Immediate non-vector priorities
 
-1. Current schema snapshot and collision report.
-2. Durable publication idempotency, WP ID persistence, reconciliation, and processor claims.
-3. Provider ID/canonical URL/content hashes with validated unique constraints.
-4. Event ID requested on every relevant CryptoNews pull, indexed, logged, and clustered in shadow mode.
-5. Lexical/entity/number/date same-event assessments before selection and processing.
-6. Structured stage logs and a labeled duplicate-evaluation set.
+1. Current deployed schema snapshot and collision report.
+2. Apply and verify the completed durable-state migration before enabling its flags.
+3. Apply the Phase 5 assessment migration and collect shadow precision evidence.
+4. Measure provider event-ID population; indexing needs a deployed-schema review.
+5. Build a labeled evaluation set from the persisted deterministic assessments.
+6. Consider selection-time policy only after false-positive review; no current
+   classification changes queue state.
 7. Topic/entity rolling quotas and an explicit breaking override; do not lower `DAILY_TARGET` as a substitute.
 
 ### Topic saturation and angle diversity
@@ -562,9 +642,20 @@ Calculate topic/entity saturation from both raw source labels and generated SEO 
 
 ## 23. MariaDB vector architecture
 
-**PLANNED**
+**PHASE 6A, 6B1, AND 6B2 IMPLEMENTED LOCALLY; DISABLED AND NOT DEPLOYED**
 
-MariaDB 11.8 native `VECTOR` is the recommended store, conditional on a deployment preflight proving the actual server is 11.8 and supports the intended distance/index syntax. The repository's old 10.4 dump is not a production-version check, and compose does not declare a DB server.
+Phase 6A adds an optional, separate MariaDB service and database named
+`coincourier_vectors`. The reproducible local service uses `mariadb:11.8`, binds
+only to `127.0.0.1:13309`, and was verified against MariaDB 11.8.9. It does not
+alter or share the application database. `VECTOR_ENABLED=false` is the source
+default, and no fetch, process, publish, image, or duplicate path imports the
+vector store or opens its connection.
+
+Phase 6B1 adds the embedding job engine. Phase 6B2 adds explicit lazy task
+commands for bounded application-row ingestion, worker execution, and manual
+historical backfill. `EMBEDDING_ENABLED=false` is also the source default. There
+is no scheduler hook, automatic pipeline hook, deployment, or production provider
+invocation.
 
 At approximately 30 posts/day and 4-6 vectors/article, the mathematical range is about 43,800-65,700 vectors/year and the five-vector midpoint is 54,750. Allowing for summaries or occasional extra chunks makes 50,000-70,000 vectors/year a sound planning envelope. This is modest enough for one MariaDB deployment and an approximate vector index, while retaining relational joins and transactionally consistent metadata.
 
@@ -574,66 +665,78 @@ The current dependency is unpinned `mysql-connector-python` (`requirements.txt:3
 
 | Capability | Recommended connector use | Audit conclusion |
 |---|---|---|
-| `VEC_FromText()` | `INSERT ... embedding = VEC_FromText(%s)` with a JSON-like vector string | expected to work through the current protocol without a Python vector adapter; integration test required |
-| `VEC_ToText()` | select `VEC_ToText(embedding)` for diagnostics/backfill verification | avoids relying on native binary type decoding; integration test required |
-| `VECTOR(N)` | execute version-checked DDL | server capability, not an ORM/connector feature |
-| `VECTOR INDEX` | execute version-checked DDL and inspect query plans | server capability; exact MariaDB 11.8 syntax/options must be proven in a disposable integration environment |
+| `VEC_FromText()` | `INSERT ... embedding = VEC_FromText(%s)` with a JSON vector string | verified for parameterized inserts |
+| `VEC_ToText()` | select `VEC_ToText(embedding)` for round-trip verification | verified through `mysql-connector-python` text results |
+| `VECTOR(1536)` | fixed-dimension column plus explicit dimension/version metadata | verified practical; short/long vectors are rejected |
+| distance | `VEC_DISTANCE_COSINE(column, VEC_FromText(%s))` and `VEC_DISTANCE_EUCLIDEAN(...)` | verified; cosine is the Phase 6A retrieval distance |
+| `VECTOR INDEX` | `CREATE VECTOR INDEX IF NOT EXISTS name ON table (embedding) DISTANCE=cosine` | verified, including rerun and `EXPLAIN` selection |
 
-Do not bind or decode raw binary vector values initially. Use `VEC_FromText()` and `VEC_ToText()` so the existing connector handles ordinary text parameters/results. Pin the connector version and run a disposable MariaDB 11.8 test covering DDL, insert, update, cosine query, index creation, `EXPLAIN`, backup, and restore before production migration.
+The implementation does not bind or decode raw binary vector values. It uses
+`VEC_FromText()` and `VEC_ToText()` so the connector handles ordinary text
+parameters/results. Integration coverage proves DDL, inserts, round trips, cosine
+ordering, dimension and malformed-input rejection, rollback, index creation, and
+`EXPLAIN`. Production backup/restore rehearsal remains a deployment prerequisite.
 
-One `VECTOR(N)` column has a fixed dimension. "Configurable dimensions" therefore means one active deployment/schema dimension at a time, validated against `EMBEDDING_DIMENSIONS`; a dimension change requires a side-by-side physical table/column and re-embedding migration, not mixed dimensions in one vector column.
+One `VECTOR(N)` column has a fixed dimension. Phase 6A validates 1536 values in
+the repository and schema metadata. A future dimension change requires a
+side-by-side physical table/column and re-embedding migration, not mixed
+dimensions in one vector column.
 
-## 24. Proposed schemas
+## 24. Vector schemas
 
-**PLANNED - additive; names/types require a real 11.8 migration review**
+**PHASE 6A STORAGE AND PHASE 6B JOB OPERATIONS IMPLEMENTED LOCALLY**
 
 ### `vector_documents`
 
 One logical source or generated document, independent of chunks:
 
-- `id`, `raw_article_id`, `rich_article_id`, `wp_post_id`;
-- `document_type`: `raw_source`, `rich_generated`, or `published_generated`;
-- source name/URL/canonical URL and their hashes;
-- provider news/event IDs plus provider scope;
-- title, source/published timestamps, content hash;
-- active embedding provider/model/dimensions/version and document status;
-- `factual_provenance`: `primary_source`, `secondary_source`, or `coincourier_derivative`;
-- created/updated timestamps.
+- `document_key`, `source_type`, durable `source_article_id`, and nullable
+  `rich_article_id`;
+- source URL, title, publication time, content hash/version, and timestamps;
+- unique `(document_key, content_version)` for retry-safe identity.
 
-Use nullable foreign identifiers but unique partial-equivalent keys through generated hashes or normal unique indexes appropriate to MariaDB. Never treat a CoinCourier derivative as independent factual confirmation of its source.
+`source_type` is `source_article` or `coincourier_generated`. A generated document
+requires both its source article ID and rich article ID; a source document cannot
+carry a rich ID. CoinCourier derivatives therefore remain linked to, and cannot be
+treated as corroboration independent from, their factual source.
 
 ### `vector_chunks`
 
 One active physical embedding dimension:
 
-- `id`, `document_id`, `chunk_index`, `chunk_type`;
-- `chunk_text`, `chunk_hash`;
-- `embedding VECTOR(N)`;
-- embedding provider/model/dimensions/version copied for audit;
-- `metadata_json`, token count, created timestamp;
-- unique `(document_id, chunk_index, embedding_version)`;
-- relational index on `(document_id, chunk_type)` and a cosine `VECTOR INDEX` on `embedding`.
+- document FK, deterministic chunk index, chunk text/hash, and timestamps;
+- `embedding VECTOR(1536)` plus model, dimensions, and immutable version identity;
+- unique document/index/version and document/hash/version keys;
+- relational document/version index and cosine VECTOR index.
 
 Keep chunk text for explainability and re-embedding only under source-retention policy. If source-content retention is restricted, retain a safe summary plus hashes and expire raw body chunks.
 
 ### `embedding_jobs`
 
-- `id`, `document_id`, requested embedding version;
-- `status`: queued/leased/succeeded/retry/dead;
-- `attempt_count`, `lease_owner`, `lease_expires_at`, `next_attempt_at`, redacted `last_error`;
-- created/updated timestamps;
-- unique active job per document/version and indexes for claim order.
+- document FK and requested embedding version;
+- `pending`, `claimed`, `completed`, `retryable`, or `failed` status;
+- bounded claim token/time, attempt count, bounded last error, and timestamps;
+- one row per document/version plus a status/claim-time ordering index.
 
-This stays separate from documents because retries/leases are many operational state transitions and should not overload document state.
+Phase 6B1 implements direct job claiming, ownership checks, stale-claim recovery,
+attempt counting, safe errors, reconciliation, and atomic persistence/completion.
+The claim transaction commits and closes before content loading or a provider
+call. Phase 6B2 implements idempotent registration/enqueue plus bounded worker and
+manual backfill commands. Scheduling and production provider rollout are not
+implemented.
 
 ### `duplicate_assessments`
 
-- candidate raw ID, matched document/chunk/event cluster;
-- exact match type, vector/lexical/entity/number/date/event signals;
-- decision: exact reject, same-event reject, allow update, allow topic overlap, insufficient evidence;
-- reason codes, policy/embedding versions, mode (`shadow`/`enforce`), actor, timestamp.
+**CURRENT after manual Phase 5 migration; disabled by source default**
 
-Keep this separate for evaluation, threshold changes, appeals, and false-positive analysis.
+- directed raw `article_id` and `candidate_article_id`;
+- five-way assessment type and provider/event/URL/content equality booleans;
+- title token Jaccard, publication-time distance, shared entity/date/number JSON;
+- deterministic reason JSON, policy version, and created/updated timestamps;
+- unique `(article_id, candidate_article_id, policy_version)` for retry-safe upsert.
+
+It remains separate for evaluation and false-positive analysis. It contains no
+vector, embedding, queue decision, enforcement mode, or full source content.
 
 ### `event_clusters` and `event_cluster_articles`
 
@@ -651,28 +754,40 @@ The proposed tables should not be collapsed into the two article tables. Documen
 
 ## 25. Embedding and chunking strategy
 
-**PLANNED**
+**PHASE 6B1 AND 6B2 IMPLEMENTED LOCALLY; DISABLED AND NOT DEPLOYED**
 
-### Initial hosted embedding configuration
+### Phase 6B1 embedding decision
 
-- Provider: OpenAI, because the repository already has its SDK/key path and no local LLM is allowed.
-- Initial model: `text-embedding-3-small`.
-- Initial dimensions: 1536, deployment-configured and schema-validated.
-- Version: explicit immutable value such as `openai:text-embedding-3-small:1536:source-normalization-v1`.
-- Optional later quality experiment: a larger hosted embedding model, evaluated side by side rather than silently replacing vectors.
-
-The provider/model recommendation must be revalidated against the approved provider catalog and data-retention terms at implementation time; this audit made no provider call.
+The approved baseline is OpenAI `text-embedding-3-small`, 1536 dimensions, cosine
+distance, deterministic `chunk-v1`, and immutable embedding identity
+`openai:text-embedding-3-small:1536:chunk-v1`. The implementation provides a
+provider protocol, deterministic fake provider, and mockable OpenAI adapter. The
+adapter sends explicit `model`, `input`, and `dimensions`; no live embedding smoke
+or production call is part of Phase 6B1. A later model or dimension must be
+evaluated side by side rather than silently replacing existing vectors.
 
 ### Document and chunk policy
 
-| Document | Vector/chunk policy | Primary use |
-|---|---|---|
-| Raw source title + provider summary | one compact `raw_summary` vector, including entities/numbers/date | pre-selection and pre-processing duplicate search |
-| Raw source body | heading/sentence-aware 450-700 token chunks, 60-100 token overlap, usually 3-5 | fact/event matching and historical source context |
-| Rich title + concise summary | one `rich_summary` vector | angle comparison and internal links, not factual confirmation |
-| Published body | heading-aware chunks, usually 3-5 | continuity, related coverage, internal links, repetitive-angle detection |
+`chunk-v1` normalizes title plus visible body with Unicode NFKC, CRLF
+normalization, horizontal-whitespace collapse, and paragraph preservation. HTML
+is reduced to visible text; script/style content is ignored. Numbers, dates,
+tickers, names, percentages, currency, and negation remain.
 
-Normalize Unicode and whitespace; retain meaningful numbers, dates, tickers, and named entities. Do not remove negation. Hash the exact normalized chunk input. Keep raw-source and CoinCourier-generated namespaces separate in every query.
+Segmentation is paragraph/sentence first, using a deterministic stdlib
+word/punctuation token estimate. It targets 500 token units, flushes a current
+chunk at or above 350 when the next segment would exceed the target, never exceeds
+600, uses zero overlap, and splits oversized segments only at whitespace so words
+are not broken. The SHA-256 content hash covers exact normalized title plus body;
+`content_version` is `chunk-v1:<content-hash>`. Each exact normalized chunk has a
+SHA-256 hash and deterministic contiguous index. Exact duplicate chunks within a
+document are retained once.
+
+Source and CoinCourier-generated provenance remains separate in
+`vector_documents`. Phase 6B2 maps raw `cryptonewsapi.id`, title, and `full_text`
+to `source_article` documents. It maps `rich_crpytonews.id`, title, and
+`full_text` to `coincourier_generated` only when the durable `raw_article_id`
+join resolves; missing lineage is skipped. Registration uses normalized title
+plus visible body and never treats URL alone as identity.
 
 ### Retention and re-embedding
 
@@ -680,40 +795,121 @@ Normalize Unicode and whitespace; retain meaningful numbers, dates, tickers, and
 - Keep recent raw candidates long enough for duplicate/event windows; propose 90 days for rejected/unselected metadata and 12-24 months for source chunks, subject to provider/license policy.
 - Keep hashes and cluster/audit decisions longer than source text when legally permitted.
 - Re-embed side by side into a new dimension-compatible physical table/version, validate coverage and retrieval quality, switch reads, then retire the old version after rollback expiry.
-- Backfill newest published/raw documents first, rate-limited and restartable by deterministic jobs.
+- Backfill newest published/raw documents first through the manual bounded task;
+  restart safety comes from descending keyset scans and deterministic documents/jobs.
 
 ### Async failure policy
 
-Embedding jobs use short timeouts, exponential backoff with jitter, leases, maximum attempts, and dead-letter status. Fetch/process/publish enqueue or reconcile jobs but do not fail when embeddings are unavailable. A sweeper finds documents missing the active version. Semantic checks return `unavailable` and fail open to deterministic controls.
+Phase 6B1 claims one exact embedding version with an opaque ownership token,
+commits and closes the claim transaction, then loads content and calls the
+provider. Complete valid persisted chunks reconcile the job with zero provider
+calls. Otherwise vectors are generated in bounded batches and full replacement
+plus completion occurs atomically in a separate short transaction. Invalid
+content identity, configuration, or provider output is terminal. Genuine
+provider/network unavailability is retryable. Lost ownership is distinct.
+Unexpected storage/programming faults release the claim to a recoverable state
+when possible and propagate; if cleanup itself is unavailable, normal claim
+expiry still permits recovery.
+
+Phase 6B2 adds `embedding_ingest`, `embedding_worker`, and
+`embedding_backfill source|generated`. The worker requires both enable flags,
+preflights the approved OpenAI/model/dimension/chunker contract, API key, and
+both database connections before claiming, then processes a bounded job count.
+Provider requests retain the Phase 6B1 batch size; a 100-chunk per-job cap makes
+paid work finite and rejects oversized input before a call. Retryable provider
+results end the current run to avoid immediate hot reclaim. Across later runs,
+pending jobs rank first and retryable jobs rotate by least attempts and oldest
+retry update, preventing one repeatedly failing newest job from starving other
+ready jobs. Failed, lost-claim, and reconciled jobs are counted separately. A
+genuine empty queue is success.
+
+Backfill takes a fixed per-run high-water ID and scans descending keyset pages.
+It deliberately persists no extra cursor table: immutable content versions and
+unique document/job constraints make restarts idempotent, while rescanning also
+finds historical edits and rows inserted after an earlier high-water mark. This
+trades repeated reads for no Phase 6B2 migration. Claims order by publication
+time newest first, so historical rows registered later do not overtake fresh
+dated articles. Backfill remains a separate manual invocation.
+
+Each operation logs count-only run metrics: scanned/registered/skipped documents,
+enqueued/existing jobs, claimed/completed/reconciled/retryable/failed/lost jobs,
+provider calls, embedded chunks, and token usage when supplied. No article text
+or vector is logged. Phase 7C2 exposes `embedding_ingest` and `embedding_worker`
+as bounded one-shot commands; no embedding cadence has been approved and
+scheduling remains a rollout decision.
+Phase 6C1 provides isolated semantic retrieval and offline evaluation. Phase 6C2A
+adds optional fail-open invocation and durable evidence, but a retrieved neighbor
+still carries no duplicate classification or publication effect. Calibration and
+policy comparison remain Phase 6C2B.
 
 ## 26. Retrieval use cases
 
-**PLANNED**
+**PHASE 6C1 SOURCE-ARTICLE RETRIEVAL IMPLEMENTED LOCALLY; OTHER USES PLANNED**
 
-1. **Semantic duplicate detection:** query recent raw summary vectors; rerank with event, lexical, entity, number/date, source, and time signals.
+Phase 6C1 retrieves distinct historical source articles for one already embedded
+source article. The newest immutable vector document must have a completed job
+and nonempty chunks for the exact requested embedding version. Query publication
+time is required. Candidates must be non-null dated source articles in the
+inclusive `[query time - 72 hours, query time]` window; the same document and all
+versions sharing the query source ID are excluded. Generated CoinCourier vectors
+cannot corroborate duplicate/event evidence.
+
+At most eight query chunks are sampled deterministically across the document.
+Each performs a native cosine ANN query with 5x article oversampling, capped at
+100 chunk rows. Article top-K defaults to 10 and cannot exceed 20. Results group
+by durable source article ID and rank by the best/minimum native chunk distance,
+with chunk indexes, document/source IDs, publication delta, version, and source
+type retained as evidence. No full vectors or complete chunk text are returned.
+
+1. **Semantic duplicate retrieval:** Phase 6C1 implements source-only candidates and distance evidence; event-feature reranking and decisions remain planned.
 2. **Historical factual context:** retrieve raw-source chunks separately and label their source/time. Generated CoinCourier text can provide continuity but not corroboration.
 3. **Internal-link suggestions:** retrieve published CoinCourier chunks, require live WP IDs/URLs and topical relevance, and avoid self-links.
 4. **Repetitive-angle avoidance:** compare proposed rich summary/outline to recent published derivatives in the same event/topic, then prompt for genuinely new facts or framing.
 5. **Update classification:** compare fact signatures and source chunks to determine whether a new article contains material changes.
 
-Retrieval output must carry document type, source, source timestamp, WP ID, similarity, and reason. A vector result alone must never be presented as factual confirmation.
+Future retrieval output must retain provenance appropriate to its purpose. A
+vector result alone must never be presented as factual confirmation.
 
 ## 27. Shadow-mode rollout
 
-**PLANNED**
+**PHASE 6C2A EVIDENCE COLLECTION IMPLEMENTED LOCALLY/DISABLED; 6C2B PLANNED**
 
-Initial switches:
+Current and future switches:
 
 ```text
 VECTOR_ENABLED=false
-VECTOR_DUPLICATE_MODE=off
+EMBEDDING_ENABLED=false
 EMBEDDING_PROVIDER=openai
 EMBEDDING_MODEL=text-embedding-3-small
 EMBEDDING_DIMENSIONS=1536
-EMBEDDING_VERSION=openai:text-embedding-3-small:1536:source-normalization-v1
+EMBEDDING_CHUNKER_VERSION=chunk-v1
+EMBEDDING_BATCH_SIZE=16
+EMBEDDING_INGEST_LIMIT=25
+EMBEDDING_WORK_LIMIT=5
+EMBEDDING_CLAIM_TIMEOUT_MINUTES=30
+EMBEDDING_BACKFILL_PAGE_SIZE=100
+EMBEDDING_MAX_CHUNKS_PER_JOB=100
+SEMANTIC_SHADOW_ENABLED=false
+SEMANTIC_LOOKBACK_HOURS=72
+SEMANTIC_TOP_K=10
+SEMANTIC_EVIDENCE_VERSION=semantic-shadow-v1
+VECTOR_DUPLICATE_MODE=off
 ```
 
-`VECTOR_DUPLICATE_MODE` supports `off|shadow|enforce`:
+The vector, embedding, and semantic settings have disabled source defaults.
+When vector and semantic flags are both true, `process_one()` invokes the
+evidence-only shadow after deterministic Phase 5 and before enrichment. It does
+not consult `EMBEDDING_ENABLED`: already-completed vectors remain readable while
+paid embedding generation is disabled. Fetch, publish, duplicate policy, tasks,
+and scheduler modules do not invoke semantic retrieval.
+
+Migration `003_semantic_shadow_assessments.sql` stores bounded neighbor evidence
+in the vector database under a null-safe source/document/embedding/semantic-version
+identity. `not_ready` can reconcile to `retrieved` after an asynchronous worker
+finishes. Retrieval and write failures fail open; neither operation shares the
+application claim transaction or holds an application row lock.
+
+The proposed future `VECTOR_DUPLICATE_MODE` contract is `off|shadow|enforce`:
 
 - `off`: schemas/jobs may exist, but no duplicate retrieval decision affects or logs candidate comparisons.
 - `shadow`: generate/query vectors and persist assessments, but never reject or delay the article.
@@ -723,7 +919,29 @@ Rollout order is exact constraints/idempotency first, event and lexical shadow n
 
 ## 28. Metrics and evaluation
 
-**PLANNED**
+**PHASE 6B2 COUNTS AND PHASE 6C1-6C2B EVIDENCE ANALYSIS IMPLEMENTED LOCALLY**
+
+The explicit ingestion, worker, and backfill tasks emit bounded count-only run
+summaries. Phase 6C1 loads a versioned synthetic JSON relationship fixture and
+reports candidate rank, Recall@K, first-relevant MRR, per-label native-distance
+distributions, top-K labeled coverage, missing pairs, and unavailable queries.
+Strict duplicate relevance means exact plus same-event duplicate; broader
+same-event relevance additionally includes material updates. Unavailable queries
+are reported and excluded from Recall/MRR and coverage denominators, while a
+valid no-candidates result remains an evaluated retrieval miss.
+
+Phase 6C2A logs bounded attempted/disabled/not-ready/no-candidate/retrieved/error
+outcomes, candidate count, best native distance, persistence state, and error type.
+It logs no vector, article/chunk body, credential, or claim token.
+
+Phase 6C2B adds a read-only `semantic_calibration` package. Versioned reviewed
+labels join directed Phase 5 pairs to ordered Phase 6 candidate evidence by source
+article IDs. Reports preserve deterministic policy, embedding, semantic, and label
+schema versions; expose missing evidence; and calculate multiclass confusion counts,
+distance/rank distributions, strict and broader Recall@1/3/5/10 and MRR, advisory
+cutoff research, and material-update overlap. No real labels are fabricated.
+Percentiles and policy confidence are withheld below the documented sample minimum.
+All cutoff rows are `research_candidate_only`; none is runtime configuration.
 
 Build a labeled set containing exact duplicates, same-event duplicates, legitimate updates, and broad topical overlap. Include the suspicious log groups but label them only after source/DB inspection. Evaluate at pair and publication-decision level.
 
@@ -752,16 +970,25 @@ Initial similarity hypotheses, to be calibrated on real labels:
 
 These values are hypotheses, not universal truths. Model version, text type, language, chunk type, and corpus distribution change score meaning. Event ID, lexical overlap, entities, numbers, dates, and new-information scoring must remain separate features.
 
+Phase 6C1 installs none of these hypotheses as configuration or policy. It exposes
+native MariaDB cosine distance only and contains no suppression threshold.
+
 ## 29. Security and secret handling
 
 **CURRENT and PLANNED**
 
 - Continue sourcing credentials from environment variables (`config.py:18-205`); never persist them in docs, vector metadata, logs, or assessment reasons.
-- Pin and scan dependencies before vector rollout; current requirements are unpinned.
+- Phase 7B pins the reviewed direct and cross-platform transitive runtime dependency
+  set used by the Linux image; vulnerability scanning remains an operational gate.
 - Redact provider tokens and credential-shaped strings from every error path, not only existing Grok/OpenAI helper errors (`gpt_processor.py:503-511`; `publish_to_wp.py:898-905`).
-- Restrict `GET /api/news` or return an explicit public projection before treating Flask as internet-facing.
+- `POST /api/publish` now always requires a deployment Bearer token. `GET /api/news`
+  intentionally retains its existing read-only behavior and should be restricted at
+  the reverse proxy if it is not intended to be public.
 - Treat source chunks and embeddings as sensitive derived data. Approve hosted-provider retention/training terms and source-content licensing before backfill.
-- Encrypt DB transport with certificate verification in production; current app DB config sets `ssl_verify_cert=False` (`config.py:187-196`).
+- Application, vector, and WordPress DB TLS and CA/verification settings are now
+  explicit. Existing-compatible verification-off defaults are documented; external
+  production databases should supply a mounted CA and enable certificate/identity
+  verification.
 - Log hashes and IDs rather than full URLs where practical, never full bodies or vectors.
 - Limit WP application-password and direct-DB privileges. Publication reconciliation should need only the minimum post/meta access.
 
@@ -793,7 +1020,9 @@ Each phase is intentionally deployable and reversible on its own.
 
 ### Phase 2: CryptoNews event-ID ingestion and event clustering
 
-- Files: `fetcher.py`, config, new clustering service/repository, tests.
+- Status: event-ID request coverage and pairwise shadow evidence are implemented by
+  project Phase 5; durable event-cluster tables and primary-member policy remain planned.
+- Files: `fetcher.py`, config, deterministic policy/repository, tests.
 - Migration: provider-scoped event ID index plus `event_clusters` and `event_cluster_articles`.
 - Tests: every pull requests event ID, missing IDs, reused IDs, multiple sources per event, legitimate updates.
 - Logs/metrics: event-ID coverage, cluster size, primary changes, source diversity.
@@ -803,33 +1032,132 @@ Each phase is intentionally deployable and reversible on its own.
 
 ### Phase 3: lexical/entity duplicate checks in shadow mode
 
-- Files: new normalization/feature module; `fetcher.py` selection integration; processor preflight; tests.
-- Migration: optional normalized-title/entity/fact-signature columns and assessment rows.
+- Status: implemented but disabled before processor LLM work; selection integration
+  and all enforcement remain planned.
+- Files: normalization/fact/policy modules; processor preflight; focused tests.
+- Migration: pairwise assessment rows only; existing raw identity columns are reused.
 - Tests: punctuation/Unicode/title variants, entity and number/date deltas, update versus duplicate fixtures.
 - Logs/metrics: component scores and shadow decision reasons, without bodies.
-- Switch: `LEXICAL_DUPLICATE_MODE=off|shadow`.
+- Switch: `DUPLICATE_SHADOW_ENABLED=false`, with lookback and policy version controls.
 - Rollback: switch off; no queue state changes in shadow.
 - Risk: low-medium.
 
-### Phase 4: MariaDB vector schema and asynchronous embedding jobs
+### Implementation Phase 6A/6B: vector storage, then embedding jobs
 
-- Files: config, vector repository, embedding client/worker/task, job sweeper, tests, requirements pin.
-- Migration: `vector_documents`, dimension-specific `vector_chunks`, `embedding_jobs`, indexes; no enforcement.
-- Tests: disposable MariaDB 11.8 DDL/functions/index/query plans, hosted client mocks, leasing/retries, dimension mismatch, backfill resume.
-- Logs/metrics: coverage/version, queue latency, failures, query latency; no vector/body logs.
-- Switch: `VECTOR_ENABLED=false` by default, then enable only job generation.
-- Rollback: disable worker/read path; additive tables remain or are archived.
-- Risk: medium.
+- Phase 6A status: local storage foundation implemented, disabled, and not deployed.
+- Phase 6A files: separate config/connection/repository, independent vector
+  migrations, local MariaDB 11.8 compose service, and synthetic integration tests.
+- Phase 6A migration: `vector_documents`, fixed-dimension `vector_chunks`,
+  storage-only `embedding_jobs`, relational keys, and cosine VECTOR index.
+- Phase 6A tests: disposable MariaDB 11.8.9 DDL/functions/index/query plans,
+  dimensions, malformed values, transactions, idempotency, and provenance filters.
+- Phase 6B1 status: deterministic `chunk-v1`, provider abstraction, fake provider,
+  OpenAI adapter, versioned settings, direct job claims/recovery, provider-outside-
+  transaction execution, atomic completion, and paid-call reconciliation are
+  implemented locally and verified on MariaDB 11.8.
+- Phase 6B2 status: application document ingestion, idempotent job enqueue,
+  bounded worker/manual backfill task commands, preflight controls, and count-only
+  metrics are implemented locally. They are disabled and not deployed.
+- Switches: `VECTOR_ENABLED=false` and `EMBEDDING_ENABLED=false`; only explicit
+  embedding task commands read them. No automatic pipeline path reads either one.
+- Phase 7C2 external sequence: run bounded `embedding_ingest` before bounded
+  `embedding_worker` if those jobs are scheduled. Their cadence remains a rollout
+  decision. Keep `embedding_backfill` manual and separately bounded.
+- Rollback: leave the separate service absent/disabled; the application DB and
+  deterministic pipeline remain independent.
 
-### Phase 5: semantic duplicate shadow mode
+### Implementation Phase 6C1: semantic retrieval and evaluation
 
-- Files: semantic retrieval/reranking service; selection/processor preflight hooks; audit repository; tests.
-- Migration: `duplicate_assessments`; possibly retrieval-audit table.
-- Tests: labeled exact/event/update/topic corpus, missing embeddings, provider outage fail-open, model-version isolation.
-- Logs/metrics: top match and all feature scores, policy version, shadow decision, human outcome.
-- Switch: `VECTOR_DUPLICATE_MODE=shadow`.
-- Rollback: `off`; no publication decisions were blocked.
-- Risk: medium.
+- Status: bounded source-only retrieval and synthetic labeled evaluation are
+  implemented locally, offline, disabled, and verified on MariaDB 11.8.
+- Migration: none. Phase 6C1 reads existing vector documents/chunks/jobs only.
+- Tests: exact-version readiness, causal 72-hour filtering, source/generated
+  provenance, source-identity exclusion, distinct article aggregation, native
+  cosine ordering/index plan, bounded work, Recall@K/MRR, and availability rules.
+- Switch: `SEMANTIC_SHADOW_ENABLED=false`; there is no automatic task or pipeline
+  hook, threshold, decision, or durable semantic assessment in Phase 6C1 itself.
+- Rollback: leave the switch false or remove the isolated package; existing
+  deterministic and publication behavior is independent.
+
+### Implementation Phase 6C2A: fail-open semantic evidence shadow
+
+- Status: implemented locally, disabled, not deployed, and evidence-only.
+- Integration: one guarded `process_one()` call after deterministic Phase 5 and
+  before enrichment; vector and semantic flags are required, embedding generation
+  is not. Claims are committed before this work begins.
+- Migration: `003_semantic_shadow_assessments.sql` in the independent vector DB.
+  It records bounded statuses/evidence with idempotent version-aware identity.
+- Failure contract: unavailable asynchronous embeddings record `not_ready`; vector
+  retrieval or persistence errors are bounded and fail open. No provider work is
+  triggered synchronously.
+- Behavior: no threshold, semantic classification, suppression, scheduling change,
+  or selected/processed/published/publication-status mutation.
+- Rollback: leave `SEMANTIC_SHADOW_ENABLED=false`; deterministic and publication
+  behavior is independent.
+
+### Phase 6C2B: semantic calibration and shadow-policy comparison
+
+- Status: offline calibration/evidence-analysis foundation implemented locally.
+- Inputs: synthetic mechanics fixtures or manually reviewed JSON/JSONL/CSV labels;
+  selected Phase 5 policy, embedding, and semantic versions are never averaged
+  across incompatible generations.
+- Reads: existing application `duplicate_assessments` and vector
+  `semantic_shadow_assessments` only. No migration, task command, provider work,
+  database write, or pipeline import was added.
+- Output: deterministic JSON with label/availability counts, deterministic confusion
+  cells, distance/rank distributions, strict and broader Recall@K/MRR, research-only
+  cutoff metrics, material-update overlap, and small-sample warnings.
+- Behavior: no threshold, semantic classification, suppression, selection,
+  scheduling, processing, or publication-state effect.
+
+### Phase 6C2C: reviewed semantic policy proposal
+
+- Planned only after sufficient real reviewed labels exist. Compare version-isolated
+  evidence, inspect material-update overlap and false positives, and decide whether
+  a versioned shadow-only candidate policy merits separate implementation review.
+- No runtime threshold or enforcement is inherited from Phase 6C2B output.
+
+### Deployment Phase 7A/7B/7C1/7C2/7D: packaging and operations
+
+- Phase 7A completed the repository-only deployment audit without live access.
+- Phase 7B is implemented locally and not deployed. The production package uses a
+  non-root immutable web image, read-only root filesystem, persistent `/data`, and
+  separate edge/internal networks. Compose manages only private MariaDB 11.8 vector
+  storage; application and WordPress databases remain external.
+- Web startup validates core configuration offline in production, keeps APScheduler
+  off, and performs no migrations or pipeline/provider work. `/health` is static;
+  `/ready` checks application DB connectivity and vector DB only when enabled, not
+  provider or schema/migration state.
+- Publication is Bearer-token protected, production API docs default off, logging
+  is container-native, file logging is opt-in, DB TLS controls are explicit, and
+  runtime dependencies are pinned. Every existing feature flag remains false and
+  image search remains V1.
+- The lower-level Phase 7B environment contract is in
+  `docs/GETNEWSAPI_PRODUCTION_ENVIRONMENT.md`; the authoritative operator
+  procedure is `docs/GETNEWSAPI_DEPLOYMENT_RUNBOOK.md`.
+- Phase 7C1 is implemented locally and not deployed. Explicit app/vector manifests
+  pin order, target, kind, dependency, and checksum. Read-only plan/check/verify,
+  explicit apply, operator backup/restore attestations, target guards, MariaDB
+  advisory locks, per-database ledgers, drift/untracked-state blocking, full current
+  schema verification, and non-activating feature readiness use the same image.
+- Normal apply excludes `005`, fresh-start utilities, and test fixtures. It is
+  fail-fast, verifies before recording, never auto-baselines or auto-rolls back, and
+  explicitly acknowledges MariaDB's non-atomic multi-DDL boundary.
+- Phase 7C2 is implemented locally and not deployed. A static job catalog exposes
+  bounded fetch, process-then-publish, embedding, and controlled manual commands
+  from the same image with typed results and deterministic exit status. Production
+  rejects APScheduler ownership; the external baseline preserves the existing
+  30-minute fetch and pipeline cadence with an approximately three-minute offset.
+- App/vector MariaDB conflict groups serialize unsafe workflow and registration
+  overlap without holding SQL transactions during provider work. Existing fetch
+  and publish locks remain; embedding workers retain parallel durable row claims.
+  Embedding cadence, deployment, migration execution, and all feature activation
+  remain unapproved.
+- Phase 7D is implemented locally as a documentation-only deployment runbook. It
+  defines local-against-remote-DEV, remote DEV, and production procedures;
+  independent migration preflight; backup/restore attestations; staged feature
+  enablement; bounded backfill; monitoring; and disable/recovery actions. No live
+  rehearsal or activation occurred. Phase 7E remains separate.
 
 ### Phase 6: enforce high-confidence duplicate blocking
 
@@ -915,12 +1243,16 @@ No test should make a live provider, WordPress, or production DB call by default
 - Compare selected-unprocessed, processed-without-published-rich, unpublished rich, and publish-ready counts using the reviewed dry-run queries; do not run the apply script without replacing the cutoff and changing its default rollback intentionally.
 - Treat "processing succeeded" and "publishing succeeded" as stage summaries, not proof that every intended row was handled.
 - For a suspected duplicate, collect raw/rich/WP IDs, provider news/event IDs, source/canonical URLs, source timestamps, content hashes, and decision records before deleting or unpublishing anything.
-- For a post visible in WordPress but `published=0`, do not rerun publication blindly. Current code cannot reconcile it safely; inspect WP IDs/title/slug/source manually first.
+- For a post visible in WordPress but `published=0`, enable no new behavior until Phase 2 migrations are verified. Once the durable path owns the row, reconcile only by saved WP ID or CoinCourier publication key, never title/slug.
 
-**PLANNED vector/idempotency checks**
+**IMPLEMENTED LOCALLY BUT DISABLED vector-job checks; IMPLEMENTED BUT DISABLED idempotency checks**
 
-- Monitor active embedding version coverage and dead/retry jobs.
-- Verify `VECTOR_ENABLED`, duplicate mode, policy version, and dimension/schema agreement at startup.
+- Monitor active embedding version coverage and failed/retryable jobs using the
+  count-only ingest/worker metrics; do not log body or vector values.
+- Verify both enable flags, vector DB isolation, API key, approved provider/model,
+  1536 dimensions, and `chunk-v1` agreement before running a worker.
+- Run fresh ingestion before workers. Invoke source/generated backfill separately
+  with small limits so it remains operationally subordinate to fresh work.
 - Inspect exact identity and cluster evidence before overriding a decision.
 - When embeddings are unavailable, confirm semantic checks show `unavailable/fail_open` while exact and publication-idempotency controls remain active.
 - Reconcile stuck publication leases by deterministic idempotency key and WP post ID; never create a new post until reconciliation proves none exists.
@@ -953,8 +1285,8 @@ No test should make a live provider, WordPress, or production DB call by default
 6. What false-positive ceiling and editorial override workflow are acceptable before semantic enforcement?
 7. Should WordPress idempotency use a registered REST meta field/custom endpoint, direct DB reconciliation, or both?
 8. Is draft-first post reservation acceptable operationally, and how long may stuck drafts/media remain?
-9. Is OpenAI `text-embedding-3-small` approved for source text, and what provider data-retention policy applies?
-10. Is 1536 the long-lived dimension, or should a quality/cost benchmark choose another dimension before DDL?
+9. What provider data-retention policy must be enforced before production source-text embedding is enabled?
+10. What quality/cost benchmark and rollback window are required before replacing the approved 1536-dimension baseline?
 11. What rolling windows and caps apply independently to events, topics, entities, sources, and breaking news?
 12. Should the hard-coded `bitcoin dominance` SEO examples be replaced with neutral/dynamic examples to reduce framing repetition?
 13. Should generated `schema_jsonld` and `image_alt` be persisted, and must missing licensed-image attribution block publication?

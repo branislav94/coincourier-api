@@ -1,0 +1,35 @@
+{
+  "schema_version": "semantic-eval-v1",
+  "relationships": [
+    {
+      "query_source_article_id": 1001,
+      "candidate_source_article_id": 2001,
+      "label": "exact_duplicate"
+    },
+    {
+      "query_source_article_id": 1001,
+      "candidate_source_article_id": 2002,
+      "label": "material_update"
+    },
+    {
+      "query_source_article_id": 1001,
+      "candidate_source_article_id": 2003,
+      "label": "related_event"
+    },
+    {
+      "query_source_article_id": 1002,
+      "candidate_source_article_id": 2004,
+      "label": "same_event_duplicate"
+    },
+    {
+      "query_source_article_id": 1002,
+      "candidate_source_article_id": 2005,
+      "label": "broad_topic_overlap"
+    },
+    {
+      "query_source_article_id": 1002,
+      "candidate_source_article_id": 2006,
+      "label": "unrelated"
+    }
+  ]
+}

@@ -1,0 +1,57 @@
+{
+  "schema_version": "semantic-calibration-labels-v1",
+  "relationships": [
+    {
+      "query_source_article_id": 100,
+      "candidate_source_article_id": 201,
+      "relationship_label": "exact_duplicate",
+      "reviewer_note": "Synthetic exact-identity example.",
+      "reviewed_at": "2026-09-01T12:00:00Z"
+    },
+    {
+      "query_source_article_id": 100,
+      "candidate_source_article_id": 202,
+      "relationship_label": "material_update"
+    },
+    {
+      "query_source_article_id": 100,
+      "candidate_source_article_id": 203,
+      "relationship_label": "related_event"
+    },
+    {
+      "query_source_article_id": 100,
+      "candidate_source_article_id": 204,
+      "relationship_label": "broad_topic_overlap"
+    },
+    {
+      "query_source_article_id": 100,
+      "candidate_source_article_id": 205,
+      "relationship_label": "unrelated"
+    },
+    {
+      "query_source_article_id": 101,
+      "candidate_source_article_id": 206,
+      "relationship_label": "same_event_duplicate"
+    },
+    {
+      "query_source_article_id": 101,
+      "candidate_source_article_id": 207,
+      "relationship_label": "broad_topic_overlap"
+    },
+    {
+      "query_source_article_id": 102,
+      "candidate_source_article_id": 208,
+      "relationship_label": "exact_duplicate"
+    },
+    {
+      "query_source_article_id": 103,
+      "candidate_source_article_id": 209,
+      "relationship_label": "same_event_duplicate"
+    },
+    {
+      "query_source_article_id": 104,
+      "candidate_source_article_id": 210,
+      "relationship_label": "unrelated"
+    }
+  ]
+}

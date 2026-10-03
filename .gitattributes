@@ -1,0 +1,2 @@
+# Migration manifests hash the canonical SQL bytes on every platform.
+*.sql text eol=lf

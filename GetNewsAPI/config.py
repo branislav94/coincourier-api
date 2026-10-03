@@ -5,7 +5,7 @@ Loads environment variables from a local .env file and exposes:
 - API tokens/keys
 - WordPress REST credentials
 - Image generation settings
-- MySQL connection dictionaries for the app DB and the WordPress DB
+- MySQL connection dictionaries for the app DB, vector DB, and WordPress DB
 
 All values are sourced from environment variables to avoid hardcoding secrets.
 """
@@ -49,7 +49,44 @@ def _parse_optional_utc(name: str) -> datetime | None:
     return parsed.replace(microsecond=0)
 
 
+def _db_tls_options(prefix: str, *, default_enabled: bool = True) -> dict[str, object]:
+    """Build options supported by mysql-connector-python 9.3."""
+
+    enabled = _env_bool(f"{prefix}_SSL_ENABLED", default_enabled)
+    options: dict[str, object] = {"ssl_disabled": not enabled}
+    if not enabled:
+        return options
+
+    options["ssl_verify_cert"] = _env_bool(f"{prefix}_SSL_VERIFY_CERT", False)
+    options["ssl_verify_identity"] = _env_bool(
+        f"{prefix}_SSL_VERIFY_IDENTITY",
+        False,
+    )
+    ca_path = (os.getenv(f"{prefix}_SSL_CA") or "").strip()
+    if ca_path:
+        options["ssl_ca"] = ca_path
+    return options
+
+
+APP_ENV = os.getenv("APP_ENV", "development").strip().lower()
+API_DOCS_ENABLED = _env_bool("API_DOCS_ENABLED", APP_ENV != "production")
+PUBLISH_API_TOKEN = os.getenv("PUBLISH_API_TOKEN")
+READINESS_DB_TIMEOUT_SECONDS = int(os.getenv("READINESS_DB_TIMEOUT_SECONDS", "3"))
+LOG_LEVEL = os.getenv("LOG_LEVEL", "INFO").strip().upper() or "INFO"
+FILE_LOGGING_ENABLED = _env_bool("FILE_LOGGING_ENABLED", False)
+_DEFAULT_WRITABLE_STATE_DIR = "/data" if APP_ENV == "production" else "/app/cache"
+WRITABLE_STATE_DIR = (
+    os.getenv("WRITABLE_STATE_DIR", _DEFAULT_WRITABLE_STATE_DIR).strip()
+    or _DEFAULT_WRITABLE_STATE_DIR
+)
+FILE_LOG_PATH = os.getenv(
+    "FILE_LOG_PATH",
+    os.path.join(WRITABLE_STATE_DIR, "logs", "getnewsapi.log"),
+)
+
+
 ENABLE_APSCHEDULER = _env_bool("ENABLE_APSCHEDULER", False)
+JOB_LOCK_TIMEOUT_SECONDS = int(os.getenv("JOB_LOCK_TIMEOUT_SECONDS", "1"))
 FLASK_DEBUG = _env_bool("FLASK_DEBUG", False)
 PIPELINE_FRESH_START_AFTER_UTC = _parse_optional_utc("PIPELINE_FRESH_START_AFTER_UTC")
 PIPELINE_FRESH_START_AFTER_UTC_SQL = (
@@ -108,6 +145,9 @@ OPENAI_TEXT_MODEL = os.getenv("OPENAI_TEXT_MODEL", "gpt-5")
 OPENAI_REASONING_EFFORT = os.getenv("OPENAI_REASONING_EFFORT", "minimal").strip().lower()
 OPENAI_MAX_OUTPUT_TOKENS = int(os.getenv("OPENAI_MAX_OUTPUT_TOKENS", "4096"))
 SEO_PLUGIN = os.getenv("SEO_PLUGIN", "yoast").strip().lower()
+
+# Google Gemini search grounding.
+GOOGLE_API_KEY = os.getenv("GOOGLE_API_KEY")
 
 USE_API_IMAGES = int(os.getenv("USE_API_IMAGES", "1"))
 OPENAI_IMAGE_MODEL = os.getenv("OPENAI_IMAGE_MODEL", os.getenv("IMAGE_MODEL", "gpt-image-1"))
@@ -176,30 +216,116 @@ OPENVERSE_PER_PAGE = int(os.getenv("OPENVERSE_PER_PAGE", "10"))
 STOCK_IMAGE_TIMEOUT_SECONDS = int(os.getenv("STOCK_IMAGE_TIMEOUT_SECONDS", "10"))
 STOCK_IMAGE_CACHE_HOURS = int(os.getenv("STOCK_IMAGE_CACHE_HOURS", "24"))
 STOCK_IMAGE_REUSE_WINDOW_DAYS = int(os.getenv("STOCK_IMAGE_REUSE_WINDOW_DAYS", "20"))
-STOCK_IMAGE_USAGE_PATH = os.getenv("STOCK_IMAGE_USAGE_PATH", "/app/cache/stock_image_usage.json")
+STOCK_IMAGE_CACHE_DIR = os.getenv(
+    "STOCK_IMAGE_CACHE_DIR",
+    os.path.join(WRITABLE_STATE_DIR, "cache", "stock_images"),
+)
+STOCK_IMAGE_USAGE_PATH = os.getenv(
+    "STOCK_IMAGE_USAGE_PATH",
+    os.path.join(WRITABLE_STATE_DIR, "stock_image_usage.json"),
+)
 STOCK_IMAGE_REUSE_CHECK_WP_HISTORY = _env_bool("STOCK_IMAGE_REUSE_CHECK_WP_HISTORY", True)
+
+# Additive durable-state rollout controls. Apply maintenance/migrations Phase 2
+# before enabling these in an environment with an existing database.
+PROCESS_DURABLE_CLAIMS_ENABLED = _env_bool("PROCESS_DURABLE_CLAIMS_ENABLED", False)
+PROCESS_CLAIM_TIMEOUT_MINUTES = int(os.getenv("PROCESS_CLAIM_TIMEOUT_MINUTES", "30"))
+PUBLISH_DURABLE_STATE_ENABLED = _env_bool("PUBLISH_DURABLE_STATE_ENABLED", False)
+PUBLISH_CLAIM_TIMEOUT_MINUTES = int(os.getenv("PUBLISH_CLAIM_TIMEOUT_MINUTES", "30"))
+
+# Deterministic duplicate analysis is observational only. Apply the Phase 5
+# manual migration before enabling its assessment reads and writes.
+DUPLICATE_SHADOW_ENABLED = _env_bool("DUPLICATE_SHADOW_ENABLED", False)
+DUPLICATE_LOOKBACK_HOURS = int(os.getenv("DUPLICATE_LOOKBACK_HOURS", "72"))
+DUPLICATE_POLICY_VERSION = os.getenv("DUPLICATE_POLICY_VERSION", "v1").strip() or "v1"
+
+# Phase 6A vector storage is a separate, optional MariaDB service. No pipeline
+# path imports the vector store or opens this connection while disabled.
+VECTOR_ENABLED = _env_bool("VECTOR_ENABLED", False)
+VECTOR_DB_CONNECT_TIMEOUT_SECONDS = int(
+    os.getenv("VECTOR_DB_CONNECT_TIMEOUT_SECONDS", "5")
+)
+VECTOR_DB_CONFIG = {
+    "user": os.getenv("VECTOR_DB_USER"),
+    "password": os.getenv("VECTOR_DB_PASSWORD"),
+    "host": os.getenv("VECTOR_DB_HOST"),
+    "port": int(os.getenv("VECTOR_DB_PORT", "3306")),
+    "database": os.getenv("VECTOR_DB_NAME", "coincourier_vectors"),
+    "connection_timeout": VECTOR_DB_CONNECT_TIMEOUT_SECONDS,
+    **_db_tls_options("VECTOR_DB"),
+}
+
+# Phase 6B1 embedding machinery is directly invokable only. Source defaults
+# keep paid provider behavior disabled and do not add pipeline task wiring.
+EMBEDDING_ENABLED = _env_bool("EMBEDDING_ENABLED", False)
+EMBEDDING_PROVIDER = os.getenv("EMBEDDING_PROVIDER", "openai").strip().lower()
+EMBEDDING_MODEL = os.getenv(
+    "EMBEDDING_MODEL",
+    "text-embedding-3-small",
+).strip()
+EMBEDDING_DIMENSIONS = int(os.getenv("EMBEDDING_DIMENSIONS", "1536"))
+EMBEDDING_CHUNKER_VERSION = os.getenv(
+    "EMBEDDING_CHUNKER_VERSION",
+    "chunk-v1",
+).strip()
+EMBEDDING_BATCH_SIZE = int(os.getenv("EMBEDDING_BATCH_SIZE", "16"))
+EMBEDDING_INGEST_LIMIT = int(os.getenv("EMBEDDING_INGEST_LIMIT", "25"))
+EMBEDDING_WORK_LIMIT = int(os.getenv("EMBEDDING_WORK_LIMIT", "5"))
+EMBEDDING_CLAIM_TIMEOUT_MINUTES = int(
+    os.getenv("EMBEDDING_CLAIM_TIMEOUT_MINUTES", "30")
+)
+EMBEDDING_BACKFILL_PAGE_SIZE = int(
+    os.getenv("EMBEDDING_BACKFILL_PAGE_SIZE", "100")
+)
+EMBEDDING_MAX_CHUNKS_PER_JOB = int(
+    os.getenv("EMBEDDING_MAX_CHUNKS_PER_JOB", "100")
+)
+
+# Phase 6C2A can persist retrieval evidence during processing only when both the
+# vector and semantic flags are true. It has no threshold or decision authority.
+SEMANTIC_SHADOW_ENABLED = _env_bool("SEMANTIC_SHADOW_ENABLED", False)
+SEMANTIC_LOOKBACK_HOURS = int(
+    os.getenv("SEMANTIC_LOOKBACK_HOURS", str(DUPLICATE_LOOKBACK_HOURS))
+)
+SEMANTIC_TOP_K = int(os.getenv("SEMANTIC_TOP_K", "10"))
+SEMANTIC_EVIDENCE_VERSION = (
+    os.getenv("SEMANTIC_EVIDENCE_VERSION", "semantic-shadow-v1").strip()
+    or "semantic-shadow-v1"
+)
 
 # WordPress REST API credentials
 WP_API_URL = os.getenv("WP_API_URL")
 WP_USERNAME = os.getenv("WP_USERNAME")
 WP_APP_PASSWORD = os.getenv("WP_APP_PASSWORD")
+WP_HTTP_CONNECT_TIMEOUT_SECONDS = int(
+    os.getenv("WP_HTTP_CONNECT_TIMEOUT_SECONDS", "10")
+)
+WP_HTTP_READ_TIMEOUT_SECONDS = int(
+    os.getenv("WP_HTTP_READ_TIMEOUT_SECONDS", "60")
+)
 
-# MySQL configuration for Flask API
+# MySQL configuration for the application API and pipeline.
+DB_CONNECT_TIMEOUT_SECONDS = int(os.getenv("DB_CONNECT_TIMEOUT_SECONDS", "5"))
 DB_CONFIG = {
     'user': os.getenv('DB_USER'),
     'password': os.getenv('DB_PASSWORD'),
     'host': os.getenv('DB_HOST'),
     'port': int(os.getenv("DB_PORT", 3306)),
     'database': os.getenv('DB_NAME'),
-    "ssl_disabled": False,
-    "ssl_verify_cert": False
+    "connection_timeout": DB_CONNECT_TIMEOUT_SECONDS,
+    **_db_tls_options("DB"),
 }
 
 # MySQL configuration for WordPress DB
+WP_DB_CONNECT_TIMEOUT_SECONDS = int(
+    os.getenv("WP_DB_CONNECT_TIMEOUT_SECONDS", "5")
+)
 WP_DB_CONFIG = {
     'user': os.getenv('WP_DB_USER'),
     'password': os.getenv('WP_DB_PASSWORD'),
     'host': os.getenv('WP_DB_HOST'),
     'port': int(os.getenv("WP_DB_PORT", 3306)),
     'database': os.getenv('WP_DB_NAME'),
+    "connection_timeout": WP_DB_CONNECT_TIMEOUT_SECONDS,
+    **_db_tls_options("WP_DB"),
 }

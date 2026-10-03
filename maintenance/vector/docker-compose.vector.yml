@@ -1,0 +1,24 @@
+name: getnewsapi-vector-local
+
+services:
+  getnewsapi-vector-mariadb:
+    image: mariadb:11.8
+    container_name: getnewsapi-vector-mariadb
+    environment:
+      MARIADB_DATABASE: ${VECTOR_MARIADB_DATABASE:-coincourier_vectors}
+      MARIADB_USER: ${VECTOR_MARIADB_USER:-vector_local}
+      MARIADB_PASSWORD: ${VECTOR_MARIADB_PASSWORD:-vector_local_only}
+      MARIADB_ROOT_PASSWORD: ${VECTOR_MARIADB_ROOT_PASSWORD:-vector_root_local_only}
+    ports:
+      - "127.0.0.1:${VECTOR_MARIADB_PORT:-13309}:3306"
+    volumes:
+      - getnewsapi-vector-mariadb-data:/var/lib/mysql
+    healthcheck:
+      test: ["CMD", "healthcheck.sh", "--connect", "--innodb_initialized"]
+      interval: 5s
+      timeout: 5s
+      retries: 30
+    restart: unless-stopped
+
+volumes:
+  getnewsapi-vector-mariadb-data:

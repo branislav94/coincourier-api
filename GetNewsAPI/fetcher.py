@@ -78,6 +78,7 @@ TOP_MULTI_TICKERS = "BTC,ETH,SOL,XRP,BNB"
 _session = requests.Session()
 _session.headers.update({"User-Agent": "CryptoCourierFetcher/1.0"})
 _api = "https://cryptonews-api.com/api/v1"
+_FETCH_ERROR_KEY = "_getnewsapi_fetch_error"
 
 
 
@@ -433,7 +434,7 @@ def _fetch(endpoint: str, params: Dict[str, Any]) -> Dict[str, Any]:
     Behavior:
         - Adds CRYPTO_NEWS_TOKEN to params as 'token'.
         - Returns parsed JSON dict on HTTP 200.
-        - On non-200 or exceptions, prints a short diagnostic and returns {}.
+        - On non-200 or exceptions, logs only status/type and returns an error marker.
 
     Args:
         endpoint: Fully qualified endpoint URL.
@@ -441,19 +442,27 @@ def _fetch(endpoint: str, params: Dict[str, Any]) -> Dict[str, Any]:
 
     Returns:
         dict[str, Any]:
-            Parsed JSON response or empty dict on failure.
+            Parsed JSON response or a private error marker on failure.
     """
     params = dict(params)
     params["token"] = CRYPTO_NEWS_TOKEN
     try:
-        r = _session.get(endpoint, params=params, timeout=30)
-        if r.status_code == 200:
-            return r.json()
-        print(f"[FETCH] {endpoint} → HTTP {r.status_code}: {r.text[:200]}")
-        return {}
-    except Exception as e:
-        print(f"[FETCH] Error: {e}")
-        return {}
+        response = _session.get(endpoint, params=params, timeout=30)
+        if response.status_code == 200:
+            return response.json()
+        logging.warning(
+            "[FETCH] CryptoNews request failed status=%s endpoint=%s",
+            response.status_code,
+            endpoint,
+        )
+        return {_FETCH_ERROR_KEY: True}
+    except Exception as error:
+        logging.warning(
+            "[FETCH] CryptoNews request failed error_type=%s endpoint=%s",
+            type(error).__name__,
+            endpoint,
+        )
+        return {_FETCH_ERROR_KEY: True}
 
 def _pull_batch() -> List[Dict[str, Any]]:
     """
@@ -499,7 +508,8 @@ def _pull_batch() -> List[Dict[str, Any]]:
     pulls.append(_fetch(f"{_api}/category", {
         "section": "general",
         "items": ITEMS_PER_PULL,
-        "page": 1
+        "page": 1,
+        "extra-fields": "id,eventid,rankscore",
     }))
 
     # 3) Multi-ticker OR search (broad)
@@ -522,13 +532,17 @@ def _pull_batch() -> List[Dict[str, Any]]:
             "extra-fields": "id,eventid,rankscore"
         }))
 
+    successful_pulls = [pull for pull in pulls if not pull.get(_FETCH_ERROR_KEY)]
+    if not successful_pulls:
+        raise RuntimeError("all CryptoNews requests failed")
+
     # Flatten & dedupe
     seen_ids = set()
     seen_urls = set()
     seen_titles = set()
     out: List[Dict[str, Any]] = []
 
-    for p in pulls:
+    for p in successful_pulls:
         for it in p.get("data", []):
             news_id = it.get("news_id")
             url = _clean_url(it.get("news_url", ""))
@@ -770,7 +784,7 @@ def _insert_or_update(items: List[Dict[str, Any]], batch_id: str):
         title = VALUES(title),
         full_text = VALUES(full_text),
         image_url = VALUES(image_url),
-        event_id = VALUES(event_id),
+        event_id = COALESCE(VALUES(event_id), event_id),
         rank_score = VALUES(rank_score),
         title_hash = VALUES(title_hash),
         fetch_batch_id = VALUES(fetch_batch_id);
@@ -1143,7 +1157,7 @@ def _mark_chosen(ids: List[int], breaking: bool):
     conn.commit(); cur.close(); conn.close()
 
 # -------------------- Main cycle ---------------------------------------------
-def run_fetch_cycle():
+def run_fetch_cycle() -> dict[str, int | str]:
     """
     Run one end-to-end fetch/score/schedule cycle.
 
@@ -1164,7 +1178,7 @@ def run_fetch_cycle():
         None
 
     Returns:
-        None
+        A bounded operational status and pulled/scored counters.
     """
     conn = None
     conn2 = None
@@ -1190,7 +1204,11 @@ def run_fetch_cycle():
                 "[FETCH] MySQL advisory lock 'news_fetcher_lock' is held by another DB session%s; skipping.",
                 f" (connection id={lock_holder})" if lock_holder else "",
             )
-            return
+            return {
+                "status": "skipped_already_running",
+                "pulled": 0,
+                "scored": 0,
+            }
         lock_acquired = True
         logging.info("[FETCH] Acquired MySQL advisory lock 'news_fetcher_lock'.")
 
@@ -1200,7 +1218,7 @@ def run_fetch_cycle():
         raw_items = _pull_batch()
         if not raw_items:
             logging.info("[FETCH] No items pulled")
-            return
+            return {"status": "no_work", "pulled": 0, "scored": 0}
 
         _insert_or_update(raw_items, batch_id)
 
@@ -1240,9 +1258,20 @@ def run_fetch_cycle():
 
         logging.info("[FETCH] Cycle complete. Pulled=%d Scored=%d Batch=%s",
                      len(raw_items), len(scored), batch_id)
+        return {
+            "status": "success",
+            "pulled": len(raw_items),
+            "scored": len(scored),
+        }
 
-    except Exception:
+    except Exception as error:
         logging.exception("[FETCH] Cycle error")
+        return {
+            "status": "failed",
+            "pulled": 0,
+            "scored": 0,
+            "reason_type": type(error).__name__,
+        }
 
     finally:
         # close secondary conn if something failed before we closed it

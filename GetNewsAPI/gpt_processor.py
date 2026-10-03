@@ -4,34 +4,38 @@ from datetime import datetime
 from db import get_db_connection
 from openai import OpenAI
 from config import (
+    GOOGLE_API_KEY,
     GROK_API_KEY,
     GROK_BASE_URL,
     GROK_MAX_OUTPUT_TOKENS,
     GROK_TEXT_MODEL,
     LLM_FALLBACK_PROVIDER,
+    DUPLICATE_SHADOW_ENABLED,
+    SEMANTIC_SHADOW_ENABLED,
+    VECTOR_ENABLED,
     OPENAI_API_KEY,
     OPENAI_MAX_OUTPUT_TOKENS,
     OPENAI_REASONING_EFFORT,
     OPENAI_TEXT_MODEL,
     PIPELINE_FRESH_START_AFTER_UTC_SQL,
+    PROCESS_CLAIM_TIMEOUT_MINUTES,
+    PROCESS_DURABLE_CLAIMS_ENABLED,
     PRIMARY_LLM_PROVIDER,
     get_grok_reasoning_effort,
 )
+from duplicate_detection.shadow import analyze_duplicates_in_shadow
+from semantic_retrieval.shadow import run_semantic_shadow
+from repositories.raw_news import RawNewsRepository
+from repositories.state import claim_prefix, safe_error_message
 import time, random
 import requests
 from typing import Any, Dict
-import logging, pathlib
+import logging
 import re, hashlib
 from html import escape
-logging.basicConfig(
-    level=logging.INFO,
-    format="%(asctime)s  %(levelname)s  %(message)s",
-    handlers=[
-        logging.StreamHandler(),
-        logging.FileHandler(pathlib.Path(__file__).with_suffix('.log'),  # GetNewsAPI/gpt_processor.log
-                       encoding="utf-8")
-    ],
-)
+from runtime.logging_config import configure_logging
+
+configure_logging()
 
 _session = requests.Session()
 _session.headers.update({
@@ -85,11 +89,10 @@ PROCESS_BATCH_MIN = int(os.getenv("PROCESS_BATCH_MIN", "3"))
 PROCESS_BATCH_MAX = int(os.getenv("PROCESS_BATCH_MAX", "12"))
 
 # -----------------------------------------------------------------------------
-GOOGLE_API_KEY = os.getenv("GOOGLE_API_KEY")   # <-- add this
 GEMINI_SEARCH_MODEL = "models/gemini-2.5-flash"  # or gemini-1.5-pro-search
 GEMINI_URL = (
     f"https://generativelanguage.googleapis.com/v1beta/"
-    f"{GEMINI_SEARCH_MODEL}:generateContent?key={GOOGLE_API_KEY}"
+    f"{GEMINI_SEARCH_MODEL}:generateContent"
 )
 
 import time, random
@@ -502,9 +505,15 @@ def _llm_provider_order() -> list[str]:
 
 def _safe_ai_reason(exc: Exception) -> str:
     text = str(exc)
-    for secret in (GROK_API_KEY, OPENAI_API_KEY):
+    for secret in (GOOGLE_API_KEY, GROK_API_KEY, OPENAI_API_KEY):
         if secret:
             text = text.replace(secret, "[redacted]")
+    text = re.sub(r"(?i)([?&]key=)[^&\s]+", r"\1[redacted]", text)
+    text = re.sub(
+        r"(?i)(x-goog-api-key\s*[:=]\s*)[^\s,;]+",
+        r"\1[redacted]",
+        text,
+    )
     text = re.sub(r"sk-[A-Za-z0-9_-]+", "[redacted]", text)
     text = re.sub(r"xai-[A-Za-z0-9_-]+", "[redacted]", text)
     text = " ".join(text.split())
@@ -1116,7 +1125,9 @@ def call_openai(
 
 
 
-# before: GEMINI_URL = "https://…/v1beta/models/gemini-1.5-flash-latest:generateContent?key=…"
+class GeminiRequestError(RuntimeError):
+    """A credential-safe Gemini transport or HTTP failure."""
+
 
 def call_gemini_search(prompt: str) -> str:
     """
@@ -1156,8 +1167,24 @@ def call_gemini_search(prompt: str) -> str:
         # ,"temperature": 0.1
     }
 
+    if not GOOGLE_API_KEY:
+        raise GeminiRequestError("Gemini API key is not configured")
+
+    headers = {"x-goog-api-key": GOOGLE_API_KEY}
     for attempt in range(1, MAX_RETRIES + 1):
-        r = requests.post(GEMINI_URL, json=body, timeout=45)
+        try:
+            r = requests.post(
+                GEMINI_URL,
+                headers=headers,
+                json=body,
+                timeout=45,
+            )
+        except requests.RequestException as exc:
+            error_type = type(exc).__name__ or "RequestException"
+            logging.error("Gemini request failed error_type=%s", error_type)
+            raise GeminiRequestError(
+                f"Gemini request failed ({error_type})"
+            ) from None
         if r.status_code == 200:
             return r.json()["candidates"][0]["content"]["parts"][0]["text"].strip()
         if r.status_code in (429, 503):
@@ -1165,9 +1192,10 @@ def call_gemini_search(prompt: str) -> str:
             print(f"⚠️  Gemini {r.status_code} – retrying in {wait:.1f}s")
             time.sleep(wait)
             continue
-        # any other error
-        print("❌ Gemini response:", r.text)
-        r.raise_for_status()
+        logging.error("Gemini request failed status=%s", r.status_code)
+        raise GeminiRequestError(
+            f"Gemini request failed with HTTP status {r.status_code}"
+        )
 
     raise RuntimeError("Gemini search preview repeatedly failed")
 
@@ -1714,35 +1742,54 @@ def store_rich_news(record: dict, original: dict) -> None:
 
     conn = get_db_connection()
     cur  = conn.cursor()
-    cur.execute(
-        """
-        INSERT INTO rich_crpytonews
-          (news_url, title, full_text, publish_date,
-           source_name, category, hashtags, sentiment,
-           tickers, image_url,
-           seo_focus, seo_slug, seo_meta)
-        VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s)
-        ON DUPLICATE KEY UPDATE
-          seo_focus = VALUES(seo_focus),
-          seo_slug  = VALUES(seo_slug),
-          seo_meta  = VALUES(seo_meta)
-        """,
-        (
-            original["news_url"],
-            record["title"],
-            record["full_text"],
-            datetime.utcnow().strftime("%Y-%m-%d %H:%M:%S"),
-            original.get("source_name", ""),
-            record["category"],
-            record["hashtags"],
-            record["sentiment"],
-            ", ".join(original.get("tickers", [])),
-            original.get("image_url", ""),
-            record["seo_focus"],
-            record["seo_slug"],
-            record["seo_meta"],
-        ),
+    values = (
+        original["news_url"],
+        record["title"],
+        record["full_text"],
+        datetime.utcnow().strftime("%Y-%m-%d %H:%M:%S"),
+        original.get("source_name", ""),
+        record["category"],
+        record["hashtags"],
+        record["sentiment"],
+        ", ".join(original.get("tickers", [])),
+        original.get("image_url", ""),
+        record["seo_focus"],
+        record["seo_slug"],
+        record["seo_meta"],
     )
+    if PROCESS_DURABLE_CLAIMS_ENABLED:
+        cur.execute(
+            """
+            INSERT INTO rich_crpytonews
+              (news_url, raw_article_id, title, full_text, publish_date,
+               source_name, category, hashtags, sentiment,
+               tickers, image_url,
+               seo_focus, seo_slug, seo_meta)
+            VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s)
+            ON DUPLICATE KEY UPDATE
+              raw_article_id = COALESCE(raw_article_id, VALUES(raw_article_id)),
+              seo_focus = VALUES(seo_focus),
+              seo_slug  = VALUES(seo_slug),
+              seo_meta  = VALUES(seo_meta)
+            """,
+            (values[0], original["id"], *values[1:]),
+        )
+    else:
+        cur.execute(
+            """
+            INSERT INTO rich_crpytonews
+              (news_url, title, full_text, publish_date,
+               source_name, category, hashtags, sentiment,
+               tickers, image_url,
+               seo_focus, seo_slug, seo_meta)
+            VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s)
+            ON DUPLICATE KEY UPDATE
+              seo_focus = VALUES(seo_focus),
+              seo_slug  = VALUES(seo_slug),
+              seo_meta  = VALUES(seo_meta)
+            """,
+            values,
+        )
     conn.commit()
     cur.close()
     conn.close()
@@ -1845,11 +1892,57 @@ def validate_rewritten_article(doc: dict, raw: dict) -> None:
         )
         raise ArticleValidationError(failures, raw.get("id"), raw.get("title"))
 
-def process_one(raw):
+
+def _run_duplicate_shadow_fail_open(raw: dict) -> None:
+    if not DUPLICATE_SHADOW_ENABLED:
+        return
+    try:
+        analyze_duplicates_in_shadow(raw)
+    except Exception:
+        logging.exception(
+            "[DUPLICATE-SHADOW] article_id=%s analysis_failed=true decision=continue",
+            raw.get("id"),
+        )
+
+
+def _run_semantic_shadow_fail_open(raw: dict) -> None:
+    article_id = raw.get("id")
+    if not VECTOR_ENABLED:
+        logging.info(
+            "[SEMANTIC-SHADOW] semantic_shadow_disabled=true article_id=%s "
+            "reason=vector_disabled decision=continue",
+            article_id,
+        )
+        return
+    if not SEMANTIC_SHADOW_ENABLED:
+        logging.info(
+            "[SEMANTIC-SHADOW] semantic_shadow_disabled=true article_id=%s "
+            "reason=semantic_disabled decision=continue",
+            article_id,
+        )
+        return
+    try:
+        run_semantic_shadow(
+            int(article_id),
+            vector_enabled=True,
+            semantic_enabled=True,
+        )
+    except Exception as error:
+        logging.error(
+            "[SEMANTIC-SHADOW] semantic_shadow_error=true article_id=%s "
+            "error_type=%s reason=unexpected_runner_failure persisted=false "
+            "decision=continue",
+            article_id,
+            type(error).__name__,
+        )
+
+def process_one(raw, *, mark_complete=True, on_error=None):
     """
     Process a single raw cryptonewsapi row through the GPT enrichment pipeline.
 
     Steps:
+        - Run optional fail-open deterministic duplicate shadow analysis
+        - Run optional fail-open semantic evidence shadow
         - Optionally enrich via search (enrich_with_search)
         - Detect/normalize YouTube video URL (_maybe_video_url)
         - Rewrite/classify to strict JSON (classify_and_rewrite)
@@ -1867,6 +1960,8 @@ def process_one(raw):
             True when the article was stored and marked processed, False otherwise.
     """
     try:
+        _run_duplicate_shadow_fail_open(raw)
+        _run_semantic_shadow_fail_open(raw)
         extra = enrich_with_search(raw)
         video_url = _maybe_video_url(raw)
         draft, text_provider = classify_and_rewrite(raw, extra, video_url)
@@ -1883,15 +1978,18 @@ def process_one(raw):
         validate_rewritten_article(final_doc, raw)
         logging.info("SEO dump: %s", {k: final_doc[k] for k in ("seo_focus","seo_slug","seo_meta")})
         store_rich_news(final_doc, raw)     # ✅ store first
-        mark_processed(raw["news_url"])     # ✅ then mark processed
+        if mark_complete:
+            mark_processed(raw["news_url"])     # ✅ then mark processed
         return True
-    except Exception:
+    except Exception as exc:
         logging.exception(
             "GPT pipeline failed; article remains retryable. article_id=%s title=%r source=%r",
             raw.get("id"),
             raw.get("title"),
             raw.get("source_name"),
         )
+        if on_error is not None:
+            on_error(exc)
         return False
 
 
@@ -1928,6 +2026,12 @@ def process_news_with_gpt(batch_size: int | None = None):
         batch_size = max(
             PROCESS_BATCH_MIN,
             min(PROCESS_BATCH_MAX, _count_due_within(PROCESS_LOOKAHEAD_MINUTES)),
+        )
+
+    if PROCESS_DURABLE_CLAIMS_ENABLED:
+        return _process_news_with_durable_claims(
+            int(batch_size),
+            use_lookahead_filter=use_lookahead_filter,
         )
 
     fresh_start_clause = ""
@@ -1975,6 +2079,97 @@ def process_news_with_gpt(batch_size: int | None = None):
 
     result = {"attempted": attempted, "succeeded": succeeded, "failed": failed}
     if failed:
+        logging.warning("GPT processing completed with failures: %s", result)
+    else:
+        logging.info("GPT processing completed: %s", result)
+    return result
+
+
+def _process_news_with_durable_claims(
+    batch_size: int,
+    *,
+    use_lookahead_filter: bool,
+) -> dict[str, int]:
+    """Run claimed work after the claim transaction has been committed."""
+    repository = RawNewsRepository()
+    result = {"attempted": 0, "succeeded": 0, "failed": 0}
+
+    for _ in range(max(0, batch_size)):
+        claim = repository.claim_next(
+            timeout_minutes=PROCESS_CLAIM_TIMEOUT_MINUTES,
+            lookahead_minutes=(PROCESS_LOOKAHEAD_MINUTES if use_lookahead_filter else None),
+            fresh_start_after=PIPELINE_FRESH_START_AFTER_UTC_SQL,
+        )
+        if claim is None:
+            break
+
+        raw_id = int(claim.article["id"])
+        result["attempted"] += 1
+        logging.info(
+            "[PROCESS-CLAIM] raw_article_id=%s attempt=%s claim=%s decision=%s",
+            raw_id,
+            claim.attempt,
+            claim_prefix(claim.token),
+            "reclaimed-expired" if claim.recovered else "claimed",
+        )
+        captured_error: list[Exception] = []
+        try:
+            succeeded = process_one(
+                claim.article,
+                mark_complete=False,
+                on_error=captured_error.append,
+            )
+            if succeeded:
+                if not repository.complete(raw_id, claim.token):
+                    raise RuntimeError("processing claim ownership was lost before completion")
+                result["succeeded"] += 1
+                logging.info(
+                    "[PROCESS-CLAIM] raw_article_id=%s attempt=%s claim=%s decision=completed",
+                    raw_id,
+                    claim.attempt,
+                    claim_prefix(claim.token),
+                )
+                continue
+
+            error = captured_error[0] if captured_error else RuntimeError("processing did not complete")
+            repository.fail(
+                raw_id,
+                claim.token,
+                safe_error_message(error, "processing"),
+            )
+            result["failed"] += 1
+            logging.warning(
+                "[PROCESS-CLAIM] raw_article_id=%s attempt=%s claim=%s decision=retryable error_type=%s",
+                raw_id,
+                claim.attempt,
+                claim_prefix(claim.token),
+                type(error).__name__,
+            )
+        except Exception as exc:
+            repository.fail(
+                raw_id,
+                claim.token,
+                safe_error_message(exc, "processing"),
+            )
+            result["failed"] += 1
+            logging.exception(
+                "[PROCESS-CLAIM] raw_article_id=%s attempt=%s claim=%s decision=retryable",
+                raw_id,
+                claim.attempt,
+                claim_prefix(claim.token),
+            )
+        except BaseException:
+            try:
+                repository.release_interrupted(raw_id, claim.token)
+            except Exception:
+                logging.exception(
+                    "[PROCESS-CLAIM] raw_article_id=%s claim=%s decision=release-failed",
+                    raw_id,
+                    claim_prefix(claim.token),
+                )
+            raise
+
+    if result["failed"]:
         logging.warning("GPT processing completed with failures: %s", result)
     else:
         logging.info("GPT processing completed: %s", result)
