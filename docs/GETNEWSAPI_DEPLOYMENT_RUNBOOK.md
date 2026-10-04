@@ -19,6 +19,9 @@ change approval in the deployment record before executing any mutating step.
 Never substitute one environment's migration ledger or backup evidence for
 another environment's evidence.
 
+For initial Dokploy DEV resource setup, use the focused
+[GETNEWSAPI_DOKPLOY_DEV_HANDOFF.md](GETNEWSAPI_DOKPLOY_DEV_HANDOFF.md).
+
 ## Non-Negotiable Safety Rules
 
 - Start every new environment with offline configuration validation and read-only
