@@ -6,7 +6,7 @@ from typing import Any, Callable
 
 import mysql.connector
 
-from config import DB_CONFIG
+from config import DB_CONFIG, EMBEDDING_FRESH_START_AFTER_UTC
 from embeddings.ingestion import ApplicationArticle
 from vector_store.models import SourceType, VectorDocumentRecord
 
@@ -28,11 +28,16 @@ class EmbeddingArticleRepository:
     def scan_recent(self, limit: int) -> list[ApplicationArticle]:
         if limit <= 0:
             return []
+        cutoff = EMBEDDING_FRESH_START_AFTER_UTC
+        cutoff_clause = (
+            "\n                      AND c.insertDate >= %s" if cutoff is not None else ""
+        )
+        params = (cutoff, cutoff, limit) if cutoff is not None else (limit,)
         connection = self._connect()
         cursor = connection.cursor(dictionary=True)
         try:
             cursor.execute(
-                """
+                f"""
                 SELECT source_type, source_article_id, rich_article_id,
                        source_url, title, body, published_at
                 FROM (
@@ -47,7 +52,7 @@ class EmbeddingArticleRepository:
                     FROM cryptonewsapi c
                     WHERE c.chosen_for_publish = 1
                       AND c.full_text IS NOT NULL
-                      AND TRIM(c.full_text) <> ''
+                      AND TRIM(c.full_text) <> ''{cutoff_clause}
                     UNION ALL
                     SELECT 'coincourier_generated' AS source_type,
                            c.id AS source_article_id,
@@ -60,12 +65,12 @@ class EmbeddingArticleRepository:
                     FROM rich_crpytonews r
                     LEFT JOIN cryptonewsapi c ON c.id = r.raw_article_id
                     WHERE r.full_text IS NOT NULL
-                      AND TRIM(r.full_text) <> ''
+                      AND TRIM(r.full_text) <> ''{cutoff_clause}
                 ) candidates
                 ORDER BY sort_at DESC, source_priority ASC, article_id DESC
                 LIMIT %s
                 """,
-                (limit,),
+                params,
             )
             return [self._article(row) for row in cursor.fetchall()]
         finally:
@@ -92,8 +97,17 @@ class EmbeddingArticleRepository:
     ) -> list[ApplicationArticle]:
         if before_id <= 0 or page_size <= 0:
             return []
+        cutoff = EMBEDDING_FRESH_START_AFTER_UTC
+        cutoff_clause = (
+            "\n                  AND c.insertDate >= %s" if cutoff is not None else ""
+        )
+        params = (
+            (before_id, cutoff, page_size)
+            if cutoff is not None
+            else (before_id, page_size)
+        )
         if source_type is SourceType.SOURCE_ARTICLE:
-            sql = """
+            sql = f"""
                 SELECT 'source_article' AS source_type,
                        c.id AS source_article_id, NULL AS rich_article_id,
                        c.news_url AS source_url, c.title,
@@ -101,12 +115,12 @@ class EmbeddingArticleRepository:
                 FROM cryptonewsapi c
                 WHERE c.id < %s
                   AND c.full_text IS NOT NULL
-                  AND TRIM(c.full_text) <> ''
+                  AND TRIM(c.full_text) <> ''{cutoff_clause}
                 ORDER BY c.id DESC
                 LIMIT %s
             """
         elif source_type is SourceType.COINCOURIER_GENERATED:
-            sql = """
+            sql = f"""
                 SELECT 'coincourier_generated' AS source_type,
                        c.id AS source_article_id, r.id AS rich_article_id,
                        r.news_url AS source_url, r.title,
@@ -115,7 +129,7 @@ class EmbeddingArticleRepository:
                 LEFT JOIN cryptonewsapi c ON c.id = r.raw_article_id
                 WHERE r.id < %s
                   AND r.full_text IS NOT NULL
-                  AND TRIM(r.full_text) <> ''
+                  AND TRIM(r.full_text) <> ''{cutoff_clause}
                 ORDER BY r.id DESC
                 LIMIT %s
             """
@@ -125,7 +139,7 @@ class EmbeddingArticleRepository:
         connection = self._connect()
         cursor = connection.cursor(dictionary=True)
         try:
-            cursor.execute(sql, (before_id, page_size))
+            cursor.execute(sql, params)
             return [self._article(row) for row in cursor.fetchall()]
         finally:
             cursor.close()

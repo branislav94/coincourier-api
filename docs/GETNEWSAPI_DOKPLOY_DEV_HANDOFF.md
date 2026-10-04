@@ -22,8 +22,10 @@ for approvals, detailed migrations, acceptance evidence, recovery, and monitorin
 | Liveness | `GET /health`; existing image healthcheck |
 | Persistent application storage | Writable `/data`; container remains replaceable |
 
-Verify the saved Dokploy resource and resulting build/deployment job actually
-use this commit and Dockerfile. Do not select `docker-compose.yml`,
+Verify the saved Dokploy resource and resulting build/deployment job use the
+reviewed current `dev` commit and Dockerfile; record the actual SHA/image digest.
+The SHA above is the historical initial baseline. A cutoff-enabled redeployment
+must include support for `EMBEDDING_FRESH_START_AFTER_UTC`. Do not select `docker-compose.yml`,
 `docker-compose.dev.yml`, or `docker-compose.prod.yml` for this API resource.
 `APP_ENV=production` is the persistent-runtime safety mode; the services and
 credentials remain DEV. Keep runtime secrets out of build arguments and Git.
@@ -222,6 +224,8 @@ USE_SOURCE_IMAGES=false
 MIGRATION_TEST_MODE=false
 RUN_GROK_TEXT_SMOKE=false
 RUN_GROK_IMAGE_SMOKE=false
+PIPELINE_FRESH_START_AFTER_UTC=
+EMBEDDING_FRESH_START_AFTER_UTC=
 
 FILE_LOGGING_ENABLED=false
 LOG_LEVEL=INFO
@@ -258,6 +262,25 @@ paths deliberately override development defaults in `.env.example`. The cache
 is replaceable; image-usage JSON affects reuse and must persist across replacements.
 File logging starts off; stdout/stderr is the initial log destination.
 
+### Optional fresh-start boundaries
+
+`PIPELINE_FRESH_START_AFTER_UTC` controls processing/publishing eligibility;
+`EMBEDDING_FRESH_START_AFTER_UTC` independently controls new embedding document/job
+registration by both recent `embedding_ingest` and manual `embedding_backfill`.
+Unset or blank preserves existing behavior. For an approved DEV boundary, both
+can independently use `2026-10-04 18:00:00` UTC; this is an example, not a default
+or a configured deployment value. UTC timestamps with `Z` or an explicit offset
+are also accepted; offsets are normalized to UTC.
+
+The embedding boundary is inclusive: the underlying `cryptonewsapi.insertDate`
+must be at or after it. Generated articles use their existing `raw_article_id`
+link to that raw row; missing/unresolved links or a missing raw insertion time
+are excluded while the cutoff is enabled. Publication/selection dates do not
+replace this timestamp. Existing eligibility rules still apply.
+
+This setting does not delete application history, vectors, or jobs, filter
+already queued worker jobs, start backfill, or enable any rollout flag.
+
 ### Provider credentials before approved job/profile tests
 
 | Operation | Required names and conditions |
@@ -277,7 +300,7 @@ scheduler/features off. Add them before the corresponding profile/job is tested.
 
 ### Dokploy health/routing checklist
 
-- [ ] Build/deploy record matches the expected initial DEV SHA.
+- [ ] Build/deploy record matches the reviewed current DEV SHA; actual image digest recorded.
 - [ ] Unique Dokploy application identity; Dockerfile build selected.
 - [ ] Internal port `5000`; proxy/domain route configured if public API access is wanted.
 - [ ] `GET /health` returns 200.
@@ -449,7 +472,10 @@ rename an unknown production container to satisfy DEV.**
 
 ## Source authority
 
-Verified against the initial implementation SHA above: [Dockerfile](../Dockerfile),
+The initial application contract is based on the historical implementation SHA
+above; the optional embedding cutoff follows the reviewed current configuration
+and [registration queries](../GetNewsAPI/repositories/embedding_articles.py).
+Relevant sources: [Dockerfile](../Dockerfile),
 [configuration](../GetNewsAPI/config.py), [application](../GetNewsAPI/app.py),
 [runtime validation](../GetNewsAPI/runtime/config_validation.py),
 [CLI](../GetNewsAPI/tasks.py), [migration inventory](../GetNewsAPI/deployment/migrations.py),

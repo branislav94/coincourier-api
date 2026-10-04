@@ -641,6 +641,28 @@ uses eligible selected source rows and generated rich rows. `generated` backfill
 requires source linkage. Both registration commands are idempotent and make no
 provider call; the worker performs embedding calls.
 
+#### Optional embedding registration boundary
+
+`EMBEDDING_FRESH_START_AFTER_UTC` is independent of the existing
+`PIPELINE_FRESH_START_AFTER_UTC` processing/publishing boundary. Its default is
+unset/blank, which preserves existing registration eligibility. Both may use the
+same approved DEV value, for example `2026-10-04 18:00:00` UTC; the example is not
+a source default or an automatically configured deployment boundary. UTC
+timestamps with `Z` or an explicit offset are also accepted and normalized to UTC.
+
+When set, recent `embedding_ingest` and source/generated `embedding_backfill`
+registration require the underlying `cryptonewsapi.insertDate >=` the cutoff,
+including rows exactly at the boundary. Generated eligibility follows the
+existing `raw_article_id` link; unresolved links and missing raw insertion times
+are excluded while enabled. Selection/publication timestamps do not substitute
+for raw insertion time, and all other eligibility rules remain in place.
+
+Only registration selection changes. Application history, existing vectors and
+jobs are retained; already queued jobs remain eligible for the worker. This
+setting neither starts backfill nor enables vector/embedding features. Review
+and record the deployed commit, effective cutoff, and corpus decision before an
+authorized registration run.
+
 Use small controlled registration waves. The limit bounds changed document/job
 registrations, not total historical rows scanned; a run may traverse prior
 history to find eligible changed versions:

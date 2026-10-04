@@ -8,6 +8,7 @@ secret values in validation output.
 from __future__ import annotations
 
 from dataclasses import dataclass
+from datetime import datetime, timezone
 import os
 from typing import Mapping
 
@@ -102,6 +103,28 @@ def _positive_integer(
         issues.append(ConfigIssue(name, "must be a positive integer in range"))
         return default
     return value
+
+
+def _validate_optional_utc(
+    environment: Mapping[str, str],
+    name: str,
+    issues: list[ConfigIssue],
+) -> None:
+    raw = _value(environment, name)
+    if not raw:
+        return
+    try:
+        parsed = datetime.fromisoformat(raw.replace("Z", "+00:00"))
+        if parsed.tzinfo is not None:
+            parsed.astimezone(timezone.utc)
+    except (ValueError, OverflowError):
+        issues.append(
+            ConfigIssue(
+                name,
+                "must be a UTC timestamp like '2026-10-04 18:00:00' "
+                "or '2026-10-04T18:00:00Z'",
+            )
+        )
 
 
 def _validate_tls(
@@ -238,6 +261,7 @@ def validate_runtime_config(
         maximum=300,
     )
     _validate_tls(env, "DB", issues, default_enabled=True)
+    _validate_optional_utc(env, "EMBEDDING_FRESH_START_AFTER_UTC", issues)
 
     if normalized_profile == "web":
         _require(env, ("PUBLISH_API_TOKEN",), issues)

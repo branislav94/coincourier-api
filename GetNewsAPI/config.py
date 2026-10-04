@@ -30,7 +30,11 @@ def _env_bool(name: str, default: bool = False) -> bool:
     raise ValueError(f"{name} must be a boolean value such as true or false")
 
 
-def _parse_optional_utc(name: str) -> datetime | None:
+def _parse_optional_utc(
+    name: str,
+    *,
+    preserve_microseconds: bool = False,
+) -> datetime | None:
     value = (os.getenv(name) or "").strip()
     if not value:
         return None
@@ -46,7 +50,7 @@ def _parse_optional_utc(name: str) -> datetime | None:
 
     if parsed.tzinfo is not None:
         parsed = parsed.astimezone(timezone.utc).replace(tzinfo=None)
-    return parsed.replace(microsecond=0)
+    return parsed if preserve_microseconds else parsed.replace(microsecond=0)
 
 
 def _db_tls_options(prefix: str, *, default_enabled: bool = True) -> dict[str, object]:
@@ -258,6 +262,15 @@ VECTOR_DB_CONFIG = {
 # Phase 6B1 embedding machinery is directly invokable only. Source defaults
 # keep paid provider behavior disabled and do not add pipeline task wiring.
 EMBEDDING_ENABLED = _env_bool("EMBEDDING_ENABLED", False)
+try:
+    EMBEDDING_FRESH_START_AFTER_UTC = _parse_optional_utc(
+        "EMBEDDING_FRESH_START_AFTER_UTC",
+        preserve_microseconds=True,
+    )
+except OverflowError as exc:
+    raise ValueError(
+        "EMBEDDING_FRESH_START_AFTER_UTC must be a representable UTC timestamp"
+    ) from exc
 EMBEDDING_PROVIDER = os.getenv("EMBEDDING_PROVIDER", "openai").strip().lower()
 EMBEDDING_MODEL = os.getenv(
     "EMBEDDING_MODEL",
