@@ -36,11 +36,17 @@ task commands; none is wired into fetch, process, publish, image, scheduler, or
   and Phase 6C2B offline calibration are **IMPLEMENTED LOCALLY**. Runtime semantic
   collection remains disabled; calibration reads evidence but makes no decision.
 
-Pre-DEV P0 hardening is **IMPLEMENTED LOCALLY, NOT DEPLOYED**: Gemini credentials
-use header transport plus safe failure rendering; all WordPress REST requests use
+Pre-DEV P0 hardening is **IMPLEMENTED LOCALLY, NOT DEPLOYED**: provider failures
+use credential-safe rendering; all WordPress REST requests use
 validated connect/read timeouts; production Compose separates application runtime
 from vector provisioning/root credentials; and the deployment runbook uses
 repository-root commands and secret-safe Compose validation.
+
+The current enrichment provider is OpenAI GPT-5.6 Luna with required hosted web
+search through the Responses API. The enrichment update preserves the existing
+bounded string passed to the Grok-primary/OpenAI-fallback writer; its contract
+is documented in section 8. The audit baseline and historical operational
+evidence above remain dated evidence, not a deployment claim.
 
 ## 1. Purpose and scope
 
@@ -73,8 +79,8 @@ flowchart LR
     E --> F[gpt_processor.process_news_with_gpt]
     F -. DUPLICATE_SHADOW_ENABLED=true .-> R[(duplicate_assessments)]
     R -. always continue .-> G
-    F --> G[Gemini search enrichment]
-    F --> H[Grok or OpenAI rewrite and validation]
+    F --> G[OpenAI GPT-5.6 Luna web-search enrichment]
+    H[Grok primary or OpenAI fallback rewrite and validation]
     G --> H
     H --> I[(rich_crpytonews)]
     I --> J[publish_to_wp.publish_news_to_wp]
@@ -150,7 +156,7 @@ When `ENABLE_APSCHEDULER=true`, `app.py:56-67` starts the scheduler once with Fl
 | Runtime | `ENABLE_APSCHEDULER=false`, `FLASK_DEBUG=false`, `PIPELINE_FRESH_START_AFTER_UTC` | parsed at `config.py:21-59` |
 | Throughput | `DAILY_TARGET`, active window/share, max age, fetch pool/score limit, process min/max/lookahead, publish max | example at `.env.example:6-17`; module defaults differ from some example values |
 | LLM | primary `grok`, fallback `openai`, provider keys/base URL/models/reasoning/output limits | `config.py:64-109` |
-| Search enrichment | `GOOGLE_API_KEY`; search itself is a code constant `USE_WEB_SEARCH=1` | `gpt_processor.py:73-93` |
+| Search enrichment | Existing `OPENAI_API_KEY`; `ENRICHMENT_MODEL=gpt-5.6-luna`, `ENRICHMENT_REASONING_EFFORT=low`, `ENRICHMENT_SEARCH_CONTEXT_SIZE=low`, `ENRICHMENT_MAX_OUTPUT_TOKENS=1200` | `config.py`; `gpt_processor.py:enrich_with_search` |
 | Image mode | API/source flags, `hybrid`, `stock_first`, generated-image primary/fallback | `config.py:112-127` |
 | Image search | default engine `v1`; V2 providers, dimensions, limits, license allowlist, retry/exhaustion behavior | `config.py:129-180` |
 | Duplicate shadow | disabled by default; 72-hour lookback and `v1` policy version | `config.py` |
@@ -241,12 +247,25 @@ For each row:
 1. When explicitly enabled, deterministic duplicate shadow analysis reads recent
    selected/processed candidates, records classifications, and always continues.
    Any repository or policy error is caught and logged before continuing.
-2. Gemini search grounding requests up to three recent facts when the code constant is enabled (`gpt_processor.py:1121-1198`).
+2. OpenAI GPT-5.6 Luna gathers bounded fresh factual context using required
+   hosted web search (`gpt_processor.py:enrich_with_search`).
 3. The rewrite tries the configured primary LLM and then the configured fallback (`gpt_processor.py:876-921`). Defaults are Grok then OpenAI (`config.py:65-70`, `config.py:105-109`).
 4. The provider that produced the valid rewrite becomes sticky for repair (`gpt_processor.py:1353-1368`, `gpt_processor.py:1532-1625`). A short body may first receive same-provider expansion (`gpt_processor.py:747-811`).
 5. On legacy-path failure, the row remains `processed=0`. On the durable path it also becomes `processing_status='retryable'`, clears its claim, and stores a bounded error class; success still sets `processed=1`.
 
-Provider HTTP calls use bounded retry/backoff. Grok retries up to seven times with jitter (`gpt_processor.py:591-669`); OpenAI handles network/transient statuses and malformed/truncated output (`gpt_processor.py:947-1115`); Gemini retries only 429/503 (`gpt_processor.py:1159-1172`).
+Provider HTTP calls use bounded retry/backoff. Grok retries up to seven times with jitter (`gpt_processor.py:591-669`); the OpenAI writer handles network/transient statuses and malformed/truncated output (`gpt_processor.py:947-1115`). Enrichment errors use credential-safe `EnrichmentRequestError` and preserve the existing failed-attempt/retry path.
+
+Enrichment uses `client.responses.create` with
+`model=ENRICHMENT_MODEL`, `reasoning={"effort": ENRICHMENT_REASONING_EFFORT}`,
+`tools=[{"type": "web_search", "search_context_size": ENRICHMENT_SEARCH_CONTEXT_SIZE}]`,
+`tool_choice="required"`, `store=False`, and
+`max_output_tokens=ENRICHMENT_MAX_OUTPUT_TOKENS`. Defaults are `gpt-5.6-luna`,
+`low`, `low`, and `1200`; configuration permits at most 4096 output tokens.
+The existing `OPENAI_API_KEY` is reused. Relevant facts, dates, amounts, named
+entities, and useful source attribution remain context for the writer; Luna is
+not asked to write the final article. Search is mandatory for this path, and
+provider calls remain outside durable claim transactions. See the [official model contract](https://developers.openai.com/api/docs/models/gpt-5.6-luna)
+and [hosted web-search documentation](https://developers.openai.com/api/docs/guides/tools-web-search).
 
 ## 9. Hard and soft article validation
 
@@ -394,7 +413,7 @@ their namespace is distinct from migration locks.
 | CryptoNews request error/non-200 | short diagnostic, empty pull fragment; cycle continues with other pulls (`fetcher.py:429-456`) |
 | Fetch cycle exception | logged; lock released in `finally`; task may appear completed because exception is swallowed (`fetcher.py:1244-1279`) |
 | Scoring failure | whole fetch cycle exception path; raw upserts may already be committed |
-| Gemini/Grok/OpenAI transient error | bounded retries; article-level provider fallback for rewrite |
+| Enrichment/Grok/OpenAI transient error | bounded retries; failed enrichment retains the processing retry path; article-level provider fallback applies to rewrite |
 | Hard-invalid article | expansion/repair/fallback; remains retryable if all fail |
 | Soft SEO failure | warning; article is stored |
 | Rich commit succeeds, processed update fails | rich exists; raw remains retryable; rewrite may repeat |
@@ -601,7 +620,7 @@ Compare the candidate with recently selected, processed, and published rows usin
 
 **PLANNED - shadow first**
 
-Run before Gemini/rewrite cost. Query recent raw title/summary vectors first, then inspect lexical/entity/number evidence and any existing event cluster. Compare against recently selected raw stories, rich processed stories, and WordPress-linked published documents. If embeddings are missing or the hosted embedding API is unavailable, fail open to existing exact/lexical controls, enqueue retry, and continue the main pipeline.
+Run before enrichment/rewrite cost. Query recent raw title/summary vectors first, then inspect lexical/entity/number evidence and any existing event cluster. Compare against recently selected raw stories, rich processed stories, and WordPress-linked published documents. If embeddings are missing or the hosted embedding API is unavailable, fail open to existing exact/lexical controls, enqueue retry, and continue the main pipeline.
 
 ### Layer 4: final pre-publish guard
 
@@ -1211,7 +1230,7 @@ The only checked-in test module is image-search focused. It has strong mocked co
 - Use table-driven duplicate fixtures for all four terminology categories.
 - Add DB integration tests against disposable MariaDB 11.8, including unique collisions, transactions, advisory locks, claim leases, vector functions/indexes, and migrations.
 - Add mocked CryptoNews payload tests with present/missing/reused `eventid`.
-- Add processor tests proving a duplicate guard runs before Gemini/rewrite calls.
+- Add processor tests proving a duplicate guard runs before enrichment/rewrite calls.
 - Add WordPress contract tests for draft reservation, lost responses, existing-meta reconciliation, post ID persistence, media attribution, and publish retry.
 - Add concurrency tests with two process/publish workers.
 - Replay a redacted log fixture to validate counts and correlation fields.

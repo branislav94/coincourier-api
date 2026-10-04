@@ -128,13 +128,26 @@ secret channel.
 - [ ] `CRYPTO_NEWS_TOKEN`
 - [ ] `GROK_API_KEY` or its compatibility alias `XAI_API_KEY`
 - [ ] `OPENAI_API_KEY`
-- [ ] `GOOGLE_API_KEY`
 - [ ] Credentials for each enabled stock/image provider, including Pexels,
   Pixabay, or Openverse where selected
 - [ ] Written decision whether DEV uses isolated DEV credentials or approved
   production credentials, including spend/rate limits
 - [ ] `PRIMARY_LLM_PROVIDER`, fallback, model, and image routing values reviewed
+- [ ] OpenAI enrichment configuration reviewed: `ENRICHMENT_MODEL=gpt-5.6-luna`,
+  `ENRICHMENT_REASONING_EFFORT=low`, `ENRICHMENT_SEARCH_CONTEXT_SIZE=low`, and
+  `ENRICHMENT_MAX_OUTPUT_TOKENS=1200`
 - [ ] `IMAGE_SEARCH_ENGINE=v1` retained unless V2 has separate approval
+
+Processing and pipeline profiles require `OPENAI_API_KEY` for enrichment,
+independently of writer routing. Enrichment uses the Responses API with only the
+hosted `web_search` tool, `tool_choice="required"`, and `store=False`. The result
+is bounded factual context for the existing writer; Grok remains the primary
+writer and OpenAI its configured fallback. `ENRICHMENT_MAX_OUTPUT_TOKENS` accepts
+1 through 4096, and search context accepts `low`, `medium`, or `high`; the reviewed
+DEV defaults above use low reasoning and low search context. Model must be
+non-empty, and this deployment accepts only `low` reasoning. Existing embedding
+and image settings are independent. See the [official model contract](https://developers.openai.com/api/docs/models/gpt-5.6-luna)
+and [hosted web-search documentation](https://developers.openai.com/api/docs/guides/tools-web-search).
 
 ### Infrastructure
 

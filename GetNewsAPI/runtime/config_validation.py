@@ -192,6 +192,26 @@ def _validate_provider_keys(
         issues.append(ConfigIssue("OPENAI_API_KEY", "is required for OpenAI routing"))
 
 
+def _validate_enrichment(
+    environment: Mapping[str, str],
+    issues: list[ConfigIssue],
+) -> None:
+    if not _value(environment, "OPENAI_API_KEY"):
+        issues.append(ConfigIssue("OPENAI_API_KEY", "is required for OpenAI web-search enrichment"))
+    if not (environment.get("ENRICHMENT_MODEL", "gpt-5.6-luna") or "").strip():
+        issues.append(ConfigIssue("ENRICHMENT_MODEL", "must be non-empty"))
+    effort = (environment.get("ENRICHMENT_REASONING_EFFORT", "low") or "").strip().lower()
+    if effort != "low":
+        issues.append(ConfigIssue("ENRICHMENT_REASONING_EFFORT", "must be low"))
+    context_size = (environment.get("ENRICHMENT_SEARCH_CONTEXT_SIZE", "low") or "").strip().lower()
+    if context_size not in {"low", "medium", "high"}:
+        issues.append(ConfigIssue("ENRICHMENT_SEARCH_CONTEXT_SIZE", "must be low, medium, or high"))
+    if "ENRICHMENT_MAX_OUTPUT_TOKENS" in environment and not _value(environment, "ENRICHMENT_MAX_OUTPUT_TOKENS"):
+        issues.append(ConfigIssue("ENRICHMENT_MAX_OUTPUT_TOKENS", "must be a positive integer in range"))
+    else:
+        _positive_integer(environment, "ENRICHMENT_MAX_OUTPUT_TOKENS", 1200, issues, maximum=4096)
+
+
 def _validate_image_provider_keys(
     environment: Mapping[str, str],
     issues: list[ConfigIssue],
@@ -335,7 +355,7 @@ def validate_runtime_config(
         _require(env, ("CRYPTO_NEWS_TOKEN", "OPENAI_API_KEY"), issues)
 
     if normalized_profile in {"process", "pipeline"} or scheduler_profile:
-        _require(env, ("GOOGLE_API_KEY",), issues)
+        _validate_enrichment(env, issues)
         _validate_provider_keys(env, issues)
 
     if normalized_profile in {"publish", "pipeline"} or scheduler_profile:

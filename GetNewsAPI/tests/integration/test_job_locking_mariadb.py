@@ -71,7 +71,6 @@ def _process_environment() -> dict[str, str]:
         "VECTOR_ENABLED": "false",
         "EMBEDDING_ENABLED": "false",
         "SEMANTIC_SHADOW_ENABLED": "false",
-        "GOOGLE_API_KEY": "local-test-only",
         "PRIMARY_LLM_PROVIDER": "grok",
         "LLM_FALLBACK_PROVIDER": "openai",
         "GROK_API_KEY": "local-test-only",

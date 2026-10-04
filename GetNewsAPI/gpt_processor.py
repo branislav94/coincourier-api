@@ -4,7 +4,10 @@ from datetime import datetime
 from db import get_db_connection
 from openai import OpenAI
 from config import (
-    GOOGLE_API_KEY,
+    ENRICHMENT_MODEL,
+    ENRICHMENT_REASONING_EFFORT,
+    ENRICHMENT_SEARCH_CONTEXT_SIZE,
+    ENRICHMENT_MAX_OUTPUT_TOKENS,
     GROK_API_KEY,
     GROK_BASE_URL,
     GROK_MAX_OUTPUT_TOKENS,
@@ -33,6 +36,7 @@ from typing import Any, Dict
 import logging
 import re, hashlib
 from html import escape
+from urllib.parse import urlsplit
 from runtime.logging_config import configure_logging
 
 configure_logging()
@@ -88,12 +92,8 @@ PROCESS_LOOKAHEAD_MINUTES = int(os.getenv("PROCESS_LOOKAHEAD_MINUTES", "40"))
 PROCESS_BATCH_MIN = int(os.getenv("PROCESS_BATCH_MIN", "3"))
 PROCESS_BATCH_MAX = int(os.getenv("PROCESS_BATCH_MAX", "12"))
 
-# -----------------------------------------------------------------------------
-GEMINI_SEARCH_MODEL = "models/gemini-2.5-flash"  # or gemini-1.5-pro-search
-GEMINI_URL = (
-    f"https://generativelanguage.googleapis.com/v1beta/"
-    f"{GEMINI_SEARCH_MODEL}:generateContent"
-)
+# Keep search context small when passing it to the existing article writer.
+ENRICHMENT_MAX_CONTEXT_CHARACTERS = 6000
 
 import time, random
 import requests
@@ -505,12 +505,12 @@ def _llm_provider_order() -> list[str]:
 
 def _safe_ai_reason(exc: Exception) -> str:
     text = str(exc)
-    for secret in (GOOGLE_API_KEY, GROK_API_KEY, OPENAI_API_KEY):
+    for secret in (GROK_API_KEY, OPENAI_API_KEY):
         if secret:
             text = text.replace(secret, "[redacted]")
     text = re.sub(r"(?i)([?&]key=)[^&\s]+", r"\1[redacted]", text)
     text = re.sub(
-        r"(?i)(x-goog-api-key\s*[:=]\s*)[^\s,;]+",
+        r"(?i)(authorization\s*[:=]\s*bearer\s+|(?:x-)?api-key\s*[:=]\s*)[^\s,;]+",
         r"\1[redacted]",
         text,
     )
@@ -1125,79 +1125,121 @@ def call_openai(
 
 
 
-class GeminiRequestError(RuntimeError):
-    """A credential-safe Gemini transport or HTTP failure."""
+class EnrichmentRequestError(RuntimeError):
+    """A credential-safe enrichment request or response failure."""
 
 
-def call_gemini_search(prompt: str) -> str:
-    """
-    Use Gemini generateContent with the google_search tool to ground the prompt.
+def _enrichment_response_text(response: Any) -> str:
+    """Accept complete search-grounded output and retain bounded URL attribution."""
+    if (
+        getattr(response, "status", None) != "completed"
+        or getattr(response, "error", None) is not None
+        or getattr(response, "incomplete_details", None) is not None
+    ):
+        raise EnrichmentRequestError("Enrichment response did not complete")
+    output = getattr(response, "output", None)
+    if not isinstance(output, list):
+        raise EnrichmentRequestError("Enrichment response has invalid output")
+    searches = [item for item in output if getattr(item, "type", None) == "web_search_call"]
+    if not searches or any(getattr(item, "status", None) != "completed" for item in searches):
+        raise EnrichmentRequestError("Enrichment response has no completed web search")
 
-    Behavior:
-        - Sends the prompt as the only text part.
-        - Enables google_search tool.
-        - Retries 429/503 with incremental backoff.
-        - Returns candidates[0].content.parts[0].text.
-
-    Args:
-        prompt: Research prompt to ground via search.
-
-    Returns:
-        str:
-            Text response (intended to be up to ~3 bullet points).
-
-    Raises:
-        requests.HTTPError:
-            If Gemini returns a non-retryable error.
-        RuntimeError:
-            If retries are exhausted.
-        KeyError/IndexError:
-            If the response structure is missing expected fields.
-    """
-
-    body = {
-        "contents": [
-            { "parts": [ { "text": prompt } ] }
-        ],
-        "tools": [
-            { "google_search": {} }
-        ]
-        # you can optionally add:
-        # ,"candidateCount": 1
-        # ,"temperature": 0.1
-    }
-
-    if not GOOGLE_API_KEY:
-        raise GeminiRequestError("Gemini API key is not configured")
-
-    headers = {"x-goog-api-key": GOOGLE_API_KEY}
-    for attempt in range(1, MAX_RETRIES + 1):
-        try:
-            r = requests.post(
-                GEMINI_URL,
-                headers=headers,
-                json=body,
-                timeout=45,
-            )
-        except requests.RequestException as exc:
-            error_type = type(exc).__name__ or "RequestException"
-            logging.error("Gemini request failed error_type=%s", error_type)
-            raise GeminiRequestError(
-                f"Gemini request failed ({error_type})"
-            ) from None
-        if r.status_code == 200:
-            return r.json()["candidates"][0]["content"]["parts"][0]["text"].strip()
-        if r.status_code in (429, 503):
-            wait = BASE_SLEEP * attempt + random.random()
-            print(f"⚠️  Gemini {r.status_code} – retrying in {wait:.1f}s")
-            time.sleep(wait)
+    text_parts: list[str] = []
+    source_urls: list[str] = []
+    for item in output:
+        if getattr(item, "type", None) != "message":
             continue
-        logging.error("Gemini request failed status=%s", r.status_code)
-        raise GeminiRequestError(
-            f"Gemini request failed with HTTP status {r.status_code}"
-        )
+        if getattr(item, "role", None) != "assistant" or getattr(item, "status", None) != "completed":
+            raise EnrichmentRequestError("Enrichment response has incomplete assistant output")
+        content = getattr(item, "content", None)
+        if not isinstance(content, list):
+            raise EnrichmentRequestError("Enrichment response has invalid assistant output")
+        for part in content:
+            if getattr(part, "type", None) == "refusal":
+                raise EnrichmentRequestError("Enrichment response was refused")
+            if getattr(part, "type", None) != "output_text":
+                continue
+            text = getattr(part, "text", None)
+            if not isinstance(text, str):
+                raise EnrichmentRequestError("Enrichment response has invalid text")
+            if text.strip():
+                text_parts.append(text.strip())
+            for annotation in getattr(part, "annotations", None) or []:
+                if getattr(annotation, "type", None) != "url_citation":
+                    continue
+                url = getattr(annotation, "url", None)
+                if (
+                    not isinstance(url, str)
+                    or len(url) > 1000
+                    or any(character.isspace() or ord(character) < 32 for character in url)
+                ):
+                    continue
+                try:
+                    parsed = urlsplit(url)
+                except ValueError:
+                    continue
+                if (
+                    parsed.scheme not in {"http", "https"}
+                    or not parsed.hostname
+                    or parsed.username is not None
+                    or parsed.password is not None
+                ):
+                    continue
+                if url not in source_urls and len(source_urls) < 3:
+                    source_urls.append(url)
+    if not text_parts:
+        raise EnrichmentRequestError("Enrichment response has no usable text")
+    sources = "\n\nSources:\n" + "\n".join(f"- {url}" for url in source_urls) if source_urls else ""
+    text_limit = ENRICHMENT_MAX_CONTEXT_CHARACTERS - len(sources)
+    return "\n".join(text_parts)[:text_limit].rstrip() + sources
 
-    raise RuntimeError("Gemini search preview repeatedly failed")
+
+def call_openai_enrichment(prompt: str) -> str:
+    """Search with Responses; preserve stage retries without SDK retry amplification."""
+    if not OPENAI_API_KEY:
+        raise EnrichmentRequestError("Enrichment requires OPENAI_API_KEY")
+    try:
+        with OpenAI(api_key=OPENAI_API_KEY, timeout=45, max_retries=0) as client:
+            for attempt in range(1, MAX_RETRIES + 1):
+                try:
+                    response = client.responses.create(
+                        model=ENRICHMENT_MODEL,
+                        reasoning={"effort": ENRICHMENT_REASONING_EFFORT},
+                        tools=[{
+                            "type": "web_search",
+                            "search_context_size": ENRICHMENT_SEARCH_CONTEXT_SIZE,
+                        }],
+                        tool_choice="required",
+                        store=False,
+                        max_output_tokens=ENRICHMENT_MAX_OUTPUT_TOKENS,
+                        input=prompt,
+                    )
+                except Exception as exc:
+                    status = getattr(exc, "status_code", None)
+                    if isinstance(status, int) and status in (429, 503):
+                        wait = BASE_SLEEP * attempt + random.random()
+                        logging.warning(
+                            "Enrichment request retry status=%s retry_in=%.1fs attempt=%d/%d",
+                            status, wait, attempt, MAX_RETRIES,
+                        )
+                        time.sleep(wait)
+                        continue
+                    error_type = type(exc).__name__
+                    if isinstance(status, int):
+                        logging.error("Enrichment request failed status=%s", status)
+                        raise EnrichmentRequestError(
+                            f"Enrichment request failed with HTTP status {status}"
+                        ) from None
+                    logging.error("Enrichment request failed error_type=%s", error_type)
+                    raise EnrichmentRequestError(f"Enrichment request failed ({error_type})") from None
+                return _enrichment_response_text(response)
+    except EnrichmentRequestError:
+        raise
+    except Exception as exc:
+        error_type = type(exc).__name__
+        logging.error("Enrichment request failed error_type=%s", error_type)
+        raise EnrichmentRequestError(f"Enrichment request failed ({error_type})") from None
+    raise EnrichmentRequestError("Enrichment request repeatedly failed")
 
 
 def enrich_with_search(article: dict) -> str:
@@ -1218,12 +1260,15 @@ def enrich_with_search(article: dict) -> str:
         return ""
     prompt = (
         "You are a research assistant.\n"
-        "Return max three concise bullet points with NEW facts, numbers or quotes "
-        "that enrich the story. Prefer sources from the last 48 hours.\n\n"
+        "Gather fresh factual context relevant to this crypto-news story using web search. "
+        "Return at most three concise bullet points with relevant dates, amounts, numbers "
+        "and named entities. Prefer official or primary sources and current information "
+        "from the last 48 hours. Distinguish confirmed facts from uncertain claims and "
+        "include useful source citations. Do not write the final article.\n\n"
         f"Title: {article['title']}\n\n"
         f"Body: {article.get('text','')[:1200]}"
     )
-    return call_gemini_search(prompt).strip()
+    return call_openai_enrichment(prompt).strip()
 
 
 

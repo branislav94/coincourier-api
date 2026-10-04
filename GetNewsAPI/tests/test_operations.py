@@ -45,7 +45,6 @@ def process_environment() -> dict[str, str]:
     environment = base_environment()
     environment.update(
         {
-            "GOOGLE_API_KEY": "google-secret",
             "PRIMARY_LLM_PROVIDER": "grok",
             "LLM_FALLBACK_PROVIDER": "openai",
             "GROK_API_KEY": "grok-secret",
@@ -220,7 +219,6 @@ class ConfigurationTests(unittest.TestCase):
         )
         self.assertEqual(validate_runtime_config(environment, profile="fetch"), ())
         self.assertNotIn("WP_API_URL", environment)
-        self.assertNotIn("GOOGLE_API_KEY", environment)
 
     def test_process_does_not_require_wordpress_configuration(self):
         environment = process_environment()

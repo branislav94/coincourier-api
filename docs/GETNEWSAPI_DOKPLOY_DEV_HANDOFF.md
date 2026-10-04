@@ -24,8 +24,9 @@ for approvals, detailed migrations, acceptance evidence, recovery, and monitorin
 
 Verify the saved Dokploy resource and resulting build/deployment job use the
 reviewed current `dev` commit and Dockerfile; record the actual SHA/image digest.
-The SHA above is the historical initial baseline. A cutoff-enabled redeployment
-must include support for `EMBEDDING_FRESH_START_AFTER_UTC`. Do not select `docker-compose.yml`,
+The SHA above is the historical initial baseline. Redeployment must include the
+reviewed OpenAI Luna enrichment implementation and support for
+`EMBEDDING_FRESH_START_AFTER_UTC`. Do not select `docker-compose.yml`,
 `docker-compose.dev.yml`, or `docker-compose.prod.yml` for this API resource.
 `APP_ENV=production` is the persistent-runtime safety mode; the services and
 credentials remain DEV. Keep runtime secrets out of build arguments and Git.
@@ -286,7 +287,7 @@ already queued worker jobs, start backfill, or enable any rollout flag.
 | Operation | Required names and conditions |
 |---|---|
 | Fetch | `CRYPTO_NEWS_TOKEN`, `OPENAI_API_KEY` |
-| Process | `GOOGLE_API_KEY`; selected text-provider keys. Defaults select Grok plus OpenAI fallback: `GROK_API_KEY` and `OPENAI_API_KEY` |
+| Process | `OPENAI_API_KEY` for Luna web-search enrichment plus selected writer keys. Defaults select Grok plus OpenAI fallback: `GROK_API_KEY` and `OPENAI_API_KEY` |
 | Publish/generated images | WordPress REST/DB plus selected image-provider keys. Default routing uses Grok/OpenAI; current publisher import also initializes OpenAI unconditionally, so supply `OPENAI_API_KEY` even for Grok-only publishing |
 | Stock images | `PEXELS_API_KEY` / `PIXABAY_API_KEY` when those providers are used; missing keys skip them. `OPENVERSE_CLIENT_ID` and `OPENVERSE_CLIENT_SECRET` are optional paired credentials for V2; anonymous search is supported |
 | Embedding worker | `OPENAI_API_KEY`, verified vector schema, `VECTOR_ENABLED=true`, `EMBEDDING_ENABLED=true` |
@@ -295,6 +296,31 @@ already queued worker jobs, start backfill, or enable any rollout flag.
 `pipeline_once` processes then publishes; it does not fetch. Provider/WP secrets
 are not required merely to boot the initial web process or prove `/health` with
 scheduler/features off. Add them before the corresponding profile/job is tested.
+
+### OpenAI factual enrichment
+
+Use the existing `OPENAI_API_KEY`; there is no separate enrichment secret.
+Before an approved process or pipeline run, review these non-secret settings:
+
+```text
+ENRICHMENT_MODEL=gpt-5.6-luna
+ENRICHMENT_REASONING_EFFORT=low
+ENRICHMENT_SEARCH_CONTEXT_SIZE=low
+ENRICHMENT_MAX_OUTPUT_TOKENS=1200
+```
+
+The Responses API request uses `reasoning={"effort": "low"}`, only
+`tools=[{"type": "web_search", "search_context_size": "low"}]`,
+`tool_choice="required"`, and `store=False`. Search must run for enrichment.
+Validation requires a non-empty model, `low` reasoning, a search-context value of
+`low`, `medium`, or `high`, and an output-token limit of 1 through 4096.
+The response remains bounded factual context for the existing Grok-primary,
+OpenAI-fallback writer. It does not write the final article or change embedding,
+image, persistence, or publishing behavior. Failed enrichment retains the
+processing attempt's failure/retry path; provider errors must remain credential
+safe. Account/model access is confirmed only by separately approved live
+acceptance, never by `config_check`. See the [official model contract](https://developers.openai.com/api/docs/models/gpt-5.6-luna)
+and [hosted web-search documentation](https://developers.openai.com/api/docs/guides/tools-web-search).
 
 ## Initial platform acceptance and read-only preflight
 

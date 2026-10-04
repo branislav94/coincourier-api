@@ -150,8 +150,22 @@ OPENAI_REASONING_EFFORT = os.getenv("OPENAI_REASONING_EFFORT", "minimal").strip(
 OPENAI_MAX_OUTPUT_TOKENS = int(os.getenv("OPENAI_MAX_OUTPUT_TOKENS", "4096"))
 SEO_PLUGIN = os.getenv("SEO_PLUGIN", "yoast").strip().lower()
 
-# Google Gemini search grounding.
-GOOGLE_API_KEY = os.getenv("GOOGLE_API_KEY")
+# Factual enrichment uses Responses with mandatory hosted web search.
+ENRICHMENT_MODEL = os.getenv("ENRICHMENT_MODEL", "gpt-5.6-luna").strip()
+if not ENRICHMENT_MODEL:
+    raise ValueError("ENRICHMENT_MODEL must be non-empty")
+ENRICHMENT_REASONING_EFFORT = os.getenv("ENRICHMENT_REASONING_EFFORT", "low").strip().lower()
+if ENRICHMENT_REASONING_EFFORT != "low":
+    raise ValueError("ENRICHMENT_REASONING_EFFORT must be low")
+ENRICHMENT_SEARCH_CONTEXT_SIZE = os.getenv("ENRICHMENT_SEARCH_CONTEXT_SIZE", "low").strip().lower()
+if ENRICHMENT_SEARCH_CONTEXT_SIZE not in {"low", "medium", "high"}:
+    raise ValueError("ENRICHMENT_SEARCH_CONTEXT_SIZE must be low, medium, or high")
+try:
+    ENRICHMENT_MAX_OUTPUT_TOKENS = int(os.getenv("ENRICHMENT_MAX_OUTPUT_TOKENS", "1200"))
+except ValueError:
+    raise ValueError("ENRICHMENT_MAX_OUTPUT_TOKENS must be an integer between 1 and 4096") from None
+if not 1 <= ENRICHMENT_MAX_OUTPUT_TOKENS <= 4096:
+    raise ValueError("ENRICHMENT_MAX_OUTPUT_TOKENS must be an integer between 1 and 4096")
 
 USE_API_IMAGES = int(os.getenv("USE_API_IMAGES", "1"))
 OPENAI_IMAGE_MODEL = os.getenv("OPENAI_IMAGE_MODEL", os.getenv("IMAGE_MODEL", "gpt-image-1"))

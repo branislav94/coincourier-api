@@ -61,6 +61,26 @@ and publishing profiles add only the credentials their operations need. Disabled
 vector, embedding, semantic, and provider integrations do not become startup
 credential requirements.
 
+Process and pipeline profiles require the existing `OPENAI_API_KEY` for factual
+enrichment, independently of writer-provider selection. The reviewed defaults
+are:
+
+```text
+ENRICHMENT_MODEL=gpt-5.6-luna
+ENRICHMENT_REASONING_EFFORT=low
+ENRICHMENT_SEARCH_CONTEXT_SIZE=low
+ENRICHMENT_MAX_OUTPUT_TOKENS=1200
+```
+
+Enrichment uses the OpenAI Responses API with hosted `web_search` as its only
+tool, `tool_choice="required"`, and `store=False`. It returns bounded factual
+context to the existing Grok-primary/OpenAI-fallback writer. Model must be
+non-empty, reasoning must be `low`, search context must be `low`, `medium`, or
+`high`, and the output-token limit must be 1 through 4096. These settings do not
+alter existing image or embedding configuration. Configuration checks are
+offline and do not verify provider-account access. See the [official model contract](https://developers.openai.com/api/docs/models/gpt-5.6-luna)
+and [hosted web-search documentation](https://developers.openai.com/api/docs/guides/tools-web-search).
+
 WordPress REST calls use the centralized Requests timeout tuple
 `WP_HTTP_CONNECT_TIMEOUT_SECONDS=10` and `WP_HTTP_READ_TIMEOUT_SECONDS=60`.
 Configuration validation accepts only positive values up to 60 and 300 seconds,

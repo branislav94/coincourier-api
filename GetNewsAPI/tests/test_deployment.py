@@ -344,7 +344,6 @@ class ConfigurationValidationTests(unittest.TestCase):
             "CRYPTO_NEWS_TOKEN",
             "GROK_API_KEY",
             "OPENAI_API_KEY",
-            "GOOGLE_API_KEY",
             "WP_API_URL",
             "VECTOR_DB_PASSWORD",
         ):
