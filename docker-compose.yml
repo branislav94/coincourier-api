@@ -1,22 +1,53 @@
+# Canonical remote production/LIVE API deployment. Databases and scheduling are owned by Dokploy.
 services:
-  getnewsapi:
+  getnewsapi-prod:
     build:
       context: .
       dockerfile: Dockerfile
-
-    container_name: prod-getnewsapi
-
+    # Dokploy generates .env alongside this file. --env-file alone only interpolates.
+    # This file must contain application runtime values only, never DB root/provisioning secrets.
     env_file:
-      - .env
-
+      - ${GETNEWSAPI_RUNTIME_ENV_FILE:-.env}
     environment:
       APP_ENV: production
+      API_DOCS_ENABLED: "false"
+      ENABLE_APSCHEDULER: "false"
       PYTHONUNBUFFERED: "1"
-      TZ: Europe/Belgrade
-
-    ports:
-      - "5000:5000"
-
+      WRITABLE_STATE_DIR: /data
+      STOCK_IMAGE_CACHE_DIR: /data/cache/stock_images
+      STOCK_IMAGE_USAGE_PATH: /data/stock_image_usage.json
+    command: ["python", "app.py"]
+    expose:
+      - "5000"
+    volumes:
+      - getnewsapi-prod-state:/data
+    tmpfs:
+      - /tmp:size=64m,mode=1777
+    networks:
+      - dokploy-network
+    read_only: true
+    init: true
+    cap_drop:
+      - ALL
+    security_opt:
+      - no-new-privileges:true
+    healthcheck:
+      test:
+        - CMD
+        - python
+        - -c
+        - "import urllib.request; urllib.request.urlopen('http://127.0.0.1:5000/health', timeout=3).read()"
+      interval: 30s
+      timeout: 5s
+      start_period: 10s
+      retries: 3
     restart: unless-stopped
 
-    command: python app.py
+networks:
+  dokploy-network:
+    external: true
+    name: dokploy-network
+
+# Compose scopes physical volume names to the Dokploy project; keep project identity stable.
+volumes:
+  getnewsapi-prod-state:

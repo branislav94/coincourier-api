@@ -9,6 +9,14 @@ plus the uncommitted Phase 6C1 retrieval/evaluation foundation described here.
 
 Operational evidence: `getnewsapi-20260726_085522.log.txt` (2026-07-25T19:19:02Z through an incomplete run beginning 2026-07-26T00:47:30Z)
 
+Deployment-contract update: 2026-10-06. The user reports later live DEV acceptance
+of the Dockerfile Application resource, including durable processing/publishing,
+providers, embeddings/vector retrieval, and semantic shadow. The deployment
+sections below now describe its canonical API-only Compose replacement. The
+original audit/log evidence and phase implementation labels remain dated history;
+disabled source defaults do not describe the accepted DEV runtime flag values.
+This repository update performs no remote deployment or live verification.
+
 Status labels used throughout this document:
 
 - **CURRENT**: present and reachable in the audited code.
@@ -38,8 +46,8 @@ task commands; none is wired into fetch, process, publish, image, scheduler, or
 
 Pre-DEV P0 hardening is **IMPLEMENTED LOCALLY, NOT DEPLOYED**: provider failures
 use credential-safe rendering; all WordPress REST requests use
-validated connect/read timeouts; production Compose separates application runtime
-from vector provisioning/root credentials; and the deployment runbook uses
+validated connect/read timeouts; remote API Compose excludes database
+provisioning/root credentials; and the deployment runbook uses
 repository-root commands and secret-safe Compose validation.
 
 The current enrichment provider is OpenAI GPT-5.6 Luna with required hosted web
@@ -121,26 +129,62 @@ phase.
 | `GetNewsAPI/tests/test_image_search.py` | Mocked image adapter, policy, ranking, reuse, routing, and attribution tests | transitive dedupe at 511; WordPress attribution flow at 972; V1 default routing at 1036 |
 | `GetNewsAPI/crypto_news_db.sql` | Historical schema/data dump, not a current migration | generated for MariaDB 10.4 at lines 1-8; table definitions 30-44 and 70-84; URL unique keys 110-120 |
 | `maintenance/sql/fresh_start_*.sql` | Manual queue inspection and cutoff cleanup | dry-run checks 5-149; apply transaction/default rollback 6-66 |
-| `Dockerfile` | Python 3.11 image and application startup | lines 2-12 |
-| `docker-compose.yml` | Legacy production-shaped application configuration without a source mount | lines 1-22 |
-| `docker-compose.dev.yml` | Legacy development source mount and external Dokploy network | lines 1-33 |
+| `Dockerfile` | Root Python 3.11 image, non-root UID/GID 10001:10001, `/app`, `python app.py`, port 5000, and `/health` | Current Dockerfile |
+| `docker-compose.yml` | Canonical remote production API-only deployment, `getnewsapi-prod` | Current production Compose |
+| `docker-compose.dev.yml` | Canonical remote DEV API-only deployment, `getnewsapi-dev` | Current DEV Compose |
+| `maintenance/vector/docker-compose.vector.yml` | Local-only vector validation helper; never remote infrastructure | Local vector README |
 | `.env.example` | Sanitized runtime/throughput/provider/DB setting inventory | lines 1-116 |
 
 There is no migration framework, current schema snapshot, cron declaration, CI configuration, or prior architecture README in the audited repository. SQL conventions consist of one old dump and manually reviewed maintenance scripts, with the destructive fresh-start script defaulting to `ROLLBACK`.
 
 ## 4. Runtime and deployment modes
 
-**CURRENT - legacy application containers**
+**CURRENT - canonical remote Compose**
 
-`docker-compose.yml` retains the legacy production-shaped service with `APP_ENV=production`, host port `5000:5000`, and no source mount. `docker-compose.dev.yml` retains `APP_ENV=development`, host port `5001:5000`, the `GetNewsAPI:/app` source mount, and the existing external `dokploy-network`. Both read the ignored repository-root `.env` and run `python app.py`; neither defines persistent `/data`, a database service, a Compose healthcheck, a worker service, or a cron service. The supported remote DEV/production contract is the hardened `docker-compose.prod.yml` and deployment runbook, which retain the reviewed image, persistence, health, and network controls.
+| Contract | API service | Persistent state | Dependencies |
+|---|---|---|---|
+| `docker-compose.dev.yml` | `getnewsapi-dev` | Project-scoped `getnewsapi-dev-state` at `/data` | Existing external DEV application DB, WordPress/DB, and MariaDB 11.8 vector DB |
+| `docker-compose.yml` | `getnewsapi-prod` | Project-scoped `getnewsapi-prod-state` at `/data` | Separately managed production application DB, WordPress/DB, and MariaDB 11.8 vector DB |
+| `maintenance/vector/docker-compose.vector.yml` | Local vector helper only | Local test/validation volume | Never persistent remote DEV or production |
 
-**CURRENT - local APScheduler**
+Both API contracts build the root Dockerfile and run `python app.py` in `/app`.
+Remote DEV intentionally retains `APP_ENV=production`; both fix API docs off,
+APScheduler off, and unbuffered output. They expose internal 5000 only, join
+external `dokploy-network`, and use distinct service aliases with platform-owned
+container names. They bind-mount no source and create no database, WordPress,
+worker, cron, or scheduler service. DB endpoints and rollout flags remain runtime
+environment values; the populated DEV vector resource is retained.
 
-When `ENABLE_APSCHEDULER=true`, `app.py:56-67` starts the scheduler once with Flask reloading disabled. The fetch scheduler runs immediately and every 30 minutes with one in-process instance, coalescing, a 60-second misfire grace period, and jitter (`fetcher.py:1284-1315`). A separate scheduler runs processing and then publishing every 30 minutes, first after three minutes, with `max_instances=1`, coalescing, one-hour misfire grace, and jitter (`scheduler.py:72-111`). These controls prevent overlap only inside that Python scheduler instance.
+Dokploy generates an uncommitted `.env`, loaded by service
+`env_file: ${GETNEWSAPI_RUNTIME_ENV_FILE:-.env}`. CLI `--env-file` alone supplies
+interpolation values; it does not inject all runtime variables. Provisioning/root
+credentials are excluded. Hardening retains Dockerfile UID/GID 10001:10001, init,
+read-only root, all capabilities dropped, `no-new-privileges`, restart policy,
+64 MiB `/tmp` tmpfs, persistent `/data`, and `/health` liveness. `/ready` remains
+operator readiness. Stable project identity preserves volumes across redeploys.
 
-**CURRENT - external cron entry points**
+The existing working Application remains untouched until a second temporary DEV
+Compose resource passes read-only readiness, inspected/reused or consistently
+copied `/data` ownership/persistence, and a single Dokploy schedule set. Disable
+and drain old jobs before enabling new ones; move the DEV route only after those
+gates. Stop the old resource after healthy replacement operation and retain it
+for observation. The [Dokploy handoff](GETNEWSAPI_DOKPLOY_DEV_HANDOFF.md) defines
+the exact cutover; no remote copy or deployment is performed by this task.
 
-`tasks.py:16-83` exposes `fetch`, `process`, `publish`, and `chained`. `chained` attempts publication even when processing raises (`tasks.py:43-56`). No server cron expression is checked in, so its cadence, environment, timeout, and overlap policy cannot be audited from this repository. Fetch and publish have cross-process MariaDB advisory locks; processing does not.
+**CURRENT - local development compatibility**
+
+Source-checkout development may retain the existing APScheduler path when
+explicitly selected. It is never enabled by canonical remote Compose. The
+standalone `.devcontainer` configuration is a local workspace helper, detached
+from both remote Compose files; it is not a remote source-mounted deployment.
+
+**CURRENT - external one-shot entry points**
+
+Dokploy owns remote recurrence. `tasks.py` exposes bounded `fetch_once`,
+`pipeline_once`, `embedding_ingest`, and `embedding_worker`; `process`, `publish`,
+and `embedding_backfill` remain controlled manual commands. Compatibility aliases
+`fetch` and `chained` remain. Section 16 documents conflict locks and UTC cadence;
+no cron configuration or scheduler service is added to repository execution.
 
 **CURRENT - HTTP routes**
 
@@ -393,16 +437,31 @@ Before migration the rich/raw relationship remains a URL join. The additive migr
 
 | Job | Production owner | Cross-process control | Contract |
 |---|---|---|---|
-| Fetch | external `fetch_once` schedule | existing app-DB `news_fetcher_lock` | one bounded run; contention skips |
-| Process/publish | external `pipeline_once` schedule | app-DB `getnewsapi:job:v1:pipeline-workflow:*`; publish retains `wp_publisher_lock` | process then publish; unsafe overlaps and manual process/publish conflicts skip |
-| Embedding ingest/backfill | external rollout/manual invocation | vector-DB `getnewsapi:job:v1:embedding-registration:*` | serialized registration scans |
-| Embedding worker | external rollout invocation | durable row claims | parallel workers supported; no global job lock |
+| Fetch | Dokploy `fetch_once` job | existing app-DB `news_fetcher_lock` | one bounded run; contention skips |
+| Process/publish | Dokploy `pipeline_once` job | app-DB `getnewsapi:job:v1:pipeline-workflow:*`; publish retains `wp_publisher_lock` | process then publish; unsafe overlaps and manual process/publish conflicts skip |
+| Embedding ingest/backfill | Dokploy ingest job / manual backfill | vector-DB `getnewsapi:job:v1:embedding-registration:*` | serialized registration scans |
+| Embedding worker | Dokploy worker job | durable row claims | parallel workers supported; no global job lock |
 
 Production rejects `ENABLE_APSCHEDULER=true`; the web container serves HTTP only.
 The local APScheduler remains for development compatibility and now delegates its
 chained run to the same `pipeline_once` contract. New advisory locks use dedicated
 autocommit connections, bounded waits, `finally` release, and disconnect release;
 their namespace is distinct from migration locks.
+
+The intended DEV schedule is UTC, configured as Dokploy COMPOSE jobs targeting
+`getnewsapi-dev` in `/app`:
+
+| UTC cron | Command |
+|---|---|
+| `0,30 * * * *` | `python tasks.py fetch_once` |
+| `2,32 * * * *` | `python tasks.py embedding_ingest 25` |
+| `3,33 * * * *` | `python tasks.py embedding_worker 5` |
+| `5,35 * * * *` | `python tasks.py pipeline_once` |
+
+Create new jobs disabled, then disable/drain old Application jobs before enabling
+the Compose jobs. Never leave both sets enabled. Production targets
+`getnewsapi-prod` under separate approval. Backfill stays manual; these documented
+schedules do not change the existing application/job algorithms or source defaults.
 
 ## 17. Failure handling and retries
 
@@ -854,8 +913,8 @@ Each operation logs count-only run metrics: scanned/registered/skipped documents
 enqueued/existing jobs, claimed/completed/reconciled/retryable/failed/lost jobs,
 provider calls, embedded chunks, and token usage when supplied. No article text
 or vector is logged. Phase 7C2 exposes `embedding_ingest` and `embedding_worker`
-as bounded one-shot commands; no embedding cadence has been approved and
-scheduling remains a rollout decision.
+as bounded one-shot commands. The current intended external DEV cadence is in
+section 16; no in-process embedding schedule or automatic feature enablement is added.
 Phase 6C1 provides isolated semantic retrieval and offline evaluation. Phase 6C2A
 adds optional fail-open invocation and durable evidence, but a retrieved neighbor
 still carries no duplicate classification or publication effect. Calibration and
@@ -1139,18 +1198,20 @@ Each phase is intentionally deployable and reversible on its own.
 ### Deployment Phase 7A/7B/7C1/7C2/7D: packaging and operations
 
 - Phase 7A completed the repository-only deployment audit without live access.
-- Phase 7B is implemented locally and not deployed. The production package uses a
-  non-root immutable web image, read-only root filesystem, persistent `/data`, and
-  separate edge/internal networks. Compose manages only private MariaDB 11.8 vector
-  storage; application and WordPress databases remain external.
+- The historical Phase 7B package introduced non-root immutable images, read-only
+  root, and persistent `/data`. The current canonical remote contracts retain
+  that hardening but replace the former bundled-vector/edge-backend topology:
+  `docker-compose.dev.yml` and `docker-compose.yml` each manage only one API service
+  on external `dokploy-network`. All databases and WordPress are separate resources.
 - Web startup validates core configuration offline in production, keeps APScheduler
   off, and performs no migrations or pipeline/provider work. `/health` is static;
   `/ready` checks application DB connectivity and vector DB only when enabled, not
   provider or schema/migration state.
 - Publication is Bearer-token protected, production API docs default off, logging
   is container-native, file logging is opt-in, DB TLS controls are explicit, and
-  runtime dependencies are pinned. Every existing feature flag remains false and
-  image search remains V1.
+  runtime dependencies are pinned. Source feature defaults remain false and image
+  search remains V1; the accepted DEV cutover preserves its externally supplied
+  rollout values instead of resetting them.
 - The lower-level Phase 7B environment contract is in
   `docs/GETNEWSAPI_PRODUCTION_ENVIRONMENT.md`; the authoritative operator
   procedure is `docs/GETNEWSAPI_DEPLOYMENT_RUNBOOK.md`.
@@ -1162,21 +1223,22 @@ Each phase is intentionally deployable and reversible on its own.
 - Normal apply excludes `005`, fresh-start utilities, and test fixtures. It is
   fail-fast, verifies before recording, never auto-baselines or auto-rolls back, and
   explicitly acknowledges MariaDB's non-atomic multi-DDL boundary.
-- Phase 7C2 is implemented locally and not deployed. A static job catalog exposes
+- Phase 7C2 implements a static job catalog exposing
   bounded fetch, process-then-publish, embedding, and controlled manual commands
   from the same image with typed results and deterministic exit status. Production
-  rejects APScheduler ownership; the external baseline preserves the existing
-  30-minute fetch and pipeline cadence with an approximately three-minute offset.
+  rejects APScheduler ownership. The current intended Dokploy DEV schedule is the
+  four-job UTC sequence in section 16; no scheduler is implemented in Compose.
 - App/vector MariaDB conflict groups serialize unsafe workflow and registration
   overlap without holding SQL transactions during provider work. Existing fetch
   and publish locks remain; embedding workers retain parallel durable row claims.
-  Embedding cadence, deployment, migration execution, and all feature activation
-  remain unapproved.
+  Actual production scheduling, deployment, migration execution, and feature
+  activation require independent operator approval.
 - Phase 7D is implemented locally as a documentation-only deployment runbook. It
   defines local-against-remote-DEV, remote DEV, and production procedures;
   independent migration preflight; backup/restore attestations; staged feature
   enablement; bounded backfill; monitoring; and disable/recovery actions. No live
-  rehearsal or activation occurred. Phase 7E remains separate.
+  rehearsal or activation occurred in that documentation phase. The user's later
+  live DEV evidence does not imply this Compose replacement has been deployed.
 
 ### Phase 6: enforce high-confidence duplicate blocking
 

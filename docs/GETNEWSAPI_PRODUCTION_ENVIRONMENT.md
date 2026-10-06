@@ -2,56 +2,85 @@
 
 ## Scope
 
-This document describes the Phase 7B package, Phase 7C1 migration operations, and
-the Phase 7C2 external one-shot job contract. It remains the lower-level
-configuration and packaging reference. The authoritative procedural guide is
-`docs/GETNEWSAPI_DEPLOYMENT_RUNBOOK.md`. No deployment has been performed and no
-scheduler product has been configured.
+This is the lower-level configuration and packaging reference for canonical
+remote DEV and production Compose deployment, migration operations, and external
+one-shot jobs. The authoritative procedural guide is
+`docs/GETNEWSAPI_DEPLOYMENT_RUNBOOK.md`. The user reports the existing Dockerfile
+Application DEV deployment has passed live acceptance. This repository update
+does not deploy its Compose replacement or modify that working resource.
 
 ## Topology
 
-`docker-compose.prod.yml` defines exactly two services:
+| File | Purpose | Database ownership |
+|---|---|---|
+| `docker-compose.dev.yml` | Canonical remote DEV API, service `getnewsapi-dev` | External DEV application DB, WordPress/DB, and MariaDB 11.8 vector DB |
+| `docker-compose.yml` | Canonical remote production API, service `getnewsapi-prod` | External production application DB, WordPress/DB, and MariaDB 11.8 vector DB |
+| `maintenance/vector/docker-compose.vector.yml` | Local-only vector testing/provisioning | Never a persistent remote DEV or production deployment |
+
+Each remote Compose file defines one API service:
 
 ```text
 reverse proxy
     |
-    +-- getnewsapi-edge -- getnewsapi-web:5000
-                              |
-                              +-- external/private application MariaDB
-                              +-- getnewsapi-private -- vector MariaDB 11.8
-                              +-- HTTPS -- external providers and WordPress
+    +-- external dokploy-network -- getnewsapi-dev:5000 OR getnewsapi-prod:5000
+                                      |
+                                      +-- external/private application MariaDB
+                                      +-- external/private vector MariaDB 11.8
+                                      +-- external WordPress DB
+                                      +-- HTTPS -- WordPress and approved providers
 ```
 
-The application MariaDB and WordPress database remain external. Compose creates
-only the private vector MariaDB. The web service joins an edge network and an
-internal backend network; the vector database joins only the internal network.
-Neither service publishes a host port. The reverse proxy must join the generated
-`getnewsapi-edge` network and route to `getnewsapi-web:5000`.
+Compose owns the API process lifecycle only. It creates no database, WordPress,
+worker, or scheduler service and does not control those resources' persistence.
+The API joins the existing external `dokploy-network`; operators must verify the
+managed DB endpoints are reachable there. Runtime `DB_*`, `WP_*`, `WP_DB_*`, and
+`VECTOR_DB_*` values select the endpoints. No database hostname is fixed in YAML.
+Distinct DEV/production service names avoid shared-network alias ambiguity, and
+Dokploy/Compose owns physical container naming. Only internal port 5000 is exposed;
+no host port or source bind mount is used.
 
-The web service does not declare vector database startup as an unconditional
-dependency because `VECTOR_ENABLED` defaults to false. `/ready` checks the vector
-database only after that feature is explicitly enabled.
+Both files build the repository-root Dockerfile and run `python app.py` in `/app`.
+Both fix `APP_ENV=production`, `API_DOCS_ENABLED=false`,
+`ENABLE_APSCHEDULER=false`, and `PYTHONUNBUFFERED=1`. Remote DEV intentionally uses
+production-safe validation while its endpoints, credentials, and domains remain
+DEV. `/ready` probes the vector database only after that feature is enabled.
 
 ## Production Environment
 
-Keep two production files outside the repository and Docker build context:
+Dokploy writes the Compose resource's runtime variables to an uncommitted `.env`
+next to the selected Compose file. The service explicitly loads it through
+`env_file: ${GETNEWSAPI_RUNTIME_ENV_FILE:-.env}`. Supplying `--env-file` to the
+Compose CLI provides interpolation values; it does not itself inject all of those
+values into the container. The service `env_file` supplies the complete runtime
+environment, with fixed deployment invariants taking precedence.
 
-- an application runtime file based on `.env.example`;
-- a Compose interpolation/provisioning file based on
-  `.env.provisioning.example`.
+Only application runtime values belong in that file. Never include
+`VECTOR_MARIADB_*` provisioning/root credentials or database root secrets.
+`.env.example` is the sanitized runtime inventory; `.env.provisioning.example`
+is a separate local vector provisioning reference, not a remote API requirement.
+No secret is a build argument, tracked environment file, or hard-coded YAML value.
 
-The provisioning file sets `GETNEWSAPI_RUNTIME_ENV_FILE` to the runtime file's
-absolute path. Validate from the repository root without rendering resolved
-environment values:
+For static validation, create a temporary file outside tracked paths using only
+synthetic values. Set `GETNEWSAPI_RUNTIME_ENV_FILE` in the calling shell to that
+file's absolute path, so both interpolation and the service `env_file` select
+sanitized data. From the repository root:
 
 ```text
-docker compose --env-file /secure/path/getnewsapi-provisioning.env \
-  -f docker-compose.prod.yml config --quiet
+docker compose --env-file <sanitized-temp-env> \
+  -f docker-compose.dev.yml config --quiet
+
+docker compose --env-file <sanitized-temp-env> \
+  -f docker-compose.yml config --quiet
 ```
 
-`.env.example` is the complete sanitized application-runtime reference. Blank
-values in that file are secrets or environment-specific inputs. From the
-repository root, `python GetNewsAPI/tasks.py config_check web` validates the
+Inspect any rendered configuration only with these synthetic values, never real
+secrets. Verify one API service, complete runtime injection, no host ports, the
+external network, and persistent `/data`. Delete the temporary file and restore
+the shell override afterward. Static `config` validation does not start Docker
+services, create volumes, or contact providers/DBs. See the [Dokploy Compose environment/storage contract](https://docs.dokploy.com/docs/core/docker-compose).
+
+Blank values in `.env.example` are secrets or environment-specific inputs. From
+the repository root, `python GetNewsAPI/tasks.py config_check web` validates the
 effective web configuration without opening a network or database connection.
 Additional offline profiles are `fetch`, `process`, `pipeline`, `publish`,
 `embedding`, `embedding_ingest`, `embedding_worker`, and `embedding_backfill`.
@@ -89,9 +118,10 @@ durable attempt runs existing post/media reconciliation first.
 
 ## Safe Initial State
 
-The image and production Compose do not run migrations, fetch, process, publish,
+The image and remote Compose do not run migrations, fetch, process, publish,
 embed, or backfill at startup. `ENABLE_APSCHEDULER` is fixed false for the web
-service. These source and Compose defaults remain false:
+service. These source defaults remain false; Compose preserves externally supplied
+rollout values instead of forcing a currently accepted DEV deployment back off:
 
 ```text
 ENABLE_APSCHEDULER
@@ -136,9 +166,29 @@ temporary media work. A named volume is mounted at `/data` for:
   history that must survive container replacement;
 - `/data/logs`: used only when file logging is explicitly enabled.
 
-Development keeps the previous `/app/cache` defaults unless paths are overridden.
-The container runs as UID/GID 10001 and owns `/data`, while application source
-remains root-owned and read-only.
+Remote DEV uses the same hardened state paths as production. Local source
+development keeps `/app/cache` defaults unless paths are overridden. The container
+runs as Dockerfile UID/GID 10001:10001, while application source remains root-owned
+and read-only. The logical volumes `getnewsapi-dev-state` and
+`getnewsapi-prod-state` have Docker Compose project-scoped names, isolating DEV
+from production. Keep each Dokploy Compose project identity stable across normal
+redeploys. Rebuild/recreate retains the named volume; deleting a volume or using
+`down -v` does not.
+
+Named-volume initialization uses the image's owned `/data` directory for a new
+empty volume. Operators must verify ownership and writability before acceptance,
+especially for reused/restored volumes. Do not guess an existing Application
+volume name. Inspect and either safely reuse the confirmed volume through a
+reviewed platform mount configuration, or copy `/data` once into the new volume.
+Quiesce old writers before a final consistent copy and verify UID/GID 10001:10001
+before enabling new jobs. The [Dokploy DEV handoff](GETNEWSAPI_DOKPLOY_DEV_HANDOFF.md)
+contains the parallel cutover; this repository task performs no remote copy.
+
+Both services retain init, read-only root, all capabilities dropped,
+`no-new-privileges`, restart `unless-stopped`, and `/tmp` tmpfs bounded to 64 MiB
+with mode 1777. The Dockerfile's non-root USER remains authoritative. Container
+health checks `http://127.0.0.1:5000/health`; use `/ready` for operator readiness,
+so transient external DB failure is not a liveness failure.
 
 ## Database TLS
 
@@ -148,30 +198,25 @@ the `DB_*`, `VECTOR_DB_*`, and `WP_DB_*` TLS variables in `.env.example`.
 
 Existing-compatible defaults offer TLS without certificate verification. For an
 external production DB, enable certificate and hostname verification and mount a
-CA file into the container, then set the corresponding `*_SSL_CA` path. The
-Compose-managed vector DB uses an internal Docker network and defaults its client
-TLS off unless DevOps configures certificates on that database. No certificates
+CA file into the container, then set the corresponding `*_SSL_CA` path. The remote
+vector DB is separately managed and uses its recorded endpoint TLS policy.
+Source defaults for all three DB connections offer TLS with certificate and
+identity verification off; Compose does not override that policy. No certificates
 are shipped by the image, and HTTPS provider verification is unchanged.
 
-## Vector Provisioning
+## Vector Resource Ownership
 
-The protected provisioning file supplies these values only to Compose
-interpolation and the vector MariaDB service, with no password defaults:
+Remote DEV and production consume separately managed MariaDB 11.8 vector
+resources. The existing populated DEV vector database is retained; API replacement
+does not provision a replacement or modify its migration chain. DevOps owns DB
+storage, least-privilege accounts, private routing, backup, and restore. The API
+uses only `VECTOR_DB_HOST`, `VECTOR_DB_PORT`, `VECTOR_DB_NAME`, `VECTOR_DB_USER`,
+`VECTOR_DB_PASSWORD`, connection timeout, and `VECTOR_DB_SSL_*` settings.
 
-```text
-VECTOR_MARIADB_DATABASE
-VECTOR_MARIADB_USER
-VECTOR_MARIADB_PASSWORD
-VECTOR_MARIADB_ROOT_PASSWORD
-```
-
-The separate runtime file supplies `VECTOR_DB_NAME`, `VECTOR_DB_USER`, and
-`VECTOR_DB_PASSWORD`; they must identify the same non-root application account
-created from the provisioning values. Compose fixes
-`VECTOR_DB_HOST=getnewsapi-vector-mariadb` and `VECTOR_DB_PORT=3306` for the web
-service. `VECTOR_MARIADB_ROOT_PASSWORD` never enters the web or one-shot job
-environment. The named `getnewsapi-vector-data` volume persists database files,
-and the vector port is never published to the host.
+`maintenance/vector/docker-compose.vector.yml` and its provisioning defaults are
+LOCAL DEVELOPMENT / VECTOR VALIDATION ONLY, never persistent remote DEV,
+production, or shared infrastructure. `VECTOR_MARIADB_ROOT_PASSWORD` and other
+provisioning values must never enter remote web or one-shot runtime environments.
 
 ## Migration Resources
 
@@ -195,8 +240,9 @@ Use the same immutable application image for one-shot operations. No source or S
 bind mount and no special migration image are required:
 
 ```text
-docker compose --env-file /secure/path/getnewsapi-provisioning.env \
-  -f docker-compose.prod.yml run --rm getnewsapi-web \
+GETNEWSAPI_RUNTIME_ENV_FILE=/secure/path/getnewsapi-runtime.env \
+docker compose --env-file /secure/path/getnewsapi-runtime.env \
+  -f docker-compose.yml run --rm getnewsapi-prod \
   python tasks.py migration_plan app
 ```
 
@@ -245,11 +291,11 @@ contacts providers nor changes any feature flag.
 
 ## External One-Shot Job Contract
 
-Production has exactly one scheduler owner: an external scheduler chosen by
-DevOps. `getnewsapi-web` serves HTTP only, fixes `ENABLE_APSCHEDULER=false`, and
+Remote DEV and production have exactly one scheduler owner: Dokploy.
+`getnewsapi-dev`/`getnewsapi-prod` serve HTTP only, fix `ENABLE_APSCHEDULER=false`, and
 does not start recurring work. Production configuration rejects
-`APP_ENV=production` with `ENABLE_APSCHEDULER=true`. Development may retain the
-in-process APScheduler compatibility path.
+`APP_ENV=production` with `ENABLE_APSCHEDULER=true`. Local source development may
+retain the in-process APScheduler compatibility path; canonical remote DEV does not.
 
 The explicit catalog is available without network or database access:
 
@@ -265,8 +311,8 @@ The supported jobs are:
 | `pipeline_once` | recurring | process against application DB and text/search providers, then publish against application/WordPress DB, WordPress REST, and image providers | `PROCESS_BATCH_MIN..PROCESS_BATCH_MAX` within `PROCESS_LOOKAHEAD_MINUTES`, then `PUBLISH_BATCH_MAX` | application-DB `pipeline-workflow` job lock; overlap skips |
 | `process` | manual | application DB and configured text/search providers | processing bounds above | shares `pipeline-workflow` |
 | `publish` | manual | application/WordPress DB, WordPress REST, and configured image providers | `PUBLISH_BATCH_MAX` | shares `pipeline-workflow`, then retains `wp_publisher_lock` |
-| `embedding_ingest` | rollout decision | application and vector DB; no embedding provider call | default `EMBEDDING_INGEST_LIMIT=25`, maximum 1000 | vector-DB `embedding-registration` job lock |
-| `embedding_worker` | rollout decision | application/vector DB and configured embedding provider | default `EMBEDDING_WORK_LIMIT=5`, maximum 100 jobs; `EMBEDDING_MAX_CHUNKS_PER_JOB=100` by default | no global job lock; durable row claims support parallel workers |
+| `embedding_ingest` | externally scheduled DEV | application and vector DB; no embedding provider call | default `EMBEDDING_INGEST_LIMIT=25`, maximum 1000 | vector-DB `embedding-registration` job lock |
+| `embedding_worker` | externally scheduled DEV | application/vector DB and configured embedding provider | default `EMBEDDING_WORK_LIMIT=5`, maximum 100 jobs; `EMBEDDING_MAX_CHUNKS_PER_JOB=100` by default | no global job lock; durable row claims support parallel workers |
 | `embedding_backfill` | manual | application and vector DB; no embedding provider call | default/maximum changed registrations 25/1000; 100-row keyset pages do not impose a total scan ceiling | shares vector-DB `embedding-registration` |
 
 Every command performs one terminating run. Output work is bounded as listed;
@@ -286,13 +332,24 @@ python tasks.py embedding_backfill [source|generated] [limit]
 not independent recurring schedules. The legacy `fetch` and `chained` names remain
 compatibility aliases for `fetch_once` and `pipeline_once`.
 
-The current-equivalent baseline is `fetch_once` every 30 minutes and
-`pipeline_once` every 30 minutes approximately three minutes after fetch. A
-pipeline run always attempts process first and publish second. Publish still runs
-when processing finds no work or fails, preserving backlog draining; any failed
-stage makes the overall result nonzero and identifies the stage. No embedding
-cadence has been approved. Scheduling `embedding_ingest` or `embedding_worker`
-remains a rollout decision, while backfill remains manual.
+The intended DEV schedule is UTC and configured by the operator as Dokploy
+COMPOSE jobs targeting `getnewsapi-dev` in `/app`:
+
+| UTC cron | Command |
+|---|---|
+| `0,30 * * * *` | `python tasks.py fetch_once` |
+| `2,32 * * * *` | `python tasks.py embedding_ingest 25` |
+| `3,33 * * * *` | `python tasks.py embedding_worker 5` |
+| `5,35 * * * *` | `python tasks.py pipeline_once` |
+
+Create new jobs disabled. Disable the old Application jobs and let active runs
+finish before enabling the Compose jobs; never leave both sets enabled. Verify
+one complete sequence and its bounded results. Production jobs target
+`getnewsapi-prod` only after separate production approval. No schedules, cron,
+sidecars, or scheduler services are implemented by these Compose files.
+Backfill stays manual. A pipeline run still attempts process then publish;
+publication runs when processing finds no work or fails, preserving backlog
+draining. Any failed stage makes the overall result nonzero and identifies it.
 
 New job locks use stable names of the form
 `getnewsapi:job:v1:<conflict-group>:<database-scope-hash>`. They are distinct from
@@ -314,12 +371,14 @@ and persistent `/data` mounts as the web service. No source mount or special wor
 image is required:
 
 ```text
-docker compose --env-file /secure/path/getnewsapi-provisioning.env \
-  -f docker-compose.prod.yml run --rm getnewsapi-web \
+GETNEWSAPI_RUNTIME_ENV_FILE=/secure/path/getnewsapi-runtime.env \
+docker compose --env-file /secure/path/getnewsapi-runtime.env \
+  -f docker-compose.yml run --rm getnewsapi-prod \
   python tasks.py fetch_once
 
-docker compose --env-file /secure/path/getnewsapi-provisioning.env \
-  -f docker-compose.prod.yml run --rm getnewsapi-web \
+GETNEWSAPI_RUNTIME_ENV_FILE=/secure/path/getnewsapi-runtime.env \
+docker compose --env-file /secure/path/getnewsapi-runtime.env \
+  -f docker-compose.yml run --rm getnewsapi-prod \
   python tasks.py pipeline_once
 ```
 
@@ -336,6 +395,8 @@ migration sequencing, one-shot jobs, staged feature activation, monitoring,
 disable/recovery actions, and DEV-to-production promotion. This file remains the
 lower-level environment contract.
 
-Phase 7D was documentation-only: it did not deploy, access Dokploy, connect to a
-live service, execute a migration, choose an embedding cadence, or activate a
-feature. Phase 7E remains the separate clean-room or remote-DEV rehearsal.
+The earlier Phase 7D documentation work did not deploy or activate features.
+The user's later live DEV acceptance is separate evidence. This Compose contract
+update performs no remote deployment, DB mutation, provider call, scheduler
+conversion, or `/data` copy; use the handoff for a separately executed parallel
+DEV replacement.

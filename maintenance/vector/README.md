@@ -2,7 +2,14 @@
 
 This compose file is a reproducible local-only MariaDB 11.8 service. It binds
 to `127.0.0.1:13309`, uses non-production defaults, and stores data in a named
-local volume. It is independent from the main application compose file.
+local volume. It is independent from both canonical remote API Compose files.
+
+**LOCAL DEVELOPMENT / VECTOR VALIDATION ONLY.**
+**NOT FOR persistent Dokploy DEV, production, or remote shared infrastructure.** Its
+local root/password defaults are disposable validation values, never remote
+deployment credentials. Remote `docker-compose.dev.yml` and `docker-compose.yml`
+create no vector service; their API consumes the existing managed `VECTOR_DB_*`
+endpoint and does not own database lifecycle.
 
 Start and inspect:
 
@@ -37,16 +44,21 @@ python -m unittest GetNewsAPI.tests.integration.test_vector_mariadb
 
 The suite refuses non-loopback hosts and all other database names.
 
-## Future Dokploy reproduction
+## Separately managed remote vector resources
 
-Do not execute these steps during Phase 6A. Later, create a service named
-`vector-mariadb` using the same tested `mariadb:11.8` family, database
-`coincourier_vectors`, internal port `3306`, no public port, and the same private
-Dokploy network as GetNewsAPI. Attach persistent storage, configure scheduled
-off-server backups, and inject production-specific credentials as secrets.
+Remote DEV and production use separate Dokploy-managed MariaDB 11.8 resources,
+private internal port 3306, no public DB port, persistent DB storage, and reviewed
+backup/restore ownership. Their API service must reach the managed endpoint on
+the approved private Dokploy route; canonical API Compose uses external
+`dokploy-network`. Hostnames and TLS policy are runtime `VECTOR_DB_*` values,
+never guessed local-helper service names.
 
-Provision an empty service, wait for health, create the database/user, apply the
-exact reviewed vector migrations, configure GetNewsAPI vector credentials, and
-keep `VECTOR_ENABLED=false`. Verify private connectivity and schema before any
-later Phase 6B or Phase 6C enablement. No automated Dokploy login or deployment
-script is provided here.
+The user reports the current DEV vector resource is populated and its migrations
+verified. Preserve that resource and data when replacing the API Application
+with Compose. Do not start this helper as a replacement, copy local defaults into
+remote secrets, or reapply schema as a cutover shortcut. Database provisioning
+and new-environment migration work are separate approved operator tasks in the
+[deployment runbook](../../docs/GETNEWSAPI_DEPLOYMENT_RUNBOOK.md).
+`VECTOR_MARIADB_*` and database root credentials stay outside API runtime; only
+`VECTOR_DB_*` application-user connection settings enter it. This repository
+task performs no remote login, provisioning, migration, or data operation.

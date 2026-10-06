@@ -1,16 +1,15 @@
 {
   "name": "GetNewsAPI-Dev",
-  // use your compose, relative to this file
-  "dockerComposeFile": [ "../docker-compose.yml" ],
-  "service": "getnewsapi",
-  "workspaceFolder": "/app",
-  // only start the API service (and WP if you need it)
-  "runServices": [ "getnewsapi" ],
+  // Local source workspace only; never overlay a remote deployment contract.
+  "dockerComposeFile": [ "docker-compose.yml" ],
+  "service": "getnewsapi-local",
+  "workspaceFolder": "/workspaces/api-test",
+  // Start only the local editor workspace; no remote API or database resource.
+  "runServices": [ "getnewsapi-local" ],
   "shutdownAction": "stopCompose",
   // expose API + debug port
-  "forwardPorts": [ 5001, 5678 ],
-  // install deps after container build
-  "postCreateCommand": "pip install -r requirements.txt",
+  "forwardPorts": [ 5000, 5678 ],
+  // The root Dockerfile already installs the pinned runtime dependencies.
   // recommend these Python extensions
   "extensions": [
     "ms-python.python",

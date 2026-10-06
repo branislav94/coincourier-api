@@ -10,6 +10,7 @@ import re
 import shutil
 import subprocess
 import sys
+import tempfile
 import unittest
 from unittest.mock import patch
 
@@ -19,6 +20,8 @@ REPOSITORY_DIR = PROJECT_DIR.parent
 if str(PROJECT_DIR) not in sys.path:
     sys.path.insert(0, str(PROJECT_DIR))
 
+from GetNewsAPI.tests.environment_isolation import isolated_subprocess_environment
+
 import tasks
 from runtime.config_validation import format_config_issues, validate_runtime_config
 from runtime import logging_config
@@ -26,7 +29,8 @@ from runtime import logging_config
 
 DOCKERIGNORE_PATH = REPOSITORY_DIR / ".dockerignore"
 DOCKERFILE_PATH = REPOSITORY_DIR / "Dockerfile"
-PRODUCTION_COMPOSE_PATH = REPOSITORY_DIR / "docker-compose.prod.yml"
+PRODUCTION_COMPOSE_PATH = REPOSITORY_DIR / "docker-compose.yml"
+DEV_COMPOSE_PATH = REPOSITORY_DIR / "docker-compose.dev.yml"
 ENV_EXAMPLE_PATH = REPOSITORY_DIR / ".env.example"
 PROVISIONING_ENV_EXAMPLE_PATH = REPOSITORY_DIR / ".env.provisioning.example"
 CONFIG_PATH = PROJECT_DIR / "config.py"
@@ -58,9 +62,169 @@ def minimal_web_environment() -> dict[str, str]:
     }
 
 
-def production_services(compose: str) -> set[str]:
-    service_block = compose.split("services:", 1)[1].split("\nnetworks:", 1)[0]
-    return set(re.findall(r"^  ([a-z0-9-]+):\s*$", service_block, re.MULTILINE))
+REMOTE_COMPOSE_CONTRACTS = (
+    (DEV_COMPOSE_PATH, "getnewsapi-dev", "getnewsapi-dev-state"),
+    (PRODUCTION_COMPOSE_PATH, "getnewsapi-prod", "getnewsapi-prod-state"),
+)
+
+DEPLOYMENT_INVARIANTS = {
+    "APP_ENV": "production",
+    "API_DOCS_ENABLED": "false",
+    "ENABLE_APSCHEDULER": "false",
+    "PYTHONUNBUFFERED": "1",
+    "WRITABLE_STATE_DIR": "/data",
+    "STOCK_IMAGE_CACHE_DIR": "/data/cache/stock_images",
+    "STOCK_IMAGE_USAGE_PATH": "/data/stock_image_usage.json",
+}
+
+# Deliberately conflicting runtime values prove that Compose owns invariants
+# while feature flags, endpoints, and credentials still come from the env file.
+SYNTHETIC_RUNTIME_ENVIRONMENT = {
+    **minimal_web_environment(),
+    "APP_ENV": "development",
+    "API_DOCS_ENABLED": "true",
+    "ENABLE_APSCHEDULER": "true",
+    "PYTHONUNBUFFERED": "0",
+    "WRITABLE_STATE_DIR": "/app/cache",
+    "STOCK_IMAGE_CACHE_DIR": "/app/cache/images",
+    "STOCK_IMAGE_USAGE_PATH": "/app/cache/usage.json",
+    "WP_API_URL": "https://wordpress.example.invalid",
+    "WP_USERNAME": "synthetic_wordpress_user",
+    "WP_APP_PASSWORD": "synthetic-wordpress-password",
+    "WP_DB_HOST": "wordpress-db.example.invalid",
+    "WP_DB_PORT": "3306",
+    "WP_DB_NAME": "wordpress_synthetic",
+    "WP_DB_USER": "synthetic_wordpress_db_user",
+    "WP_DB_PASSWORD": "synthetic-wordpress-db-password",
+    "VECTOR_DB_HOST": "vector-db.example.invalid",
+    "VECTOR_DB_PORT": "3306",
+    "VECTOR_DB_NAME": "vectors_synthetic",
+    "VECTOR_DB_USER": "synthetic_vector_user",
+    "VECTOR_DB_PASSWORD": "synthetic-vector-password",
+    "VECTOR_DB_CONNECT_TIMEOUT_SECONDS": "7",
+    "VECTOR_DB_SSL_ENABLED": "false",
+    "VECTOR_DB_SSL_VERIFY_CERT": "false",
+    "VECTOR_DB_SSL_VERIFY_IDENTITY": "false",
+    "VECTOR_DB_SSL_CA": "",
+    "CRYPTO_NEWS_TOKEN": "synthetic-cryptonews-token",
+    "OPENAI_API_KEY": "synthetic-openai-key",
+    "GROK_API_KEY": "synthetic-grok-key",
+    "PEXELS_API_KEY": "synthetic-pexels-key",
+    "PIXABAY_API_KEY": "synthetic-pixabay-key",
+    "PROCESS_DURABLE_CLAIMS_ENABLED": "true",
+    "PUBLISH_DURABLE_STATE_ENABLED": "true",
+    "DUPLICATE_SHADOW_ENABLED": "true",
+    "VECTOR_ENABLED": "true",
+    "EMBEDDING_ENABLED": "true",
+    "SEMANTIC_SHADOW_ENABLED": "true",
+}
+
+
+def compose_subprocess_environment(overrides=None) -> dict[str, str]:
+    environment = isolated_subprocess_environment(overrides)
+    # Docker's Windows plugin search uses these installation paths. Do not
+    # inherit parent credentials or Docker connection/configuration settings.
+    environment.update(
+        {
+            name: value
+            for name, value in os.environ.items()
+            if name.upper() in {"PROGRAMFILES", "PROGRAMFILES(X86)", "PROGRAMW6432"}
+        }
+    )
+    return environment
+
+
+def compose_cli() -> str:
+    executable = shutil.which("docker")
+    if executable is None:
+        raise unittest.SkipTest("Docker CLI is not installed")
+    version = subprocess.run(
+        [executable, "compose", "version"],
+        cwd=REPOSITORY_DIR,
+        env=compose_subprocess_environment(),
+        stdin=subprocess.DEVNULL,
+        capture_output=True,
+        text=True,
+        timeout=30,
+        check=False,
+    )
+    if version.returncode != 0:
+        raise unittest.SkipTest("Docker Compose is not available")
+    return executable
+
+
+def resolved_compose(
+    executable: str,
+    compose_path: Path,
+    *,
+    runtime_environment: dict[str, str] | None = None,
+    runtime_override: bool = False,
+    interpolation_environment: dict[str, str] | None = None,
+) -> dict:
+    """Parse a temporary contract with synthetic env files; never run Docker."""
+
+    runtime = (
+        SYNTHETIC_RUNTIME_ENVIRONMENT
+        if runtime_environment is None
+        else runtime_environment
+    )
+    with tempfile.TemporaryDirectory(prefix="getnewsapi-compose-test-") as directory:
+        root = Path(directory)
+        staged_compose = root / compose_path.name
+        staged_compose.write_text(
+            compose_path.read_text(encoding="utf-8"), encoding="utf-8"
+        )
+        default_env = root / ".env"
+        default_env.write_text(
+            "".join(f"{name}={value}\n" for name, value in runtime.items()),
+            encoding="utf-8",
+        )
+        overrides = {
+            "COMPOSE_DISABLE_ENV_FILE": "1",
+            "GETNEWSAPI_RUNTIME_ENV_FILE": "",
+            **(interpolation_environment or {}),
+        }
+        if runtime_override:
+            custom_env = root / "synthetic-runtime.env"
+            custom_env.write_text(
+                "".join(f"{name}={value}\n" for name, value in runtime.items()),
+                encoding="utf-8",
+            )
+            # Different default values detect accidental injection from .env.
+            default_env.write_text(
+                "DB_HOST=unused-default.example.invalid\n", encoding="utf-8"
+            )
+            overrides["GETNEWSAPI_RUNTIME_ENV_FILE"] = str(custom_env)
+
+        parsed = subprocess.run(
+            [
+                executable,
+                "compose",
+                "--project-name",
+                "getnewsapi-contract-test",
+                "--env-file",
+                str(default_env),
+                "-f",
+                str(staged_compose),
+                "config",
+                "--format",
+                "json",
+                "--no-path-resolution",
+            ],
+            cwd=root,
+            env=compose_subprocess_environment(overrides),
+            stdin=subprocess.DEVNULL,
+            capture_output=True,
+            text=True,
+            timeout=30,
+            check=False,
+        )
+        if parsed.returncode != 0:
+            raise AssertionError(
+                f"{compose_path.name}: synthetic Compose validation failed: "
+                f"{parsed.stderr.strip()}"
+            )
+        return json.loads(parsed.stdout)
 
 
 class DockerPackagingTests(unittest.TestCase):
@@ -68,11 +232,9 @@ class DockerPackagingTests(unittest.TestCase):
     def setUpClass(cls):
         cls.dockerignore = DOCKERIGNORE_PATH.read_text(encoding="utf-8")
         cls.dockerfile = DOCKERFILE_PATH.read_text(encoding="utf-8")
-        cls.compose = PRODUCTION_COMPOSE_PATH.read_text(encoding="utf-8")
 
     def test_dockerignore_excludes_real_environment_files(self):
         patterns = set(self.dockerignore.splitlines())
-        self.assertTrue((PROJECT_DIR / ".env").exists())
         self.assertTrue({".env", ".env.*", "**/.env", "**/.env.*"} <= patterns)
         self.assertIn("GetNewsAPI/.env", patterns)
 
@@ -93,156 +255,6 @@ class DockerPackagingTests(unittest.TestCase):
         self.assertNotIn("*.sql", set(self.dockerignore.splitlines()))
         self.assertNotIn("maintenance/", set(self.dockerignore.splitlines()))
 
-    def test_production_compose_has_no_source_bind_mount(self):
-        self.assertNotIn("./GetNewsAPI:/app", self.compose)
-        self.assertNotIn("type: bind", self.compose)
-
-    def test_production_compose_defines_only_web_and_vector_database_services(self):
-        self.assertEqual(
-            production_services(self.compose),
-            {"getnewsapi-web", "getnewsapi-vector-mariadb"},
-        )
-
-    def test_production_compose_does_not_define_application_database(self):
-        services = production_services(self.compose)
-        self.assertNotIn("getnewsapi-mariadb", services)
-        self.assertNotIn("application-db", services)
-
-    def test_vector_database_uses_mariadb_11_8_and_persistent_volume(self):
-        self.assertIn("image: mariadb:11.8", self.compose)
-        self.assertIn("getnewsapi-vector-data:/var/lib/mysql", self.compose)
-        self.assertRegex(self.compose, r"(?m)^  getnewsapi-vector-data:$")
-
-    def test_vector_database_has_no_public_port(self):
-        self.assertNotRegex(self.compose, r"(?m)^    ports:$")
-        self.assertNotIn("3306:3306", self.compose)
-
-    def test_production_network_is_explicit_and_shared(self):
-        self.assertRegex(self.compose, r"(?m)^  getnewsapi-private:$")
-        self.assertEqual(self.compose.count("- getnewsapi-private"), 2)
-        self.assertRegex(
-            self.compose,
-            r"(?ms)^  getnewsapi-private:\s+driver: bridge\s+internal: true$",
-        )
-        self.assertRegex(self.compose, r"(?m)^  getnewsapi-edge:$")
-
-    def test_production_web_exposes_only_container_port(self):
-        self.assertIn('expose:\n      - "5000"', self.compose)
-        self.assertNotRegex(self.compose, r"(?m)^    ports:$")
-
-    def test_vector_provisioning_has_no_default_passwords(self):
-        for name in (
-            "VECTOR_MARIADB_USER",
-            "VECTOR_MARIADB_PASSWORD",
-            "VECTOR_MARIADB_ROOT_PASSWORD",
-        ):
-            self.assertIn(f"${{{name}:?", self.compose)
-
-    def test_vector_application_connection_uses_runtime_credentials(self):
-        runtime_example = ENV_EXAMPLE_PATH.read_text(encoding="utf-8")
-        self.assertIn("VECTOR_DB_HOST: getnewsapi-vector-mariadb", self.compose)
-        self.assertIn('VECTOR_DB_PORT: "3306"', self.compose)
-        for name in ("VECTOR_DB_NAME", "VECTOR_DB_USER", "VECTOR_DB_PASSWORD"):
-            self.assertIn(f"{name}=", runtime_example)
-
-    def test_runtime_and_provisioning_environment_contracts_are_separate(self):
-        runtime_example = ENV_EXAMPLE_PATH.read_text(encoding="utf-8")
-        provisioning_example = PROVISIONING_ENV_EXAMPLE_PATH.read_text(encoding="utf-8")
-        self.assertTrue(PROVISIONING_ENV_EXAMPLE_PATH.is_file())
-        self.assertIn("GETNEWSAPI_RUNTIME_ENV_FILE", self.compose)
-        for name in (
-            "VECTOR_MARIADB_DATABASE",
-            "VECTOR_MARIADB_USER",
-            "VECTOR_MARIADB_PASSWORD",
-            "VECTOR_MARIADB_ROOT_PASSWORD",
-        ):
-            self.assertNotIn(name, runtime_example)
-            self.assertIn(name, provisioning_example)
-
-        web_block = self.compose.split("  getnewsapi-web:", 1)[1].split(
-            "  getnewsapi-vector-mariadb:", 1
-        )[0]
-        self.assertNotIn("VECTOR_MARIADB_", web_block)
-        self.assertNotIn("MARIADB_ROOT_PASSWORD", web_block)
-
-    def test_resolved_compose_scopes_vector_provisioning_to_database(self):
-        if shutil.which("docker") is None:
-            self.skipTest("Docker CLI is not installed")
-
-        version = subprocess.run(
-            ["docker", "compose", "version"],
-            cwd=REPOSITORY_DIR,
-            capture_output=True,
-            text=True,
-            check=False,
-        )
-        if version.returncode != 0:
-            self.skipTest("Docker Compose is not available")
-
-        resolved = subprocess.run(
-            [
-                "docker",
-                "compose",
-                "--env-file",
-                str(PROVISIONING_ENV_EXAMPLE_PATH),
-                "-f",
-                str(PRODUCTION_COMPOSE_PATH),
-                "config",
-                "--format",
-                "json",
-            ],
-            cwd=REPOSITORY_DIR,
-            capture_output=True,
-            text=True,
-            check=False,
-        )
-
-        self.assertEqual(
-            resolved.returncode,
-            0,
-            msg="resolved Compose configuration failed",
-        )
-        services = json.loads(resolved.stdout)["services"]
-        self.assertEqual(
-            set(services),
-            {"getnewsapi-web", "getnewsapi-vector-mariadb"},
-        )
-        web_environment = set(services["getnewsapi-web"]["environment"])
-        vector_environment = set(
-            services["getnewsapi-vector-mariadb"]["environment"]
-        )
-        self.assertTrue(
-            {"VECTOR_DB_HOST", "VECTOR_DB_PORT", "VECTOR_DB_NAME",
-             "VECTOR_DB_USER", "VECTOR_DB_PASSWORD"} <= web_environment
-        )
-        self.assertTrue(
-            {"MARIADB_DATABASE", "MARIADB_USER", "MARIADB_PASSWORD",
-             "MARIADB_ROOT_PASSWORD"} <= vector_environment
-        )
-        self.assertFalse(
-            {"VECTOR_MARIADB_ROOT_PASSWORD", "MARIADB_ROOT_PASSWORD"}
-            & web_environment
-        )
-        self.assertNotIn("ports", services["getnewsapi-vector-mariadb"])
-
-        for flag in (
-            "PROCESS_DURABLE_CLAIMS_ENABLED",
-            "PUBLISH_DURABLE_STATE_ENABLED",
-            "DUPLICATE_SHADOW_ENABLED",
-            "VECTOR_ENABLED",
-            "EMBEDDING_ENABLED",
-            "SEMANTIC_SHADOW_ENABLED",
-        ):
-            self.assertEqual(
-                services["getnewsapi-web"]["environment"][flag],
-                "false",
-            )
-
-    def test_one_shot_jobs_inherit_only_the_web_service_environment(self):
-        self.assertNotIn("worker:", self.compose)
-        self.assertNotIn("scheduler:", self.compose)
-        self.assertIn("run --rm getnewsapi-web", RUNBOOK_PATH.read_text(encoding="utf-8"))
-
     def test_all_safe_feature_defaults_remain_false(self):
         config_source = CONFIG_PATH.read_text(encoding="utf-8")
         environment_example = ENV_EXAMPLE_PATH.read_text(encoding="utf-8")
@@ -255,9 +267,9 @@ class DockerPackagingTests(unittest.TestCase):
             "EMBEDDING_ENABLED",
             "SEMANTIC_SHADOW_ENABLED",
         ):
-            self.assertIn(f'_env_bool("{name}", False)', config_source)
-            self.assertIn(f"{name}=false", environment_example)
-        self.assertIn('ENABLE_APSCHEDULER: "false"', self.compose)
+            with self.subTest(variable=name):
+                self.assertIn(f'_env_bool("{name}", False)', config_source)
+                self.assertIn(f"{name}=false", environment_example)
 
     def test_image_search_v1_remains_the_source_default(self):
         source = CONFIG_PATH.read_text(encoding="utf-8")
@@ -265,7 +277,9 @@ class DockerPackagingTests(unittest.TestCase):
 
     def test_dockerfile_runs_as_non_root_with_immutable_source(self):
         self.assertIn("USER 10001:10001", self.dockerfile)
+        self.assertIn("WORKDIR /app", self.dockerfile)
         self.assertIn("COPY GetNewsAPI/ .", self.dockerfile)
+        self.assertIn("chown 10001:10001 /data", self.dockerfile)
         self.assertNotIn("--chown=10001", self.dockerfile)
         self.assertNotIn("--reload", self.dockerfile)
 
@@ -281,21 +295,271 @@ class DockerPackagingTests(unittest.TestCase):
             )
         self.assertNotIn("maintenance/testing", self.dockerfile)
 
-    def test_web_root_filesystem_is_read_only_with_bounded_writable_paths(self):
-        self.assertIn("read_only: true", self.compose)
-        self.assertIn("getnewsapi-state:/data", self.compose)
-        self.assertIn("/tmp:size=64m,mode=1777", self.compose)
-
-    def test_container_healthchecks_use_python_or_image_native_tools(self):
+    def test_dockerfile_healthcheck_needs_no_extra_operating_system_tools(self):
         self.assertIn("urllib.request.urlopen", self.dockerfile)
-        self.assertIn("urllib.request.urlopen", self.compose)
-        self.assertIn("healthcheck.sh", self.compose)
+        self.assertIn("http://127.0.0.1:5000/health", self.dockerfile)
         self.assertNotIn("apt-get", self.dockerfile)
 
     def test_startup_does_not_run_migrations_or_backfills(self):
         source = APP_PATH.read_text(encoding="utf-8")
         self.assertNotIn("migration", source.lower())
         self.assertNotIn("backfill", source.lower())
+
+
+class RemoteComposeContractTests(unittest.TestCase):
+    @classmethod
+    def setUpClass(cls):
+        cls.executable = compose_cli()
+        cls.contracts = [
+            (path, service_name, volume_name, resolved_compose(cls.executable, path))
+            for path, service_name, volume_name in REMOTE_COMPOSE_CONTRACTS
+        ]
+
+    def test_remote_contracts_define_only_their_distinct_api_service(self):
+        for path, service_name, _volume_name, model in self.contracts:
+            with self.subTest(compose=path.name):
+                self.assertEqual(set(model["services"]), {service_name})
+                self.assertNotIn("container_name", model["services"][service_name])
+                self.assertNotIn("depends_on", model["services"][service_name])
+
+    def test_api_builds_the_root_dockerfile_and_starts_app(self):
+        for path, service_name, _volume_name, model in self.contracts:
+            with self.subTest(compose=path.name):
+                service = model["services"][service_name]
+                self.assertEqual(service["build"]["context"], ".")
+                self.assertEqual(service["build"]["dockerfile"], "Dockerfile")
+                self.assertEqual(service["command"], ["python", "app.py"])
+                self.assertIsNone(service.get("entrypoint"))
+                self.assertNotIn("user", service)
+
+    def test_runtime_env_file_injects_values_and_invariants_override_conflicts(self):
+        expected = {
+            **SYNTHETIC_RUNTIME_ENVIRONMENT,
+            **DEPLOYMENT_INVARIANTS,
+        }
+        for path, service_name, _volume_name, model in self.contracts:
+            with self.subTest(compose=path.name):
+                self.assertEqual(model["services"][service_name]["environment"], expected)
+
+    def test_operator_can_select_a_separate_runtime_env_file(self):
+        runtime = {
+            **SYNTHETIC_RUNTIME_ENVIRONMENT,
+            "DB_HOST": "explicit-runtime.example.invalid",
+            "VECTOR_DB_HOST": "explicit-vector.example.invalid",
+        }
+        for path, service_name, _volume_name in REMOTE_COMPOSE_CONTRACTS:
+            with self.subTest(compose=path.name):
+                model = resolved_compose(
+                    self.executable, path,
+                    runtime_environment=runtime,
+                    runtime_override=True,
+                )
+                self.assertEqual(
+                    model["services"][service_name]["environment"],
+                    {**runtime, **DEPLOYMENT_INVARIANTS},
+                )
+
+    def test_api_does_not_receive_provisioning_values_from_interpolation(self):
+        provisioning = {
+            "VECTOR_MARIADB_DATABASE": "synthetic_provisioning_database",
+            "VECTOR_MARIADB_USER": "synthetic_provisioning_user",
+            "VECTOR_MARIADB_PASSWORD": "synthetic-provisioning-password",
+            "VECTOR_MARIADB_ROOT_PASSWORD": "synthetic-root-password",
+        }
+        for path, service_name, _volume_name in REMOTE_COMPOSE_CONTRACTS:
+            with self.subTest(compose=path.name):
+                model = resolved_compose(
+                    self.executable, path, interpolation_environment=provisioning
+                )
+                environment = model["services"][service_name]["environment"]
+                self.assertFalse(set(provisioning) & set(environment))
+                self.assertNotIn("MARIADB_ROOT_PASSWORD", environment)
+
+    def test_api_only_exposes_internal_http_port(self):
+        for path, service_name, _volume_name, model in self.contracts:
+            with self.subTest(compose=path.name):
+                service = model["services"][service_name]
+                self.assertEqual([str(port) for port in service["expose"]], ["5000"])
+                self.assertNotIn("ports", service)
+                self.assertNotIn("network_mode", service)
+
+    def test_api_joins_the_existing_external_dokploy_network(self):
+        for path, service_name, _volume_name, model in self.contracts:
+            with self.subTest(compose=path.name):
+                service = model["services"][service_name]
+                self.assertEqual(set(service["networks"]), {"dokploy-network"})
+                self.assertEqual(set(model["networks"]), {"dokploy-network"})
+                network = model["networks"]["dokploy-network"]
+                self.assertEqual(network["name"], "dokploy-network")
+                self.assertIs(network["external"], True)
+                self.assertNotIn("internal", network)
+
+    def test_data_uses_isolated_project_owned_persistent_volumes(self):
+        physical_names = set()
+        for path, service_name, volume_name, model in self.contracts:
+            with self.subTest(compose=path.name):
+                self.assertEqual(set(model["volumes"]), {volume_name})
+                volume = model["volumes"][volume_name]
+                self.assertNotIn("external", volume)
+                self.assertNotIn("driver_opts", volume)
+                self.assertEqual(
+                    volume["name"], f"getnewsapi-contract-test_{volume_name}"
+                )
+                physical_names.add(volume["name"])
+                mounts = model["services"][service_name]["volumes"]
+                self.assertEqual(len(mounts), 1)
+                self.assertEqual(mounts[0]["type"], "volume")
+                self.assertEqual(mounts[0]["source"], volume_name)
+                self.assertEqual(mounts[0]["target"], "/data")
+                self.assertFalse(mounts[0].get("read_only", False))
+        self.assertEqual(len(physical_names), 2)
+
+    def test_api_has_bounded_writable_paths_under_read_only_root(self):
+        for path, service_name, _volume_name, model in self.contracts:
+            with self.subTest(compose=path.name):
+                service = model["services"][service_name]
+                self.assertIs(service["read_only"], True)
+                self.assertEqual(service["tmpfs"], ["/tmp:size=64m,mode=1777"])
+                self.assertEqual(
+                    {mount["target"] for mount in service["volumes"]}, {"/data"}
+                )
+
+    def test_api_retains_process_and_privilege_hardening(self):
+        for path, service_name, _volume_name, model in self.contracts:
+            with self.subTest(compose=path.name):
+                service = model["services"][service_name]
+                self.assertIs(service["init"], True)
+                self.assertEqual(service["cap_drop"], ["ALL"])
+                self.assertEqual(service["security_opt"], ["no-new-privileges:true"])
+                self.assertEqual(service["restart"], "unless-stopped")
+                self.assertFalse(service.get("privileged", False))
+                self.assertNotIn("cap_add", service)
+                self.assertNotIn("devices", service)
+                self.assertNotIn("pid", service)
+
+    def test_liveness_uses_health_instead_of_external_database_readiness(self):
+        for path, service_name, _volume_name, model in self.contracts:
+            with self.subTest(compose=path.name):
+                check = model["services"][service_name]["healthcheck"]
+                self.assertEqual(check["test"][:3], ["CMD", "python", "-c"])
+                self.assertIn("http://127.0.0.1:5000/health", check["test"][3])
+                self.assertIn("timeout=3", check["test"][3])
+                self.assertNotIn("/ready", " ".join(check["test"]))
+                self.assertEqual(check["interval"], "30s")
+                self.assertEqual(check["timeout"], "5s")
+                self.assertEqual(check["start_period"], "10s")
+                self.assertEqual(check["retries"], 3)
+
+    def test_remote_yaml_defines_no_credentials_or_legacy_container_identity(self):
+        for path, _service_name, _volume_name in REMOTE_COMPOSE_CONTRACTS:
+            with self.subTest(compose=path.name):
+                source = path.read_text(encoding="utf-8")
+                self.assertNotIn("prod-getnewsapi", source)
+                self.assertNotIn("dev-getnewsapi", source)
+                self.assertNotIn("./GetNewsAPI:/app", source)
+                self.assertNotIn("VECTOR_MARIADB_", source)
+                self.assertNotIn("MARIADB_ROOT_PASSWORD", source)
+                for name, value in SYNTHETIC_RUNTIME_ENVIRONMENT.items():
+                    if any(marker in name for marker in ("PASSWORD", "TOKEN", "KEY")):
+                        self.assertNotIn(name, source)
+                        self.assertNotIn(value, source)
+
+
+class DeploymentTopologyRegressionTests(unittest.TestCase):
+    def test_editor_workspace_is_standalone_and_keeps_source_mount_local(self):
+        local_dir = REPOSITORY_DIR / ".devcontainer"
+        model = resolved_compose(
+            compose_cli(), local_dir / "docker-compose.yml", runtime_environment={}
+        )
+        self.assertEqual(set(model["services"]), {"getnewsapi-local"})
+        service = model["services"]["getnewsapi-local"]
+        self.assertEqual(service["build"]["context"], "..")
+        self.assertEqual(service["build"]["dockerfile"], "Dockerfile")
+        self.assertEqual(service["command"], ["sleep", "infinity"])
+        self.assertIs(service["healthcheck"]["disable"], True)
+        self.assertEqual(len(service["volumes"]), 1)
+        self.assertEqual(service["volumes"][0]["type"], "bind")
+        self.assertEqual(service["volumes"][0]["target"], "/workspaces/api-test")
+        self.assertNotIn("dokploy-network", model.get("networks", {}))
+        for name in ("devcontainer.json", "devcontainer.jsonc"):
+            source = (local_dir / name).read_text(encoding="utf-8")
+            # Both committed editor configurations contain whole-line comments.
+            configuration = json.loads(
+                "\n".join(
+                    line for line in source.splitlines()
+                    if not line.lstrip().startswith("//")
+                )
+            )
+            with self.subTest(configuration=name):
+                self.assertEqual(configuration["dockerComposeFile"], ["docker-compose.yml"])
+                self.assertEqual(configuration["service"], "getnewsapi-local")
+                self.assertNotIn("postCreateCommand", configuration)
+
+    def test_only_one_production_contract_remains_and_no_reference_survives(self):
+        retired_name = "docker-compose." + "prod.yml"
+        self.assertFalse((REPOSITORY_DIR / retired_name).exists())
+        roots = [
+            REPOSITORY_DIR / "docs",
+            REPOSITORY_DIR / "maintenance",
+            REPOSITORY_DIR / ".devcontainer",
+        ]
+        text_suffixes = {
+            ".md", ".txt", ".py", ".sh", ".ps1", ".bat", ".cmd",
+            ".json", ".jsonc", ".yaml", ".yml",
+        }
+        files = [
+            path
+            for root in roots
+            for path in root.rglob("*")
+            if path.is_file() and path.suffix.lower() in text_suffixes
+        ]
+        files.extend(
+            path for path in REPOSITORY_DIR.iterdir()
+            if path.is_file() and path.suffix.lower() in text_suffixes
+        )
+        for path in files:
+            with self.subTest(path=path.relative_to(REPOSITORY_DIR).as_posix()):
+                self.assertNotIn(retired_name, path.read_text(encoding="utf-8"))
+
+    def test_runtime_and_local_provisioning_examples_remain_separate(self):
+        runtime = ENV_EXAMPLE_PATH.read_text(encoding="utf-8")
+        provisioning = PROVISIONING_ENV_EXAMPLE_PATH.read_text(encoding="utf-8")
+        for name in (
+            "VECTOR_MARIADB_DATABASE",
+            "VECTOR_MARIADB_USER",
+            "VECTOR_MARIADB_PASSWORD",
+            "VECTOR_MARIADB_ROOT_PASSWORD",
+        ):
+            self.assertNotIn(name, runtime)
+            self.assertIn(name, provisioning)
+        for name in (
+            "VECTOR_DB_HOST",
+            "VECTOR_DB_PORT",
+            "VECTOR_DB_NAME",
+            "VECTOR_DB_USER",
+            "VECTOR_DB_PASSWORD",
+        ):
+            self.assertIn(f"{name}=", runtime)
+        self.assertIn("LOCAL", provisioning.upper())
+
+    def test_local_vector_helper_is_loopback_bound_and_owns_only_local_database(self):
+        executable = compose_cli()
+        path = REPOSITORY_DIR / "maintenance" / "vector" / "docker-compose.vector.yml"
+        model = resolved_compose(executable, path, runtime_environment={})
+        self.assertEqual(set(model["services"]), {"getnewsapi-vector-mariadb"})
+        service = model["services"]["getnewsapi-vector-mariadb"]
+        self.assertEqual(service["image"], "mariadb:11.8")
+        self.assertEqual(len(service["ports"]), 1)
+        self.assertEqual(service["ports"][0]["host_ip"], "127.0.0.1")
+        self.assertEqual(str(service["ports"][0]["published"]), "13309")
+        self.assertEqual(service["ports"][0]["target"], 3306)
+        self.assertIn("MARIADB_ROOT_PASSWORD", service["environment"])
+        self.assertEqual(service["volumes"][0]["type"], "volume")
+        self.assertEqual(service["volumes"][0]["target"], "/var/lib/mysql")
+        readme = path.with_name("README.md").read_text(encoding="utf-8")
+        self.assertIn("LOCAL", readme.upper())
+        self.assertIn("NOT FOR", readme.upper())
+        self.assertIn("production", readme.lower())
 
 
 class ConfigurationValidationTests(unittest.TestCase):
@@ -452,19 +716,19 @@ class RuntimeContractTests(unittest.TestCase):
             runbook,
         )
 
-    def test_documented_compose_validation_is_quiet_and_uses_provisioning_file(self):
+    def test_documented_remote_compose_validation_uses_runtime_environment(self):
         documents = (
             RUNBOOK_PATH.read_text(encoding="utf-8"),
             PRODUCTION_ENVIRONMENT_PATH.read_text(encoding="utf-8"),
         )
         for document in documents:
             self.assertNotIn("GETNEWSAPI_ENV_FILE", document)
-            self.assertNotRegex(
-                document,
-                r"(?m)^\s*-f docker-compose\.prod\.yml config\s*$",
-            )
-            self.assertIn("-f docker-compose.prod.yml config --quiet", document)
-            self.assertIn("getnewsapi-provisioning.env", document)
+            self.assertIn("GETNEWSAPI_RUNTIME_ENV_FILE", document)
+            self.assertIn("config --quiet", document)
+            self.assertIn("docker-compose.yml", document)
+            self.assertIn("docker-compose.dev.yml", document)
+            self.assertIn("getnewsapi-prod", document)
+            self.assertIn("getnewsapi-dev", document)
 
     def test_backfill_documentation_does_not_claim_a_total_scan_bound(self):
         runbook = RUNBOOK_PATH.read_text(encoding="utf-8")

@@ -580,8 +580,11 @@ and representative mocked request/response fixtures before implementation.
 - Phase 7B status: production packaging and runtime hardening implemented locally,
   not deployed, and awaiting review.
 - Packaging: `.dockerignore`, a non-root immutable application image, and
-  `docker-compose.prod.yml` with edge/backend networks, no host ports or source
+  the retired hardened production Compose with edge/backend networks, no host ports or source
   bind mount, persistent application state, and private MariaDB 11.8 vector data.
+  This is historical Phase 7B evidence. The current remote API-only deployment
+  contracts in the deployment runbook supersede that bundled-vector topology;
+  provisioning and root credentials remain outside API runtime.
 - Runtime: offline `config_check`, strict production startup validation, static
   `/health`, conditional database-only `/ready`, Bearer-protected publication,
   production-disabled API docs, stderr/stdout logging, configurable file logging,

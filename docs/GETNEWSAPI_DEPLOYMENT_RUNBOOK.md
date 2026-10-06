@@ -11,15 +11,17 @@ Use `.env.example` as the sanitized configuration inventory and the code in
 This runbook covers local validation, remote DEV, production preflight, migration,
 staged activation, one-shot jobs, historical vector backfill, monitoring, and
 recovery. It does not authorize a deployment, a database mutation, provider use,
-or feature activation. Phase 7E performs the first clean-room or remote-DEV
-rehearsal.
+or feature activation. The user reports that the working Dockerfile Application
+DEV resource has passed live application/provider/vector acceptance. The current
+repository task modernizes its deployment contract only; the parallel Compose
+replacement is an operator action described in the handoff.
 
 Record the Git commit, image tag, image digest, operator, environment, date, and
 change approval in the deployment record before executing any mutating step.
 Never substitute one environment's migration ledger or backup evidence for
 another environment's evidence.
 
-For initial Dokploy DEV resource setup, use the focused
+For parallel Dokploy DEV Compose cutover, use the focused
 [GETNEWSAPI_DOKPLOY_DEV_HANDOFF.md](GETNEWSAPI_DOKPLOY_DEV_HANDOFF.md).
 
 ## Non-Negotiable Safety Rules
@@ -48,10 +50,10 @@ For initial Dokploy DEV resource setup, use the focused
 
 | Environment | Execution | Services | Intended use |
 |---|---|---|---|
-| Local development | Source checkout, development Compose, or local image | Local/test dependencies | Unit and disposable integration work |
+| Local development | Source checkout, standalone `.devcontainer` helper, or local image | Local/test dependencies | Unit and disposable integration work; remote DEV Compose is not a source-edit helper |
 | Local code against remote DEV | Latest source or immutable candidate image on a developer machine | Remote DEV app DB, vector DB, WordPress, and explicitly approved provider credentials | Primary rapid end-to-end validation topology |
-| Remote DEV deployment | The same immutable candidate image on DevOps infrastructure | Remote DEV services and external scheduler | Deployment, restart, network, persistence, and scheduler acceptance |
-| Production | The exact DEV-tested image digest | Independently inspected production services | Staged release after a separate production preflight |
+| Remote DEV deployment | Root Dockerfile build via `docker-compose.dev.yml` | External DEV resources; Dokploy jobs | Parallel replacement of the accepted Application resource |
+| Production | Same reviewed commit, Dockerfile, and dependency contract via `docker-compose.yml` | Independently inspected external production resources; Dokploy jobs | Staged release after separate production preflight; record actual image digest |
 
 The supported high-value DEV topology is:
 
@@ -113,9 +115,8 @@ secret channel.
 - [ ] MariaDB 11.8 with native vector capability
 - [ ] `VECTOR_DB_HOST`, `VECTOR_DB_PORT`, `VECTOR_DB_NAME`, `VECTOR_DB_USER`, and
   `VECTOR_DB_PASSWORD`
-- [ ] Separate `VECTOR_MARIADB_DATABASE`, `VECTOR_MARIADB_USER`,
-  `VECTOR_MARIADB_PASSWORD`, and `VECTOR_MARIADB_ROOT_PASSWORD` supplied only to
-  Compose provisioning; root credentials are absent from application runtime
+- [ ] Vector provisioning/root credentials retained only by the separately
+  managed database resource; no `VECTOR_MARIADB_*` values in API runtime
 - [ ] Database name is `coincourier_vectors`, or a guarded disposable name that
   starts with `coincourier_vectors_` and ends with `_test`
 - [ ] TLS/CA/verification policy through `VECTOR_DB_SSL_*`
@@ -156,7 +157,7 @@ and [hosted web-search documentation](https://developers.openai.com/api/docs/gui
 - [ ] Private DB routing plus required provider/WordPress egress
 - [ ] Persistent `/data` and vector storage
 - [ ] Backup and restore infrastructure with named owners
-- [ ] One external scheduler product and service identity
+- [ ] Dokploy owns one set of external jobs and the selected API service identity
 - [ ] Canonical stdout/stderr collection and alerting destination
 - [ ] Deployment, migration, rollback, and incident owners
 
@@ -171,21 +172,40 @@ filename and finds the ignored configuration at `GetNewsAPI/.env`. Do not invent
 the sanitized application-runtime reference and populate secrets through the
 approved secret workflow.
 
-The legacy development `docker-compose.dev.yml` reads the ignored repository-root
-`.env`, bind-mounts source, and requires the existing external `dokploy-network`.
-The legacy `docker-compose.yml` retains production environment settings without a
-source mount or persistent `/data`; neither legacy file is the supported immutable
-deployment shape. Use the hardened `docker-compose.prod.yml` contract for remote
-DEV and production, with platform environment/secret injection or an external file
-outside the repository and Docker build context. Containers started directly from
-the candidate image can receive the ignored local file with
-`--env-file GetNewsAPI/.env`.
+The canonical remote contracts are:
+
+| File | Purpose | Database model |
+|---|---|---|
+| `docker-compose.dev.yml` | Remote DEV API, `getnewsapi-dev` | External application DB, WordPress/DB, and MariaDB 11.8 vector DB |
+| `docker-compose.yml` | Remote production/LIVE API, `getnewsapi-prod` | External application DB, WordPress/DB, and MariaDB 11.8 vector DB |
+| `maintenance/vector/docker-compose.vector.yml` | Local-only vector testing/provisioning | Never persistent remote DEV or production infrastructure |
+
+Dokploy writes its Compose runtime variables into an uncommitted `.env` next to
+the selected Compose file. Each service loads
+`env_file: ${GETNEWSAPI_RUNTIME_ENV_FILE:-.env}`. CLI `--env-file` supplies
+interpolation values; it does not automatically inject every variable into the
+container. The service `env_file` supplies the complete application environment.
+For local sanitized validation or an approved external runtime file, set the shell
+override `GETNEWSAPI_RUNTIME_ENV_FILE` to that file's absolute path.
+
+The platform-generated file contains only API runtime values. Do not inject
+`VECTOR_MARIADB_*`, database root credentials, or local provisioning defaults.
+Databases own their own lifecycle; the API Compose files provision none. Both API
+services join external `dokploy-network` and must reach the existing managed
+resources through runtime-configured private hostnames. Source is never remotely
+bind-mounted. The standalone `.devcontainer` helper is local-only and is not a
+deployment override. Containers started directly from a candidate image can
+receive an approved ignored local file with `--env-file GetNewsAPI/.env`.
 
 Never commit either local environment file. `.dockerignore` excludes `.env` and
 `.env.*` files recursively. Do not print passwords, API keys, WordPress application
 passwords, bearer tokens, certificates, or complete secret DSNs.
 
-Begin with these values:
+For a genuinely new, unaccepted environment, begin with these source-default
+rollout values. For the accepted DEV resource's Compose cutover, preserve its
+reviewed runtime flag values, freshness boundaries, endpoints, and secrets; do not
+replace them with this bootstrap list. Both remote Compose contracts enforce
+`APP_ENV=production`, `API_DOCS_ENABLED=false`, and `ENABLE_APSCHEDULER=false`.
 
 ```text
 ENABLE_APSCHEDULER=false
@@ -225,40 +245,54 @@ docker run --rm --env-file GetNewsAPI/.env \
   -p 127.0.0.1:5001:5000 getnewsapi:<git-sha>
 ```
 
-Remote DEV uses the same image, command, and `/data` contract. DevOps changes only
-environment-specific endpoints, secrets, networks, storage, and proxy attachment.
-Production Compose uses two external files: an application runtime file based on
-`.env.example`, and a Compose interpolation/provisioning file based on
-`.env.provisioning.example`. Only the runtime file enters `getnewsapi-web`; the
-provisioning file points to it through `GETNEWSAPI_RUNTIME_ENV_FILE` and supplies
-the vector MariaDB service credentials. From the repository root:
+Remote DEV and production use the same reviewed root Dockerfile/build definition,
+`python app.py` command, `/app` working directory, and port 5000. Record the actual
+image digest for each build; separate builds are not guaranteed to have the same
+digest. Endpoints, secrets, project-scoped storage, and domain routing remain
+environment-specific. Use standard Dokploy Docker Compose mode, not Stack mode,
+because the contract includes `build`.
+
+For static validation, create a temporary environment file outside tracked paths
+containing only synthetic values. Set the calling shell's
+`GETNEWSAPI_RUNTIME_ENV_FILE` to its absolute path so the service reads that file,
+not any real `.env`. Validate from the repository root:
 
 ```text
-docker compose --env-file /secure/path/getnewsapi-provisioning.env \
-  -f docker-compose.prod.yml config --quiet
+docker compose --env-file <sanitized-temp-env> \
+  -f docker-compose.dev.yml config --quiet
 
-docker compose --env-file /secure/path/getnewsapi-provisioning.env \
-  -f docker-compose.prod.yml up -d --no-build
+docker compose --env-file <sanitized-temp-env> \
+  -f docker-compose.yml config --quiet
 ```
 
-The protected provisioning file must set the immutable `GETNEWSAPI_IMAGE`,
-`GETNEWSAPI_RUNTIME_ENV_FILE=/secure/path/getnewsapi-runtime.env`, optional edge
-network, and `VECTOR_MARIADB_*` values. Never pass the provisioning file as a
-container `env_file`, and never place `VECTOR_MARIADB_ROOT_PASSWORD` in the
-runtime file.
+Inspect rendered configuration only with sanitized values: one API service, no
+database/scheduler container, complete runtime injection, external network,
+persistent `/data`, no host-published port, and no source mount. Delete temporary
+artifacts and restore the shell override afterward. `config --quiet` does not
+start containers or contact application services. See the [Dokploy Compose environment/storage documentation](https://docs.dokploy.com/docs/core/docker-compose).
 
-The unmodified production Compose contract fixes `VECTOR_DB_HOST` to its bundled
-`getnewsapi-vector-mariadb` service. A DevOps deployment using an external remote
-vector database must deploy the same image through the platform's service
-definition, or a separately reviewed Compose override, and inject `VECTOR_DB_*`.
-Do not edit application source for an environment.
+Both services retain non-root Dockerfile UID/GID 10001:10001, init, read-only root,
+all capabilities dropped, `no-new-privileges`, restart `unless-stopped`, and a
+64 MiB `/tmp` tmpfs with mode 1777. `/health` is liveness; `/ready` is an operator
+readiness check. `/data` is a named persistent volume: `getnewsapi-dev-state` or
+`getnewsapi-prod-state`, with physical names scoped by Compose project. Keep the
+Dokploy project identity stable across redeploys. Normal rebuild/recreate retains
+state; never delete its volume or use `down -v` during cutover.
+
+Inspect the existing Application mount before deciding to reuse it safely or copy
+it to the new Compose volume. Do not guess its Docker name. A new volume inherits
+the image's owned `/data`; reused/restored storage still requires ownership and
+writability verification for UID/GID 10001:10001. Quiesce writers before a final
+consistent copy, and enable new jobs only after verification. Follow the handoff's
+parallel cutover; no remote copy is part of this repository task.
 
 Run one-shot commands from the immutable image with the same effective
 configuration. For the production Compose topology:
 
 ```text
-docker compose --env-file /secure/path/getnewsapi-provisioning.env \
-  -f docker-compose.prod.yml run --rm getnewsapi-web \
+GETNEWSAPI_RUNTIME_ENV_FILE=/secure/path/getnewsapi-runtime.env \
+docker compose --env-file /secure/path/getnewsapi-runtime.env \
+  -f docker-compose.yml run --rm getnewsapi-prod \
   python tasks.py job_catalog
 ```
 
@@ -273,7 +307,8 @@ docker run --rm --env-file GetNewsAPI/.env \
 
 ### Case A: Remote DEV Vector MariaDB 11.8
 
-This is preferred. DevOps provisions a private, persistent MariaDB 11.8 instance,
+Remote API Compose always uses a separately managed vector resource. DevOps
+provisions a private, persistent MariaDB 11.8 instance when one is missing,
 database, least-privilege runtime/migration user, network policy, credentials, and
 backup coverage. DevOps does not create vector tables or indexes. Configure the
 five `VECTOR_DB_*` connection values and TLS settings locally and in remote DEV.
@@ -294,15 +329,18 @@ requires the same backup/restore attestations as production. This is a migration
 safety mode, not a claim that DEV is production. Do not use `--allow-disposable`
 for retained remote DEV.
 
-After remote DEV becomes available, repeat migration inspection, apply approval,
+For the current populated DEV vector resource, preserve its data and verified
+migration state; API Compose cutover creates no replacement and applies no schema.
+For a genuinely new environment, repeat migration inspection, apply approval,
 schema verification, small embedding runs, historical sample backfill, retrieval
 validation, and semantic-shadow validation there even if local vector validation
 already passed.
 
 ### Case B: Temporary Local MariaDB 11.8
 
-The repository fallback binds only `127.0.0.1:13309` and persists a named local
-volume:
+The repository helper is LOCAL DEVELOPMENT / VECTOR VALIDATION ONLY, never
+persistent Dokploy DEV, production, or remote shared infrastructure. It binds only
+`127.0.0.1:13309` and persists a named local volume:
 
 ```text
 docker compose -f maintenance/vector/docker-compose.vector.yml up -d
@@ -512,8 +550,8 @@ python GetNewsAPI/tasks.py job_catalog
 |---|---|---|
 | `python GetNewsAPI/tasks.py fetch_once` | Recurring baseline | Fetch, score, persist, and schedule one bounded candidate pool |
 | `python GetNewsAPI/tasks.py pipeline_once` | Recurring baseline | Process one bounded due batch, then publish one bounded due batch |
-| `python GetNewsAPI/tasks.py embedding_ingest [limit]` | Rollout decision | Register recent source/generated documents and jobs; no embedding provider call |
-| `python GetNewsAPI/tasks.py embedding_worker [limit]` | Rollout decision | Claim and execute bounded embedding jobs; provider calls occur |
+| `python GetNewsAPI/tasks.py embedding_ingest [limit]` | Intended external DEV schedule | Register recent source/generated documents and jobs; no embedding provider call |
+| `python GetNewsAPI/tasks.py embedding_worker [limit]` | Intended external DEV schedule | Claim and execute bounded embedding jobs; provider calls occur |
 | `python GetNewsAPI/tasks.py process` | Manual | Process one bounded due batch |
 | `python GetNewsAPI/tasks.py publish` | Manual | Publish one bounded due batch |
 | `python GetNewsAPI/tasks.py embedding_backfill [source|generated] [limit]` | Manual | Register up to the limit of changed versions while scanning deterministic history; no provider call |
@@ -521,17 +559,24 @@ python GetNewsAPI/tasks.py job_catalog
 `fetch` aliases `fetch_once`; `chained` aliases `pipeline_once`. Prefer the
 explicit names in scheduler configuration.
 
-Production has one scheduler owner: DevOps' external scheduler. Keep the web
-container's `ENABLE_APSCHEDULER=false`. Configure the current-equivalent baseline:
+Dokploy owns scheduled execution for remote DEV and production. Keep
+`ENABLE_APSCHEDULER=false`; no API-container cron, host cron, scheduler sidecar,
+or scheduler Compose service is supplied. The intended DEV recurrence is UTC,
+configured as Dokploy COMPOSE jobs targeting `getnewsapi-dev` in `/app`:
 
-| Job | Schedule |
+| UTC cron | Command inside the service |
 |---|---|
-| `fetch_once` | Every 30 minutes |
-| `pipeline_once` | Every 30 minutes, approximately three minutes after fetch |
+| `0,30 * * * *` | `python tasks.py fetch_once` |
+| `2,32 * * * *` | `python tasks.py embedding_ingest 25` |
+| `3,33 * * * *` | `python tasks.py embedding_worker 5` |
+| `5,35 * * * *` | `python tasks.py pipeline_once` |
 
-Do not define an embedding cadence in the baseline. `embedding_ingest` and
-`embedding_worker` scheduling remain rollout decisions; historical backfill is
-manual. A busy conflict group returns `SKIPPED_ALREADY_RUNNING` and exits zero.
+These are operator responsibilities, not repository-created schedules. Create
+new Compose jobs disabled, disable the old Application jobs, and wait for running
+jobs to finish before enabling the new jobs. Never enable both sets. Verify one
+complete sequence. Production scheduling targets `getnewsapi-prod` only after
+separate production approval. Historical backfill remains manual.
+A busy conflict group returns `SKIPPED_ALREADY_RUNNING` and exits zero.
 Repeated skips are an operational signal to inspect duration, overlap, and
 scheduler duplication, not permission to add competing schedules.
 
@@ -827,10 +872,12 @@ git rev-parse HEAD
 docker image inspect <registry-image>:<tag> --format '{{json .RepoDigests}}'
 ```
 
-Sign off the exact commit, immutable image reference, digest, migration manifest
-checksums, and DEV evidence. Production uses that same digest. Do not rebuild with
-production-specific source changes; only configuration, endpoints, secrets,
-networks, and storage differ.
+Sign off the exact commit, Dockerfile/dependency definition, actual image digest,
+migration manifest checksums, and DEV evidence. Production uses that reviewed
+source/build definition and records its resulting digest. If the platform promotes
+a prebuilt digest, use the accepted digest; do not assume two builds have identical
+digests. Never add production-specific application source changes. Configuration,
+endpoints, secrets, project storage, and domain routing differ by environment.
 
 ## Production Preflight And Migration
 
@@ -873,7 +920,8 @@ result or unexpected output.
 
 Use a separate approval and observation window for each stage:
 
-1. Deploy the exact DEV-tested image digest with all rollout flags off.
+1. Deploy the reviewed DEV-tested commit/build definition and record its actual
+   digest, with all rollout flags off for a new production environment.
 2. Verify proxy, `/health`, stage-appropriate `/ready`, logs, restart, and one
    external scheduler owner.
 3. Complete independent production app preflight; reconcile or apply approved app
@@ -956,9 +1004,9 @@ logging is compatibility-only and defaults off.
 Network contract:
 
 ```text
-Internet -> reverse proxy/TLS -> getnewsapi-web:5000
-getnewsapi-web and one-shot jobs -> private application MariaDB
-getnewsapi-web and vector jobs -> private vector MariaDB 11.8
+Internet -> Dokploy reverse proxy/TLS -> getnewsapi-dev:5000 OR getnewsapi-prod:5000
+API service and one-shot jobs -> external dokploy-network -> private application MariaDB
+API service and vector jobs -> external dokploy-network -> private vector MariaDB 11.8
 publish jobs -> WordPress REST and WordPress DB
 jobs -> approved providers and image/source HTTPS hosts
 ```
@@ -1024,11 +1072,15 @@ docker build --tag getnewsapi:<git-sha> .
 docker run --rm --env-file GetNewsAPI/.env \
   getnewsapi:<git-sha> python tasks.py <supported-command>
 
-docker compose --env-file /secure/path/getnewsapi-provisioning.env \
-  -f docker-compose.prod.yml config --quiet
+docker compose --env-file <sanitized-temp-env> \
+  -f docker-compose.dev.yml config --quiet
 
-docker compose --env-file /secure/path/getnewsapi-provisioning.env \
-  -f docker-compose.prod.yml run --rm getnewsapi-web \
+docker compose --env-file <sanitized-temp-env> \
+  -f docker-compose.yml config --quiet
+
+GETNEWSAPI_RUNTIME_ENV_FILE=/secure/path/getnewsapi-runtime.env \
+docker compose --env-file /secure/path/getnewsapi-runtime.env \
+  -f docker-compose.yml run --rm getnewsapi-prod \
   python tasks.py <supported-command>
 
 docker compose -f maintenance/vector/docker-compose.vector.yml up -d
@@ -1038,9 +1090,12 @@ docker compose -f maintenance/vector/docker-compose.vector.yml down
 
 Replace `<supported-command>` with the command arguments from one of the source
 forms above, omitting the host-side `GetNewsAPI/` path inside the image. The
-production provisioning file must set `GETNEWSAPI_RUNTIME_ENV_FILE` to the
-separate external runtime file and supply required `VECTOR_MARIADB_*` values.
-Only the runtime file is injected into web and one-shot job containers.
+static validation forms require the calling shell's `GETNEWSAPI_RUNTIME_ENV_FILE`
+to select the same sanitized temporary file. The external runtime-file form is an
+operator override; ordinary Dokploy deployment loads its generated `.env`.
+Only application runtime data is injected into web and one-shot job containers;
+no `VECTOR_MARIADB_*` or root/provisioning values belong there. For DEV operations,
+select `docker-compose.dev.yml` and `getnewsapi-dev` instead.
 
 ## DEV To Production Promotion Checklist
 
@@ -1063,7 +1118,7 @@ Only the runtime file is injected into web and one-shot job containers.
 
 ### Production
 
-- [ ] Same tested artifact digest selected
+- [ ] Reviewed DEV-tested commit/build definition selected; actual digest recorded
 - [ ] Production configuration validated offline
 - [ ] Production app/vector state independently inspected
 - [ ] Fresh backup confirmed for each mutation target
@@ -1074,12 +1129,12 @@ Only the runtime file is injected into web and one-shot job containers.
 - [ ] Monitoring and alerts active before activation
 - [ ] Rollback/incident owner identified
 
-## Phase 7E Boundary
+## Repository Work And Remote Cutover Boundary
 
-Phase 7D documents the procedure only. It does not start a disposable deployment,
-apply a real DEV migration, invoke remote DEV fetch/pipeline, run historical
-backfill, enable semantic shadow, or perform production-like acceptance.
-
-The next phase is remote DEV validation when all required endpoints, credentials,
-network paths, backups, and approvals are available. Otherwise it is a local Phase
-7E clean-room rehearsal using disposable services and no live dependencies.
+The earlier Phase 7D/7E planning was separate from the user's later live DEV
+acceptance. This contract update starts no Docker service, performs no remote
+deployment, runs no remote jobs, changes no scheduler setting, copies no `/data`,
+and mutates no database. The existing working Application resource stays intact
+until the parallel Compose resource passes the handoff's readiness, persistence,
+schedule, and routing gates. Stop the old resource only after healthy replacement
+operation; retain it for observation and do not delete it immediately.

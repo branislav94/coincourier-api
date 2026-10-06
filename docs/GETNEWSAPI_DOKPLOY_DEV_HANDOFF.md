@@ -1,62 +1,129 @@
 # GetNewsAPI Dokploy DEV Handoff
 
-Operator preparation for the implementation verified on 2026-10-04. This pack
-does not authorize deployment, database mutation, WordPress/provider calls, or
-feature activation. Follow the [generic deployment runbook](GETNEWSAPI_DEPLOYMENT_RUNBOOK.md)
-for approvals, detailed migrations, acceptance evidence, recovery, and monitoring.
+Operator preparation updated on 2026-10-06 for parallel DEV Compose cutover.
+The user reports that the existing root-Dockerfile Application resource has
+passed live application, durable process/publish, provider, embedding/vector,
+retrieval, and semantic-shadow acceptance. Keep that working resource and its
+databases intact. This repository update performs no remote deployment or data
+copy. Follow the [generic deployment runbook](GETNEWSAPI_DEPLOYMENT_RUNBOOK.md)
+for independently approved mutations, migrations, recovery, and monitoring.
 
-## Git and Dokploy application contract
+## Git and Dokploy Compose contract
 
 | Setting | Required contract |
 |---|---|
 | Repository | https://github.com/branislav94/coincourier-api.git |
 | DEV branch | `dev` -> test/DEV environment |
-| Expected initial implementation SHA | `54872b16d1defd899ccce2614c81d7a51cb7640c` |
+| Historical initial implementation SHA | `54872b16d1defd899ccce2614c81d7a51cb7640c`; record the reviewed current DEV commit separately |
 | Production branch | `main` -> production later; never select it for DEV |
 | Production SHA to preserve | `349a4233880632d1c125c7f9dfec66b0a6bf1c0c` |
-| Dokploy resource | Application with Dockerfile build; unique DEV application identity |
+| Target Dokploy resource | Second temporary DEV Compose resource, standard Docker Compose mode; existing Application stays intact until cutover succeeds |
+| Compose path / service | `./docker-compose.dev.yml` / `getnewsapi-dev` |
 | Build context / Dockerfile | Repository root / `./Dockerfile` |
-| Runtime command / working directory | Inherit image command `python app.py` / `/app` |
+| Runtime command / working directory | `python app.py` / `/app` |
 | Internal port / bind | `5000` / `0.0.0.0`; one Uvicorn worker, reload disabled |
 | Container user | UID/GID `10001:10001` |
 | Liveness | `GET /health`; existing image healthcheck |
-| Persistent application storage | Writable `/data`; container remains replaceable |
+| Persistent application storage | Named `getnewsapi-dev-state` at `/data`, physical name scoped to the Dokploy Compose project |
+| Runtime invariants | `APP_ENV=production`, `API_DOCS_ENABLED=false`, `ENABLE_APSCHEDULER=false`, `PYTHONUNBUFFERED=1` |
+| Network / exposure | External `dokploy-network`; internal port 5000 only; no published host port |
 
-Verify the saved Dokploy resource and resulting build/deployment job use the
-reviewed current `dev` commit and Dockerfile; record the actual SHA/image digest.
-The SHA above is the historical initial baseline. Redeployment must include the
-reviewed OpenAI Luna enrichment implementation and support for
-`EMBEDDING_FRESH_START_AFTER_UTC`. Do not select `docker-compose.yml`,
-`docker-compose.dev.yml`, or `docker-compose.prod.yml` for this API resource.
+Verify the saved Compose resource selects the reviewed current `dev` commit and
+`./docker-compose.dev.yml`; record the actual SHA/image digest and project
+identity. The SHA above is dated baseline evidence, not the new deployment target.
+The reviewed build includes OpenAI Luna enrichment and
+`EMBEDDING_FRESH_START_AFTER_UTC`. Production/LIVE uses `./docker-compose.yml`
+with `getnewsapi-prod` only under separate approval.
 `APP_ENV=production` is the persistent-runtime safety mode; the services and
 credentials remain DEV. Keep runtime secrets out of build arguments and Git.
 
-The selected topology is one Dockerfile API application plus external
-application MariaDB, isolated DEV WordPress/its DB, and platform-managed vector
-MariaDB. No new Compose topology or vector Compose is required.
-`maintenance/vector/docker-compose.vector.yml` is local-validation infrastructure.
+The target topology is one API Compose service plus the existing external DEV
+application MariaDB, WordPress/its DB, and managed MariaDB 11.8 vector resource.
+Compose owns only the API process lifecycle; it creates no database, WordPress,
+worker, cron, or scheduler service. Preserve the populated vector DB and all
+verified migration state. `maintenance/vector/docker-compose.vector.yml` is
+LOCAL DEVELOPMENT / VECTOR VALIDATION ONLY, never persistent Dokploy DEV,
+production, or shared infrastructure.
 
-## Resource setup order
+Dokploy's Compose environment editor writes an uncommitted `.env` next to the
+Compose file. The service loads `${GETNEWSAPI_RUNTIME_ENV_FILE:-.env}` through
+`env_file`, ensuring runtime variables actually enter the container. CLI
+`--env-file` alone supplies interpolation, not complete container injection.
+The optional file-path override is for sanitized local validation or an approved
+external runtime file. Never include provisioning/root variables in that file.
+See the [Dokploy Compose environment/storage contract](https://docs.dokploy.com/docs/core/docker-compose)
+and [Compose networking/domain guidance](https://docs.dokploy.com/docs/core/docker-compose/domains).
 
-Execute only under the appropriate DevOps authorization:
+## Parallel DEV cutover: stages A through I
 
-1. Confirm/import a compatible DEV application MariaDB and its existing base schema.
-2. Confirm/provision isolated DEV WordPress with matching WordPress DB.
-3. Provision private, persistent MariaDB 11.8.x for vectors; leave managed tables absent.
-4. Configure GetNewsAPI runtime secrets/environment; record each DB's TLS policy.
-5. Create the unique Dokploy Dockerfile application using the Git contract above.
-6. Attach persistent `/data` and confirm UID/GID 10001 can write it before starting.
-7. Retain/configure the image liveness check; attach any approved proxy/domain route.
-8. Deploy with every rollout flag and APScheduler OFF; create no scheduled tasks.
-9. Confirm `GET /health` returns 200 and stdout/stderr logs are visible.
-10. Run the first read-only preflight below; inspect stage-appropriate `/ready`.
-11. Stop and return evidence to the application team before any migration APPLY.
-12. Only after separate approval follow migration and staged feature acceptance.
+Execute these operator steps only after reviewing this contract. Do not delete
+the working Application first. Preserve its accepted runtime values, including
+rollout flags and both freshness cutoffs; the new-environment bootstrap example
+later in this document is not a replacement for that working configuration.
 
-Provider and WordPress runtime credentials may be deferred until their specific
-profile is tested. Injecting the complete final DEV configuration initially is
-also acceptable. Missing later-profile secrets must be recorded, not worked
-around by invoking a live job.
+1. **Stage A — parallel resource.** Create a second temporary DEV Compose resource
+   from branch `dev`, path `./docker-compose.dev.yml`, service `getnewsapi-dev`.
+   Use standard Docker Compose mode, the existing DEV runtime environment, and
+   the same external application DB, vector DB, WordPress, and WordPress DB.
+   Verify private `dokploy-network` routes. Attach no public/production API domain
+   yet; enable no new schedule or manual mutating job.
+2. **Stage B — read-only acceptance.** Require `/health=200` and `/ready=200`
+   through the intended private service path. In the new service terminal:
+
+   ```sh
+   cd /app
+   python tasks.py config_check web
+   python tasks.py config_check fetch
+   python tasks.py config_check process
+   python tasks.py config_check publish
+   python tasks.py config_check pipeline
+   python tasks.py config_check embedding
+   python tasks.py feature_readiness
+   ```
+
+   `config_check` is offline; `feature_readiness` reads existing DB state and
+   performs no migration or provider/WordPress call. Require
+   `durable_processing=ready`, `durable_publishing=ready`,
+   `duplicate_shadow=ready`, `vector=ready`, `embedding=ready`, and
+   `semantic_shadow=ready`. Stop on unexpected configuration, connectivity,
+   migration drift, or readiness failures; do not replace the DB or apply schema
+   as a cutover workaround.
+3. **Stage C — persistent state.** Inspect the old Application `/data` mount and
+   record its actual identity, backup, capacity, and ownership. Choose either a
+   reviewed platform mount that safely reuses the confirmed volume, or the new
+   project-scoped `getnewsapi-dev-state` volume. Never guess a Docker volume name.
+   If a new volume is used, arrange one consistent copy of existing `/data`
+   during the writer pause in Stage E. Verify UID/GID 10001:10001 ownership and
+   write access, `/data/cache/stock_images`, and
+   `/data/stock_image_usage.json`. Test persistence across a controlled service
+   recreate without deleting its volume. A copy inspected while the old jobs
+   are still writing is not the final cutover copy.
+4. **Stage D — disabled jobs.** Create the four Dokploy COMPOSE jobs in the UTC
+   schedule below, targeting `getnewsapi-dev` in `/app`, all disabled.
+5. **Stage E — quiesce old writers.** Disable every old Application schedule and
+   prevent manual processing/publishing during the handoff. Wait for active runs
+   to finish. If Stage C selected a new volume, perform the approved consistent
+   `/data` copy now and verify ownership, integrity, and persistence before
+   proceeding. If reusing storage, verify neither resource can write concurrently.
+   No database export, deletion, reset, migration, or vector copy is required.
+6. **Stage F — one scheduler set.** Enable the new Compose jobs only after the
+   old jobs are disabled/drained and state is verified. Never leave both sets
+   enabled; keep `ENABLE_APSCHEDULER=false` throughout.
+7. **Stage G — domain cutover.** If DEV has an API domain, move/attach that DEV
+   route to `getnewsapi-dev`, internal port 5000. Do not attach production domains
+   or publish a host port. Verify the saved Dokploy service/domain selection.
+8. **Stage H — observe.** Verify `/health`, `/ready`, logs, state persistence, and
+   one full scheduled sequence with bounded structured results and one scheduler
+   owner. Preserve redacted evidence and investigate unexpected overlap/errors.
+9. **Stage I — retain rollback resource.** Stop the old Application only after
+   healthy replacement operation is confirmed. Do not delete it immediately.
+   Observe; delete obsolete resources only later after review, preserving all
+   retained volumes and separately managed databases.
+
+For rollback, first disable/drain new jobs before restoring any old schedule or
+domain route. Reconcile which `/data` copy contains the newest accepted usage
+state; do not silently revert to stale storage. Existing provider/WordPress side
+effects remain real and must not be replayed merely to test cutover.
 
 ## Database and WordPress resource checklists
 
@@ -158,8 +225,8 @@ Defaults are from current code, not permission to leave deployment policy implic
 | `VECTOR_DB_SSL_ENABLED`, `VECTOR_DB_SSL_VERIFY_CERT`, `VECTOR_DB_SSL_VERIFY_IDENTITY`, `VECTOR_DB_SSL_CA` | TLS-dependent; exact policy below |
 
 Do not inject `VECTOR_MARIADB_*` or equivalent database provisioning/root secrets
-into GetNewsAPI. `.env.provisioning.example` describes bundled Compose provisioning,
-not the Dockerfile API environment. Migration tooling uses the same `DB_*` and
+into GetNewsAPI. `.env.provisioning.example` describes local-only vector provisioning,
+not the remote API environment. Migration tooling uses the same `DB_*` and
 `VECTOR_DB_*` names; a later authorized migration job may receive separately
 reviewed DDL credentials without changing the application's runtime user.
 
@@ -186,9 +253,8 @@ reviewed DDL credentials without changing the application's runtime user.
 
 Current source defaults for all three are TLS enabled `true`, certificate
 verification `false`, identity verification `false`, and no CA path. These are
-compatibility defaults, **not a policy recommendation**. The older production
-environment document's statement that vector client TLS defaults off does not
-match current source. Use this code-derived contract when recording the policy.
+compatibility defaults, **not a policy recommendation**. Compose leaves each
+managed endpoint's reviewed TLS policy to the existing runtime variables.
 
 Certificate verification requires TLS enabled and CA configuration. Identity
 verification depends on certificate verification. The CA file must be mounted
@@ -199,8 +265,10 @@ at the specified container path and readable by the application user.
 - [ ] Vector DB's effective TLS/verification/CA policy explicitly recorded.
 - [ ] Required CA files and permissions confirmed; credentials remain secrets.
 
-### One sanitized initial Dokploy template
+### Sanitized first-time bootstrap template
 
+This example is for a genuinely new, unaccepted environment. Do not copy its
+all-off flags or blank cutoffs over the accepted DEV runtime during cutover.
 Replace every placeholder in Dokploy's secret/configuration store before use.
 Do not create or commit a real `.env`. The TLS lines reproduce source defaults
 for review: change them to each recorded policy before deployment, including CA
@@ -257,8 +325,9 @@ VECTOR_DB_SSL_VERIFY_IDENTITY=false
 VECTOR_DB_SSL_CA=
 ```
 
-This template is for first deployment/read-only preflight, not live pipeline
-operation. The flag values match source defaults; production mode and persistent
+This template is for first deployment/read-only preflight, not accepted DEV
+cutover or live pipeline operation. The flag values match source defaults;
+production mode and persistent
 paths deliberately override development defaults in `.env.example`. The cache
 is replaceable; image-usage JSON affects reuse and must persist across replacements.
 File logging starts off; stdout/stderr is the initial log destination.
@@ -322,12 +391,12 @@ safe. Account/model access is confirmed only by separately approved live
 acceptance, never by `config_check`. See the [official model contract](https://developers.openai.com/api/docs/models/gpt-5.6-luna)
 and [hosted web-search documentation](https://developers.openai.com/api/docs/guides/tools-web-search).
 
-## Initial platform acceptance and read-only preflight
+## Platform acceptance and additional read-only preflight
 
 ### Dokploy health/routing checklist
 
 - [ ] Build/deploy record matches the reviewed current DEV SHA; actual image digest recorded.
-- [ ] Unique Dokploy application identity; Dockerfile build selected.
+- [ ] Unique DEV Compose project; `./docker-compose.dev.yml` and `getnewsapi-dev` selected.
 - [ ] Internal port `5000`; proxy/domain route configured if public API access is wanted.
 - [ ] `GET /health` returns 200.
 - [ ] `/data` mounted persistently and writable by UID/GID `10001:10001`.
@@ -340,8 +409,10 @@ and [hosted web-search documentation](https://developers.openai.com/api/docs/gui
 
 Retain the reviewed image/platform hardening: non-root user, read-only root
 filesystem, bounded writable `/tmp`, init, dropped capabilities, and
-`no-new-privileges`. No particular Docker network name is required; configure
-the approved proxy/private routes and later provider egress.
+`no-new-privileges`. Canonical Compose explicitly uses external `dokploy-network`;
+verify managed DB reachability and approved provider egress there. Dokploy's
+domain tooling may add platform routing networks/labels; inspect its saved
+preview and service selection without removing the required private route.
 
 | Endpoint | Proves | Does not prove |
 |---|---|---|
@@ -355,7 +426,7 @@ Startup with scheduler off runs no migrations, providers, or jobs. All-off
 rollout flags do **not** disable manual processing/publishing or authenticated
 `POST /api/publish`; do not invoke them as initial connectivity probes.
 
-### First read-only preflight: Dokploy container terminal
+### Additional migration inspection: Dokploy container terminal
 
 Use the deployed image's runtime environment, with file logging off. Run one
 command at a time, retain redacted output/exit status, and honor stop conditions.
@@ -378,7 +449,7 @@ read DB state; they do not apply migrations, create the ledger, or insert ledger
 entries. They do not call WordPress/providers. Explicit targets avoid the CLI
 default `all`. No read-only command above authorizes a subsequent APPLY.
 
-With the minimal template, `config_check pipeline` can report missing WP/provider
+For a genuinely new environment using the minimal template, `config_check pipeline` can report missing WP/provider
 secrets; record these deferred-profile gaps. Clean `pending` migrations can be
 normal before first application, later preflights may be deferred, and
 `migration_verify` fails until the full chain is applied and verified.
@@ -397,9 +468,12 @@ tables, and unexplained failures also require review.
 `pending` alone is not an adoption or repair case. Keep flags off and obtain
 separate migration approval. The migration tool has no general automatic rollback.
 
-## Later work: approval required, outside initial resource setup
+## New-environment migration/activation work: separate approval
 
-**DO NOT RUN DURING INITIAL RESOURCE SETUP.**
+**DO NOT RUN AS PART OF THE ACCEPTED DEV COMPOSE CUTOVER.** Existing app/vector
+migrations and populated DEV data are retained. The following procedures are for
+new or separately reviewed environments, not an instruction to rebuild the
+working DEV schema.
 
 Normal application sequence: `app-001`, `app-002`, `app-003`, `app-004`,
 `app-006`, `app-007`; the preflight entries are 001, 003, and 006. No application
@@ -440,13 +514,31 @@ future order, with evidence and approval at each stage:
 
 Before embedding profiles, explicitly supply `EMBEDDING_MODEL=text-embedding-3-small`,
 `EMBEDDING_CHUNKER_VERSION=chunk-v1`, and `EMBEDDING_DIMENSIONS=1536`.
-Do not configure fetch, pipeline, or embedding recurrence during initial setup.
-Future approved baseline: `fetch_once` every 30 minutes and `pipeline_once`
-every 30 minutes approximately three minutes later, under **one external scheduler
-owner**. Keep in-process APScheduler off. Embedding cadence remains rollout-defined.
+For new environments, do not enable recurrence until the corresponding readiness
+and live acceptance gates pass. The current DEV cutover uses the intended
+schedule below while preserving its accepted runtime rollout values.
 Record the scheduling/timezone policy: current day accounting uses fixed UTC+02,
 not DST-aware timezone behavior. Record chosen throughput limits rather than
 assuming `.env.example` values equal omitted-variable source defaults.
+
+## Dokploy-owned DEV schedule
+
+Configure these Dokploy COMPOSE jobs against `getnewsapi-dev`, working directory
+`/app`, using UTC. Do not implement cron or a scheduler inside the API container,
+in a sidecar, or on the host through this repository.
+
+| UTC cron | Command |
+|---|---|
+| `0,30 * * * *` | `python tasks.py fetch_once` |
+| `2,32 * * * *` | `python tasks.py embedding_ingest 25` |
+| `3,33 * * * *` | `python tasks.py embedding_worker 5` |
+| `5,35 * * * *` | `python tasks.py pipeline_once` |
+
+Create these jobs disabled at Stage D. Disable/drain old Application jobs at
+Stage E, then enable the Compose jobs at Stage F and verify one full sequence.
+Never leave both scheduler sets enabled. Keep `ENABLE_APSCHEDULER=false` in both
+resources. Backfill remains manual. Production schedules require separate
+approval and target `getnewsapi-prod`, never the DEV service.
 
 ## Evidence DevOps returns to the application team
 
@@ -487,21 +579,27 @@ These are first inspection steps for authorized operators, not destructive fixes
 
 ### Historical deployment failure
 
-The reported earlier build succeeded, then the deployment command selected
-`-f ./docker-compose.yml`. That legacy file fixes `container_name: prod-getnewsapi`
+Before this contract update, the reported earlier build succeeded, then the
+deployment command selected the old root production-shaped Compose. That retired
+definition fixed a global container name,
 and Docker rejected creation because the name already existed, before application
 startup. Repository evidence does not explain the UI/command filename mismatch.
 
-The corrective action is the root Dockerfile as a uniquely named, platform-managed
-DEV application, with saved settings/job selection verified. **Do not delete or
-rename an unknown production container to satisfy DEV.**
+The working corrective deployment used a uniquely named Dockerfile Application.
+The new canonical Compose files likewise leave container naming to the platform,
+with distinct DEV/production service aliases. **Do not delete or rename an unknown
+production container to satisfy DEV.** Retain the working Application until the
+parallel replacement is verified.
 
 ## Source authority
 
-The initial application contract is based on the historical implementation SHA
-above; the optional embedding cutoff follows the reviewed current configuration
+The initial application contract is historical evidence from the SHA above.
+The current Compose contract follows the reviewed DEV tree; the optional
+embedding cutoff follows the reviewed current configuration
 and [registration queries](../GetNewsAPI/repositories/embedding_articles.py).
 Relevant sources: [Dockerfile](../Dockerfile),
+[remote DEV Compose](../docker-compose.dev.yml),
+[remote production Compose](../docker-compose.yml),
 [configuration](../GetNewsAPI/config.py), [application](../GetNewsAPI/app.py),
 [runtime validation](../GetNewsAPI/runtime/config_validation.py),
 [CLI](../GetNewsAPI/tasks.py), [migration inventory](../GetNewsAPI/deployment/migrations.py),
