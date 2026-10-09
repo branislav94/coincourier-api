@@ -1,0 +1,46 @@
+name: AI Cost Reporter offline validation
+
+on:
+  push:
+    paths:
+      - 'services/ai-cost-reporter/**'
+      - '.github/workflows/ai-cost-reporter-offline.yml'
+  pull_request:
+    paths:
+      - 'services/ai-cost-reporter/**'
+      - '.github/workflows/ai-cost-reporter-offline.yml'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  ai-cost-reporter:
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: services/ai-cost-reporter
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+          cache: pip
+          cache-dependency-path: services/ai-cost-reporter/requirements.txt
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+      - name: Install reporter dependencies only
+        run: python -m pip install -r requirements.txt
+      - name: Python tests (mock network calls)
+        run: python -m unittest discover -s tests -v
+      - name: Apps Script tests (mock Google services)
+        run: node tests/test_apps_script_receiver.cjs
+      - name: Generate synthetic PDF and JSON
+        run: python app.py --demo --date 2026-10-06 --output-dir ./reports
+      - name: Build the independent reporter image
+        run: docker build --file Dockerfile --tag ai-cost-reporter:ci .
+      - name: Validate the container without networking
+        run: >-
+          docker run --rm --network none ai-cost-reporter:ci
+          python /app/app.py --demo --date 2026-10-06 --output-dir /data/reports
