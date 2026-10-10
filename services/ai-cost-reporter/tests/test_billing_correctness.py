@@ -337,16 +337,22 @@ class XAIDenseCoverageTests(unittest.TestCase):
         self.assertEqual(spend.daily, Decimal('0.123456789012345678901234567890123456789'))
         self.assertEqual(spend.month_to_date, Decimal('2.123456789012345678901234567890123456789'))
 
-    def test_explicit_dense_zero_values_pass_empty_unknown_coverage_fails(self) -> None:
-        '''Documented dense zero observations are distinct from absent data.'''
+    def test_explicit_dense_zero_and_no_recorded_usage_are_distinct(self) -> None:
+        '''Covered zero points and two absent record collections retain different evidence.'''
         spend = app.fetch_xai_costs(Session(posts=[RawResponse(xai_body())]),
                                     'offline-key', 'team_offline', REPORT_DATE)
         self.assertEqual(spend.daily, Decimal('0'))
         self.assertEqual(spend.month_to_date, Decimal('0'))
-        for groups in ([], [{'groupLabels': ['Grok'], 'dataPoints': []}]):
-            with self.subTest(groups=groups), self.assertRaises(app.ReporterError):
-                app.fetch_xai_costs(Session(posts=[RawResponse(xai_body(groups))]),
-                                    'offline-key', 'team_offline', REPORT_DATE)
+        self.assertEqual(spend.accounting_state, app.RECORDED_SPENDING)
+        inactive = app.fetch_xai_costs(Session(posts=[RawResponse(xai_body([])), RawResponse(xai_body([]))]),
+                                       'offline-key', 'team_offline', REPORT_DATE)
+        self.assertEqual(inactive.accounting_state, app.NO_RECORDED_USAGE)
+        self.assertEqual(inactive.accounting_evidence, app.XAI_EMPTY_USAGE_EVIDENCE)
+        self.assertEqual(inactive.daily_breakdown, {})
+        with self.assertRaises(app.ReporterError):
+            app.fetch_xai_costs(Session(posts=[RawResponse(xai_body([
+                {'groupLabels': ['Grok'], 'dataPoints': []},
+            ]))]), 'offline-key', 'team_offline', REPORT_DATE)
 
     def test_every_group_must_be_dense_even_if_union_covers_all_days(self) -> None:
         '''Two sparse groups cannot conceal incomplete accounting behind their union.'''

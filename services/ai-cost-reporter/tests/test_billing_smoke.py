@@ -182,6 +182,7 @@ class BillingSmokeTests(unittest.TestCase):
         self.assertEqual(result['month_to_date_total_usd'], '15.3000000000000000003')
         self.assertEqual(result['providers']['openai']['daily_usd'], '0.1000000000000000001')
         self.assertEqual(result['providers']['xai']['daily_usd'], '0.2000000000000000002')
+        self.assertNotIn('accounting_evidence', result['providers']['xai'])
         self.assertEqual(result['openai_scope'], {'type': 'all_organization_projects', 'project_ids': []})
         self.assertEqual(result['xai_scope']['team_id'], 'team_unit')
         self.assertEqual([(method, url) for method, url, _kwargs in calls], [
@@ -195,6 +196,106 @@ class BillingSmokeTests(unittest.TestCase):
         self.assertNotIn(ENVIRONMENT['OPENAI_ADMIN_KEY'], output)
         self.assertNotIn(ENVIRONMENT['XAI_MANAGEMENT_KEY'], output)
         self.assertNotIn('synthetic mocked billing item', output)
+
+    def test_live_mocked_zero_confirmation_keeps_exact_openai_costs_and_no_xai_breakdown(self) -> None:
+        '''Only complete ungrouped daily zeros can yield a zero-cost xAI provider result.'''
+        aggregate = {
+            'limitReached': False,
+            'timeSeries': [{'groupLabels': [], 'dataPoints': [
+                {'timestamp': f'2026-10-{day:02d}T00:00:00Z', 'values': ['0']}
+                for day in range(1, 7)
+            ]}],
+        }
+        responses = [provider_responses()[0],
+                     ResponseStub({'limitReached': False, 'timeSeries': []}), ResponseStub(aggregate)]
+        calls: list[tuple[str, str, dict[str, Any]]] = []
+        reports = []
+        get_live_report = app.get_live_report
+
+        def request(session: requests.Session, method: str, url: str, **kwargs: Any) -> ResponseStub:
+            '''Capture the actual fixed billing requests while returning synthetic HTTP bytes.'''
+            self.assertFalse(session.trust_env)
+            self.assertIs(kwargs.get('verify'), True)
+            self.assertIs(kwargs.get('allow_redirects'), False)
+            calls.append((method, url, kwargs))
+            return responses.pop(0)
+
+        def capture_report(session: requests.Session, report_date: date) -> app.BillingReport:
+            '''Inspect the real parsed result without replacing production accounting logic.'''
+            report = get_live_report(session, report_date)
+            reports.append(report)
+            return report
+
+        with patch.object(requests.Session, 'request', autospec=True, side_effect=request), \
+             patch.object(app, 'get_live_report', side_effect=capture_report):
+            status, output, errors = self.run_main(['--live', '--date', '2026-10-06'])
+        self.assertEqual(status, 0, errors)
+        self.assertEqual(responses, [])
+        self.assertEqual(len(calls), 3)
+        result = json.loads(output)
+        self.assertEqual(result['daily_total_usd'], '0.1000000000000000001')
+        self.assertEqual(result['month_to_date_total_usd'], '5.1000000000000000001')
+        self.assertEqual(result['providers']['xai'], {
+            'daily_usd': '0', 'month_to_date_usd': '0',
+            'accounting_evidence': 'ungrouped_dense_zero_confirmation',
+        })
+        self.assertEqual(reports[0].xai.daily_breakdown, {})
+        self.assertEqual(reports[0].xai.accounting_evidence, 'ungrouped_dense_zero_confirmation')
+        self.assertEqual(calls[1][1], calls[2][1])
+        self.assertEqual(calls[2][2]['json']['analyticsRequest'],
+                         {**calls[1][2]['json']['analyticsRequest'], 'groupBy': []})
+        self.assertFalse(result['files_written'])
+        self.assertFalse(result['delivery_performed'])
+
+    def test_zero_confirmation_failure_cannot_print_a_partial_combined_cost_read(self) -> None:
+        '''OpenAI success plus rejected aggregate confirmation does not yield a combined report.'''
+        responses = [provider_responses()[0], ResponseStub({'limitReached': False, 'timeSeries': []}),
+                     ResponseStub({'private': 'synthetic sensitive response'}, status_code=403)]
+        with patch.object(requests.Session, 'request', side_effect=responses) as transport:
+            status, output, errors = self.run_main(['--live', '--date', '2026-10-06'])
+        self.assertEqual(transport.call_count, 3)
+        self.assertEqual(status, 1)
+        self.assertEqual(output, '')
+        self.assertEqual(errors, 'BILLING_SMOKE_FAILED: no complete cost read was confirmed\n')
+
+    def test_empty_recorded_usage_snapshot_is_zero_valued_but_not_a_reconciled_cost_confirmation(self) -> None:
+        '''Two valid empty datasets produce a labeled, recheckable recorded-spending snapshot.'''
+        responses = [provider_responses()[0], ResponseStub({'limitReached': False, 'timeSeries': []}),
+                     ResponseStub({'limitReached': False, 'timeSeries': []})]
+        with patch.object(requests.Session, 'request', side_effect=responses) as transport:
+            status, output, errors = self.run_main(['--live', '--date', '2026-10-06'])
+        self.assertEqual(status, 0, errors)
+        self.assertEqual(transport.call_count, 3)
+        result = json.loads(output)
+        self.assertEqual(result['status'], 'recorded_spending_snapshot')
+        self.assertEqual(result['reconciliation_status'], 'not_reconciled')
+        self.assertEqual(result['providers']['xai'], {
+            'daily_usd': '0', 'month_to_date_usd': '0', 'accounting_state': 'NO_RECORDED_USAGE',
+            'accounting_evidence': 'grouped_and_ungrouped_empty',
+            'reconciliation_status': 'not_reconciled', 'allow_recheck': True,
+        })
+        self.assertEqual(result['providers']['openai']['daily_usd'], '0.1000000000000000001')
+        self.assertFalse(result['files_written'])
+        self.assertFalse(result['delivery_performed'])
+
+    def test_later_fresh_smoke_read_does_not_reuse_an_inactive_provider_snapshot(self) -> None:
+        '''Delayed provider-recorded amounts replace an earlier no-record observation on a new read.'''
+        first = [provider_responses()[0], ResponseStub({'limitReached': False, 'timeSeries': []}),
+                 ResponseStub({'limitReached': False, 'timeSeries': []})]
+        with patch.object(requests.Session, 'request', side_effect=first) as first_transport:
+            first_status, first_output, first_errors = self.run_main(['--live', '--date', '2026-10-06'])
+        with patch.object(requests.Session, 'request', side_effect=provider_responses()) as later_transport:
+            later_status, later_output, later_errors = self.run_main(['--live', '--date', '2026-10-06'])
+        self.assertEqual(first_status, 0, first_errors)
+        self.assertEqual(first_transport.call_count, 3)
+        self.assertEqual(json.loads(first_output)['providers']['xai']['accounting_state'], 'NO_RECORDED_USAGE')
+        self.assertEqual(later_status, 0, later_errors)
+        self.assertEqual(later_transport.call_count, 2)
+        later = json.loads(later_output)
+        self.assertEqual(later['status'], 'provider_costs_confirmed')
+        self.assertEqual(later['providers']['xai']['daily_usd'], '0.2000000000000000002')
+        self.assertNotIn('accounting_state', later['providers']['xai'])
+        self.assertNotIn('reconciliation_status', later)
 
     def test_all_invalid_live_configuration_fails_before_session_or_provider_calls(self) -> None:
         '''A missing second key or invalid team/scope cannot trigger the first billing API.'''

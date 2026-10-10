@@ -50,6 +50,15 @@ MAX_MONEY_EXPONENT = 256
 MAX_BILLING_RESPONSE_BYTES = 16 * 1024 * 1024
 MAX_BILLING_ROWS = 100000
 MAX_BILLING_PAGES = 1000
+XAI_ZERO_CONFIRMATION_EVIDENCE = 'ungrouped_dense_zero_confirmation'
+XAI_EMPTY_USAGE_EVIDENCE = 'grouped_and_ungrouped_empty'
+RECORDED_SPENDING = 'RECORDED_SPENDING'
+NO_RECORDED_USAGE = 'NO_RECORDED_USAGE'
+XAI_NO_RECORDED_USAGE_NOTE = (
+    'xAI: No recorded usage. Recorded spend is $0.00; no provider billing records were supplied. '
+    'Not reconciled and subject to late billing. Recheck the same completed UTC period later; '
+    'delivered snapshots stay unchanged.'
+)
 NOTES = (
     'Provider-reported API consumption in USD, not a card-payment statement. '
     'Values can be adjusted after reporting; taxes, prepaid credit purchases, '
@@ -59,7 +68,61 @@ NOTES = (
 
 
 class ReporterError(RuntimeError):
-    '''An error that must prevent publication of an incomplete report.'''
+    '''A report-blocking failure with bounded diagnostics independent of error text.'''
+
+    _CODES = frozenset({
+        'internal_error', 'configuration_missing', 'invalid_config', 'invalid_report_date',
+        'http_error', 'network_error', 'invalid_json', 'response_schema_invalid',
+        'incomplete_coverage', 'pagination_invalid', 'pagination_limit', 'response_truncated',
+        'no_accounting_data', 'invalid_usd_amount', 'unsupported_currency', 'duplicate_data',
+        'out_of_range_day', 'scope_mismatch', 'aggregation_mismatch',
+    })
+    _STAGES = frozenset({
+        'unknown', 'preflight', 'http', 'network', 'response', 'schema', 'coverage',
+        'pagination', 'scope', 'amount', 'aggregation',
+    })
+    _INTEGER_DETAILS = frozenset({
+        'response_bytes', 'max_response_bytes', 'record_count', 'max_record_count',
+        'page_count', 'max_page_count', 'expected_day_count', 'observed_day_count',
+    })
+
+    def __init__(self, message: str, *, code: str = 'internal_error', stage: str = 'unknown',
+                 details: Mapping[str, Any] | None = None) -> None:
+        '''Preserve legacy messages while accepting only machine-safe diagnostic fields.'''
+        super().__init__(message)
+        self.code = code if isinstance(code, str) and code in self._CODES else 'internal_error'
+        self.failure_stage = stage if isinstance(stage, str) and stage in self._STAGES else 'unknown'
+        self.details: dict[str, Any] = {}
+        if not isinstance(details, Mapping):
+            return
+        for key in self._INTEGER_DETAILS:
+            value = details.get(key)
+            if type(value) is int and 0 <= value <= 1000000000:
+                self.details[key] = value
+        status = details.get('http_status')
+        if type(status) is int and 100 <= status <= 599:
+            self.details['http_status'] = status
+        missing = details.get('missing_utc_days')
+        if isinstance(missing, (list, tuple)) and len(missing) <= 31:
+            valid_dates: list[str] = []
+            for value in missing:
+                if (not isinstance(value, str)
+                        or re.fullmatch(r'[0-9]{4}-[0-9]{2}-[0-9]{2}', value, re.ASCII) is None):
+                    break
+                try:
+                    parsed = date.fromisoformat(value)
+                except ValueError:
+                    break
+                if parsed < date(2000, 1, 1):
+                    break
+                valid_dates.append(value)
+            else:
+                self.details['missing_utc_days'] = sorted(set(valid_dates))
+
+    @property
+    def stage(self) -> str:
+        '''Expose the failure stage with the short alias used by internal callers.'''
+        return self.failure_stage
 
 
 @dataclass(frozen=True)
@@ -69,6 +132,10 @@ class ProviderSpend:
     daily: Decimal
     month_to_date: Decimal
     daily_breakdown: dict[str, Decimal] = field(default_factory=dict)
+    accounting_evidence: str | None = None
+    accounting_state: str = RECORDED_SPENDING
+    reconciliation_status: str | None = None
+    allow_recheck: bool | None = None
 
 
 @dataclass(frozen=True)
@@ -103,11 +170,30 @@ class BillingConfiguration:
     openai_project_ids: tuple[str, ...]
 
 
+@dataclass(frozen=True)
+class OpenAIBillingConfiguration:
+    '''One provider's validated read scope with authentication omitted from repr.'''
+
+    admin_key: str = field(repr=False)
+    project_ids: tuple[str, ...]
+
+
+@dataclass(frozen=True)
+class XAIBillingConfiguration:
+    '''The validated xAI team with authentication omitted from repr.'''
+
+    management_key: str = field(repr=False)
+    team_id: str
+
+
 def validate_billing_date(report_date: date) -> None:
     '''Reject partial UTC days and unsupported historical dates before networking.'''
     if (type(report_date) is not date or report_date < date(2000, 1, 1)
             or report_date >= datetime.now(timezone.utc).date()):
-        raise ReporterError('Report date must be a fully completed UTC billing day from 2000 onward')
+        raise ReporterError(
+            'Report date must be a fully completed UTC billing day from 2000 onward',
+            code='invalid_report_date', stage='preflight',
+        )
 
 
 def billing_period_utc(report_date: date) -> tuple[datetime, datetime]:
@@ -121,53 +207,105 @@ def billing_period_utc(report_date: date) -> tuple[datetime, datetime]:
 def parse_openai_project_ids(raw: str) -> tuple[str, ...]:
     '''Parse explicitly selected projects; blank means the complete organization.'''
     if not isinstance(raw, str):
-        raise ReporterError('OPENAI_PROJECT_IDS must be comma-separated project IDs')
+        raise ReporterError(
+            'OPENAI_PROJECT_IDS must be comma-separated project IDs',
+            code='invalid_config', stage='preflight',
+        )
     if not raw.strip():
         return ()
     values = tuple(value.strip() for value in raw.split(','))
     if not all(re.fullmatch(r'proj_[A-Za-z0-9_-]{1,128}', value, re.ASCII) for value in values):
-        raise ReporterError('OPENAI_PROJECT_IDS must be comma-separated project IDs')
+        raise ReporterError(
+            'OPENAI_PROJECT_IDS must be comma-separated project IDs',
+            code='invalid_config', stage='preflight',
+        )
     return tuple(dict.fromkeys(values))
+
+
+def billing_header_key(variable: str) -> str:
+    '''Validate a named billing bearer without reading files or exposing its value.'''
+    if variable not in ('OPENAI_ADMIN_KEY', 'XAI_MANAGEMENT_KEY'):
+        raise ReporterError(
+            'Unsupported billing credential variable',
+            code='invalid_config', stage='preflight',
+        )
+    value = os.environ.get(variable, '')
+    if not value or not value.strip():
+        raise ReporterError(
+            f'Required environment variable {variable} is not set',
+            code='configuration_missing', stage='preflight',
+        )
+    if len(value) > 4096 or any(ord(character) <= 32 or ord(character) >= 127 for character in value):
+        raise ReporterError(
+            f'{variable} has an invalid credential format',
+            code='invalid_config', stage='preflight',
+        )
+    return value
+
+
+def validate_openai_billing_configuration(report_date: date) -> OpenAIBillingConfiguration:
+    '''Validate only OpenAI for an independently reported, read-only diagnostic.'''
+    validate_billing_date(report_date)
+    project_ids = parse_openai_project_ids(os.environ.get('OPENAI_PROJECT_IDS', ''))
+    return OpenAIBillingConfiguration(billing_header_key('OPENAI_ADMIN_KEY'), project_ids)
+
+
+def validate_xai_billing_configuration(report_date: date) -> XAIBillingConfiguration:
+    '''Validate only xAI while retaining its configured team scope exactly.'''
+    validate_billing_date(report_date)
+    team_id = os.environ.get('XAI_TEAM_ID', '').strip()
+    if not team_id:
+        raise ReporterError(
+            'Required environment variable XAI_TEAM_ID is not set',
+            code='configuration_missing', stage='preflight',
+        )
+    if re.fullmatch(r'[A-Za-z0-9_-]{1,128}', team_id, re.ASCII) is None:
+        raise ReporterError(
+            'XAI_TEAM_ID has an invalid format',
+            code='invalid_config', stage='preflight',
+        )
+    return XAIBillingConfiguration(billing_header_key('XAI_MANAGEMENT_KEY'), team_id)
 
 
 def validate_billing_configuration(report_date: date) -> BillingConfiguration:
     '''Validate both providers before the first API request; never echo credentials.'''
-    validate_billing_date(report_date)
-    project_ids = parse_openai_project_ids(os.environ.get('OPENAI_PROJECT_IDS', ''))
-    team_id = required_env('XAI_TEAM_ID')
-    if re.fullmatch(r'[A-Za-z0-9_-]{1,128}', team_id, re.ASCII) is None:
-        raise ReporterError('XAI_TEAM_ID has an invalid format')
-
-    def header_key(variable: str) -> str:
-        '''Require printable ASCII bearer material with no whitespace or controls.'''
-        value = os.environ.get(variable, '')
-        if not value or not value.strip():
-            raise ReporterError(f'Required environment variable {variable} is not set')
-        if len(value) > 4096 or any(ord(character) <= 32 or ord(character) >= 127 for character in value):
-            raise ReporterError(f'{variable} has an invalid credential format')
-        return value
-
-    return BillingConfiguration(header_key('OPENAI_ADMIN_KEY'), header_key('XAI_MANAGEMENT_KEY'),
-                                 team_id, project_ids)
+    openai = validate_openai_billing_configuration(report_date)
+    xai = validate_xai_billing_configuration(report_date)
+    return BillingConfiguration(openai.admin_key, xai.management_key, xai.team_id, openai.project_ids)
 
 
 def decimal_value(value: object, context: str) -> Decimal:
     '''Accept finite exact monetary values within bounded precision and exponent.'''
     if isinstance(value, bool) or not isinstance(value, (int, str, Decimal)):
-        raise ReporterError(f'{context}: missing or invalid exact USD amount')
+        raise ReporterError(
+            f'{context}: missing or invalid exact USD amount',
+            code='invalid_usd_amount', stage='amount',
+        )
     if isinstance(value, str) and (len(value) > MAX_MONEY_DIGITS * 2
             or re.fullmatch(r'-?(?:0|[1-9][0-9]*)(?:\.[0-9]+)?(?:[eE][+-]?[0-9]+)?', value, re.ASCII) is None):
-        raise ReporterError(f'{context}: invalid USD amount')
+        raise ReporterError(
+            f'{context}: invalid USD amount',
+            code='invalid_usd_amount', stage='amount',
+        )
     try:
         result = value if isinstance(value, Decimal) else Decimal(str(value))
     except DecimalException:
-        raise ReporterError(f'{context}: invalid USD amount') from None
+        raise ReporterError(
+            f'{context}: invalid USD amount',
+            code='invalid_usd_amount', stage='amount',
+        ) from None
     if not result.is_finite():
-        raise ReporterError(f'{context}: non-finite USD amount')
+        raise ReporterError(
+            f'{context}: non-finite USD amount',
+            code='invalid_usd_amount', stage='amount',
+        )
     digits = result.as_tuple()
     if (len(digits.digits) > MAX_MONEY_DIGITS or abs(digits.exponent) > MAX_MONEY_EXPONENT
             or abs(result.adjusted()) > MAX_MONEY_EXPONENT):
-        raise ReporterError(f'{context}: USD amount exceeds bounded precision or exponent')
+        raise ReporterError(
+            f'{context}: USD amount exceeds bounded precision or exponent',
+            code='invalid_usd_amount', stage='amount',
+        )
     return result
 
 
@@ -177,7 +315,14 @@ def exact_sum(values: Iterable[Decimal]) -> Decimal:
     if not amounts:
         return Decimal('0')
     if len(amounts) > MAX_BILLING_ROWS:
-        raise ReporterError('Cost aggregation exceeded its record safety limit')
+        raise ReporterError(
+            'Cost aggregation exceeded its record safety limit',
+            code='response_truncated', stage='aggregation',
+            details={
+                'record_count': len(amounts),
+                'max_record_count': MAX_BILLING_ROWS,
+            },
+        )
     exponent = min(value.as_tuple().exponent for value in amounts)
     total = 0
     for amount in amounts:
@@ -222,10 +367,28 @@ def session_with_retry() -> requests.Session:
 def response_json(response: requests.Response, provider: str) -> Mapping[str, Any]:
     '''Decode raw provider JSON numbers as Decimal and suppress sensitive bodies.'''
     if not 200 <= response.status_code < 300:
-        raise ReporterError(f'{provider} billing request failed: HTTP {response.status_code}')
+        raise ReporterError(
+            f'{provider} billing request failed: HTTP {response.status_code}',
+            code='http_error', stage='http',
+            details={
+                'http_status': response.status_code,
+            },
+        )
     content = response.content
-    if not isinstance(content, bytes) or not content or len(content) > MAX_BILLING_RESPONSE_BYTES:
-        raise ReporterError(f'{provider} billing response is empty or exceeds its size limit')
+    if not isinstance(content, bytes) or not content:
+        raise ReporterError(
+            f'{provider} billing response is empty or exceeds its size limit',
+            code='invalid_json', stage='response',
+        )
+    if len(content) > MAX_BILLING_RESPONSE_BYTES:
+        raise ReporterError(
+            f'{provider} billing response is empty or exceeds its size limit',
+            code='response_truncated', stage='response',
+            details={
+                'response_bytes': len(content),
+                'max_response_bytes': MAX_BILLING_RESPONSE_BYTES,
+            },
+        )
 
     def object_pairs(pairs: list[tuple[str, Any]]) -> dict[str, Any]:
         '''Reject duplicate JSON keys rather than accepting ambiguous accounting data.'''
@@ -244,9 +407,15 @@ def response_json(response: requests.Response, provider: str) -> Mapping[str, An
         body = json.loads(content.decode('utf-8'), parse_float=Decimal,
                           object_pairs_hook=object_pairs, parse_constant=invalid_constant)
     except (ValueError, UnicodeError, DecimalException, RecursionError):
-        raise ReporterError(f'{provider} billing response was not valid unambiguous JSON') from None
+        raise ReporterError(
+            f'{provider} billing response was not valid unambiguous JSON',
+            code='invalid_json', stage='response',
+        ) from None
     if not isinstance(body, dict):
-        raise ReporterError(f'{provider} billing response was not an object')
+        raise ReporterError(
+            f'{provider} billing response was not an object',
+            code='response_schema_invalid', stage='schema',
+        )
     return body
 
 
@@ -259,7 +428,10 @@ def fetch_openai_costs(
     if (not isinstance(project_ids, tuple)
             or not all(isinstance(value, str) and re.fullmatch(r'proj_[A-Za-z0-9_-]{1,128}', value, re.ASCII)
                        for value in project_ids)):
-        raise ReporterError('OPENAI_PROJECT_IDS contains an invalid project ID')
+        raise ReporterError(
+            'OPENAI_PROJECT_IDS contains an invalid project ID',
+            code='invalid_config', stage='preflight',
+        )
     project_ids = tuple(dict.fromkeys(project_ids))
     start = int(start_time.timestamp())
     end = int(end_time.timestamp())
@@ -281,70 +453,138 @@ def fetch_openai_costs(
                                    headers={'Authorization': f'Bearer {admin_key}'},
                                    params=params, timeout=30, allow_redirects=False, verify=True)
         except requests.RequestException:
-            raise ReporterError('OpenAI billing request failed: network error') from None
+            raise ReporterError(
+                'OpenAI billing request failed: network error',
+                code='network_error', stage='network',
+            ) from None
         body = response_json(response, 'OpenAI')
         if body.get('object') != 'page':
-            raise ReporterError('OpenAI billing response is not a costs page')
+            raise ReporterError(
+                'OpenAI billing response is not a costs page',
+                code='response_schema_invalid', stage='schema',
+            )
         buckets = body.get('data')
         if not isinstance(buckets, list):
-            raise ReporterError('OpenAI billing response omitted cost buckets')
+            raise ReporterError(
+                'OpenAI billing response omitted cost buckets',
+                code='response_schema_invalid', stage='schema',
+            )
         for bucket in buckets:
             if (not isinstance(bucket, dict) or bucket.get('object') != 'bucket'
                     or not isinstance(bucket.get('results'), list)):
-                raise ReporterError('OpenAI billing response contains an invalid bucket')
+                raise ReporterError(
+                    'OpenAI billing response contains an invalid bucket',
+                    code='response_schema_invalid', stage='schema',
+                )
             timestamp = bucket.get('start_time')
             ending = bucket.get('end_time')
             if (type(timestamp) is not int or type(ending) is not int
                     or timestamp % 86400 != 0 or ending != timestamp + 86400
                     or not start <= timestamp < end):
-                raise ReporterError('OpenAI billing bucket does not cover a complete requested UTC day')
+                raise ReporterError(
+                    'OpenAI billing bucket does not cover a complete requested UTC day',
+                    code='out_of_range_day', stage='coverage',
+                )
             if timestamp in seen_buckets:
-                raise ReporterError('OpenAI billing response repeated a UTC bucket across pages')
+                raise ReporterError(
+                    'OpenAI billing response repeated a UTC bucket across pages',
+                    code='duplicate_data', stage='coverage',
+                )
             seen_buckets.add(timestamp)
             seen_items: set[tuple[str | None, str | None]] = set()
             for result in bucket['results']:
                 if (not isinstance(result, dict) or result.get('object') != 'organization.costs.result'
                         or not isinstance(result.get('amount'), dict)):
-                    raise ReporterError('OpenAI billing entry omitted its recorded cost amount')
+                    raise ReporterError(
+                        'OpenAI billing entry omitted its recorded cost amount',
+                        code='response_schema_invalid', stage='schema',
+                    )
                 project = result.get('project_id')
                 if project_ids and (not isinstance(project, str) or project not in project_ids):
-                    raise ReporterError('OpenAI returned a cost outside the requested project scope')
+                    raise ReporterError(
+                        'OpenAI returned a cost outside the requested project scope',
+                        code='scope_mismatch', stage='scope',
+                    )
                 line_item = result.get('line_item')
                 if line_item is not None and not isinstance(line_item, str):
-                    raise ReporterError('OpenAI billing line item is invalid')
+                    raise ReporterError(
+                        'OpenAI billing line item is invalid',
+                        code='response_schema_invalid', stage='schema',
+                    )
                 identity = (project if project_ids else None, line_item)
                 if identity in seen_items:
-                    raise ReporterError('OpenAI billing bucket repeated a grouped cost record')
+                    raise ReporterError(
+                        'OpenAI billing bucket repeated a grouped cost record',
+                        code='duplicate_data', stage='schema',
+                    )
                 seen_items.add(identity)
                 amount = result['amount']
                 if not isinstance(amount.get('currency'), str) or amount['currency'].lower() != 'usd':
-                    raise ReporterError('OpenAI returned a non-USD billing amount')
+                    raise ReporterError(
+                        'OpenAI returned a non-USD billing amount',
+                        code='unsupported_currency', stage='amount',
+                    )
                 cost = decimal_value(amount.get('value'), 'OpenAI')
                 all_costs.append(cost)
                 if len(all_costs) > MAX_BILLING_ROWS:
-                    raise ReporterError('OpenAI billing response exceeded its record safety limit')
+                    raise ReporterError(
+                        'OpenAI billing response exceeded its record safety limit',
+                        code='response_truncated', stage='response',
+                        details={
+                            'record_count': len(all_costs),
+                            'max_record_count': MAX_BILLING_ROWS,
+                        },
+                    )
                 if timestamp == end - 86400:
                     daily_costs.append(cost)
                     breakdown_costs.setdefault(line_item or 'Uncategorized', []).append(cost)
         has_more = body.get('has_more')
         if type(has_more) is not bool:
-            raise ReporterError('OpenAI billing response omitted pagination state')
+            raise ReporterError(
+                'OpenAI billing response omitted pagination state',
+                code='pagination_invalid', stage='pagination',
+            )
         # The current official SDK declares next_page optional with default None.
         page = body.get('next_page')
         if not has_more:
             if page is not None:
-                raise ReporterError('OpenAI billing pagination completion is contradictory')
+                raise ReporterError(
+                    'OpenAI billing pagination completion is contradictory',
+                    code='pagination_invalid', stage='pagination',
+                )
             break
         if not buckets or not isinstance(page, str) or not page or len(page) > 4096 or page in seen_pages:
-            raise ReporterError('OpenAI billing pagination cursor is invalid or made no progress')
+            raise ReporterError(
+                'OpenAI billing pagination cursor is invalid or made no progress',
+                code='pagination_invalid', stage='pagination',
+            )
         seen_pages.add(page)
         params['page'] = page
     else:
-        raise ReporterError('OpenAI billing pagination exceeded its safety limit')
+        raise ReporterError(
+            'OpenAI billing pagination exceeded its safety limit',
+            code='pagination_limit', stage='pagination',
+            details={
+                'page_count': MAX_BILLING_PAGES,
+                'max_page_count': MAX_BILLING_PAGES,
+            },
+        )
     # An explicit empty bucket represents a zero day. Missing buckets are not
     # documented as zero, so completeness must be demonstrated before publishing.
-    if seen_buckets != set(range(start, end, 86400)):
-        raise ReporterError('OpenAI billing response has incomplete UTC-day coverage; no zero costs inferred')
+    expected_buckets = set(range(start, end, 86400))
+    if seen_buckets != expected_buckets:
+        raise ReporterError(
+            'OpenAI billing response has incomplete UTC-day coverage; no zero costs inferred',
+            code='incomplete_coverage', stage='coverage',
+            details={
+                'missing_utc_days': [
+                    datetime.fromtimestamp(value, timezone.utc).date().isoformat()
+                    for value in sorted(expected_buckets - seen_buckets)
+                ],
+                'expected_day_count': len(expected_buckets),
+                'observed_day_count': len(seen_buckets),
+            },
+        )
     return ProviderSpend(exact_sum(daily_costs), exact_sum(all_costs),
                          {name: exact_sum(values) for name, values in breakdown_costs.items()})
 
@@ -355,28 +595,69 @@ def fetch_xai_costs(
     '''Read dense USD billing series over a documented half-open UTC interval.'''
     start_time, end_time = billing_period_utc(report_date)
     if not isinstance(team_id, str) or re.fullmatch(r'[A-Za-z0-9_-]{1,128}', team_id, re.ASCII) is None:
-        raise ReporterError('XAI_TEAM_ID has an invalid format')
-    payload = {'analyticsRequest': {
-        'timeRange': {'startTime': start_time.strftime('%Y-%m-%d %H:%M:%S'),
-                      'endTime': end_time.strftime('%Y-%m-%d %H:%M:%S'), 'timezone': 'Etc/GMT'},
-        'timeUnit': 'TIME_UNIT_DAY',
-        'values': [{'name': 'usd', 'aggregation': 'AGGREGATION_SUM'}],
-        'groupBy': ['description'], 'filters': [],
-    }}
-    try:
-        response = session.post(f'{XAI_BASE_URL}/v1/billing/teams/{team_id}/usage',
-                                headers={'Authorization': f'Bearer {management_key}'},
-                                json=payload, timeout=30, allow_redirects=False, verify=True)
-    except requests.RequestException:
-        raise ReporterError('xAI billing request failed: network error') from None
-    body = response_json(response, 'xAI')
-    if body.get('limitReached') is True:
-        raise ReporterError('xAI billing analytics were truncated; refusing to report partial costs')
-    if body.get('limitReached') is not False:
-        raise ReporterError('xAI billing response omitted the completeness flag')
-    series = body.get('timeSeries')
-    if not isinstance(series, list) or not series:
-        raise ReporterError('xAI billing response has no accounting coverage; no zero costs inferred')
+        raise ReporterError(
+            'XAI_TEAM_ID has an invalid format',
+            code='invalid_config', stage='preflight',
+        )
+    def usage_series(group_by: tuple[str, ...]) -> list[Any]:
+        '''Read and validate one bounded analytics collection without inferring missing data.'''
+        payload = {'analyticsRequest': {
+            'timeRange': {'startTime': start_time.strftime('%Y-%m-%d %H:%M:%S'),
+                          'endTime': end_time.strftime('%Y-%m-%d %H:%M:%S'), 'timezone': 'Etc/GMT'},
+            'timeUnit': 'TIME_UNIT_DAY',
+            'values': [{'name': 'usd', 'aggregation': 'AGGREGATION_SUM'}],
+            'groupBy': list(group_by), 'filters': [],
+        }}
+        try:
+            response = session.post(f'{XAI_BASE_URL}/v1/billing/teams/{team_id}/usage',
+                                    headers={'Authorization': f'Bearer {management_key}'},
+                                    json=payload, timeout=30, allow_redirects=False, verify=True)
+        except requests.RequestException:
+            raise ReporterError(
+                'xAI billing request failed: network error',
+                code='network_error', stage='network',
+            ) from None
+        body = response_json(response, 'xAI')
+        if body.get('limitReached') is True:
+            raise ReporterError(
+                'xAI billing analytics were truncated; refusing to report partial costs',
+                code='response_truncated', stage='coverage',
+            )
+        if body.get('limitReached') is not False:
+            raise ReporterError(
+                'xAI billing response omitted the completeness flag',
+                code='response_schema_invalid', stage='schema',
+            )
+        series = body.get('timeSeries')
+        if not isinstance(series, list):
+            raise ReporterError(
+                'xAI billing response has no accounting coverage; no zero costs inferred',
+                code='response_schema_invalid', stage='schema',
+            )
+        if not series and set(body) != {'timeSeries', 'limitReached'}:
+            raise ReporterError(
+                'xAI empty billing response contains unsupported accounting metadata',
+                code='response_schema_invalid', stage='schema',
+            )
+        return series
+
+    series = usage_series(('description',))
+    zero_confirmation = not series
+    if zero_confirmation:
+        series = usage_series(())
+    if not series:
+        return ProviderSpend(
+            Decimal('0'), Decimal('0'), {},
+            accounting_evidence=XAI_EMPTY_USAGE_EVIDENCE,
+            accounting_state=NO_RECORDED_USAGE,
+            reconciliation_status='not_reconciled',
+            allow_recheck=True,
+        )
+    if zero_confirmation and len(series) != 1:
+        raise ReporterError(
+            'xAI zero confirmation did not return one aggregate series',
+            code='response_schema_invalid', stage='schema',
+        )
     daily_costs: list[Decimal] = []
     all_costs: list[Decimal] = []
     breakdown_costs: dict[str, list[Decimal]] = {}
@@ -385,56 +666,150 @@ def fetch_xai_costs(
     groups: set[str] = set()
     for group in series:
         if not isinstance(group, dict) or not isinstance(group.get('dataPoints'), list):
-            raise ReporterError('xAI returned an invalid usage group')
-        labels = group.get('groupLabels', group.get('group'))
-        if not isinstance(labels, list) or len(labels) != 1 or not isinstance(labels[0], str) or not labels[0]:
-            raise ReporterError('xAI billing response omitted its grouped description')
-        label = labels[0]
+            raise ReporterError(
+                'xAI returned an invalid usage group',
+                code='response_schema_invalid', stage='schema',
+            )
+        if zero_confirmation:
+            for key in ('group', 'groupLabels'):
+                if key in group and (type(group[key]) is not list or group[key]):
+                    raise ReporterError(
+                        'xAI zero confirmation contains grouped aggregate metadata',
+                        code='response_schema_invalid', stage='schema',
+                    )
+            label = ''
+        else:
+            labels = group.get('groupLabels', group.get('group'))
+            if not isinstance(labels, list) or len(labels) != 1 or not isinstance(labels[0], str) or not labels[0]:
+                raise ReporterError(
+                    'xAI billing response omitted its grouped description',
+                    code='response_schema_invalid', stage='schema',
+                )
+            label = labels[0]
         if label in groups:
-            raise ReporterError('xAI billing response repeated a grouped usage series')
+            raise ReporterError(
+                'xAI billing response repeated a grouped usage series',
+                code='duplicate_data', stage='schema',
+            )
         groups.add(label)
         seen_days: set[datetime] = set()
         for point in group['dataPoints']:
             if (not isinstance(point, dict) or not isinstance(point.get('values'), list)
                     or len(point['values']) != 1 or not isinstance(point.get('timestamp'), str)):
-                raise ReporterError('xAI returned an invalid USD billing data point')
+                raise ReporterError(
+                    'xAI returned an invalid USD billing data point',
+                    code='response_schema_invalid', stage='schema',
+                )
             try:
                 point_time = datetime.fromisoformat(point['timestamp'].replace('Z', '+00:00'))
                 if point_time.tzinfo is None:
                     raise ValueError('Timestamp has no timezone')
                 point_time = point_time.astimezone(timezone.utc)
             except ValueError:
-                raise ReporterError('xAI billing usage timestamp is invalid or has no timezone') from None
+                raise ReporterError(
+                    'xAI billing usage timestamp is invalid or has no timezone',
+                    code='response_schema_invalid', stage='schema',
+                ) from None
             if (point_time not in expected_days or point_time.hour or point_time.minute
                     or point_time.second or point_time.microsecond):
-                raise ReporterError('xAI billing point is outside the requested complete UTC days')
+                raise ReporterError(
+                    'xAI billing point is outside the requested complete UTC days',
+                    code='out_of_range_day', stage='coverage',
+                )
             if point_time in seen_days:
-                raise ReporterError('xAI billing response repeated a daily data point')
+                raise ReporterError(
+                    'xAI billing response repeated a daily data point',
+                    code='duplicate_data', stage='coverage',
+                )
             seen_days.add(point_time)
             cost = decimal_value(point['values'][0], 'xAI')
             all_costs.append(cost)
             if len(all_costs) > MAX_BILLING_ROWS:
-                raise ReporterError('xAI billing response exceeded its record safety limit')
+                raise ReporterError(
+                    'xAI billing response exceeded its record safety limit',
+                    code='response_truncated', stage='response',
+                    details={
+                        'record_count': len(all_costs),
+                        'max_record_count': MAX_BILLING_ROWS,
+                    },
+                )
             if point_time == end_time - timedelta(days=1):
                 daily_costs.append(cost)
-                breakdown_costs.setdefault(label, []).append(cost)
+                if not zero_confirmation:
+                    breakdown_costs.setdefault(label, []).append(cost)
         if seen_days != expected_days:
-            raise ReporterError('xAI billing series has incomplete dense UTC-day coverage; no zero costs inferred')
+            raise ReporterError(
+                'xAI billing series has incomplete dense UTC-day coverage; no zero costs inferred',
+                code='incomplete_coverage', stage='coverage',
+                details={
+                    'missing_utc_days': [
+                        value.date().isoformat()
+                        for value in sorted(expected_days - seen_days)
+                    ],
+                    'expected_day_count': len(expected_days),
+                    'observed_day_count': len(seen_days),
+                },
+            )
+    if zero_confirmation:
+        if any(not value.is_zero() for value in all_costs):
+            raise ReporterError(
+                'xAI grouped-empty response disagrees with its aggregate zero confirmation',
+                code='aggregation_mismatch', stage='coverage',
+            )
+        return ProviderSpend(Decimal('0'), Decimal('0'), {}, XAI_ZERO_CONFIRMATION_EVIDENCE)
     return ProviderSpend(exact_sum(daily_costs), exact_sum(all_costs),
                          {name: exact_sum(values) for name, values in breakdown_costs.items()})
 
 
+def validate_accounting_evidence(spend: ProviderSpend, provider: str) -> None:
+    '''Bind provisional absence and explicit zero evidence to consistent xAI accounting metadata.'''
+    valid = False
+    if spend.accounting_state == NO_RECORDED_USAGE:
+        valid = (provider == 'xai' and spend.accounting_evidence == XAI_EMPTY_USAGE_EVIDENCE
+                 and spend.reconciliation_status == 'not_reconciled' and spend.allow_recheck is True
+                 and spend.daily.is_zero() and spend.month_to_date.is_zero() and not spend.daily_breakdown)
+    elif (spend.accounting_state == RECORDED_SPENDING
+          and spend.reconciliation_status is None and spend.allow_recheck is None):
+        valid = spend.accounting_evidence is None or (
+            provider == 'xai' and spend.accounting_evidence == XAI_ZERO_CONFIRMATION_EVIDENCE
+            and spend.daily.is_zero() and spend.month_to_date.is_zero() and not spend.daily_breakdown
+        )
+    if not valid:
+        raise ReporterError(
+            'Report accounting evidence is invalid or inconsistent with recorded costs',
+            code='response_schema_invalid', stage='schema',
+        )
+
+
+def report_notes(report: BillingReport) -> str:
+    '''Qualify recorded zero when an xAI period supplied no billing records.'''
+    if not report.demo and report.xai.accounting_state == NO_RECORDED_USAGE:
+        return NOTES + ' ' + XAI_NO_RECORDED_USAGE_NOTE
+    return NOTES
+
+
 def report_to_dict(report: BillingReport) -> dict[str, Any]:
     '''Create a machine-readable, explicitly sourced spending record.'''
-    def provider_data(value: ProviderSpend) -> dict[str, Any]:
+    def provider_data(value: ProviderSpend, provider: str) -> dict[str, Any]:
         '''Represent one provider with full monetary precision.'''
-        return {
+        result = {
             'daily_usd': usd_text(value.daily),
             'month_to_date_usd': usd_text(value.month_to_date),
             'daily_breakdown_usd': {
                 name: usd_text(amount) for name, amount in sorted(value.daily_breakdown.items())
             },
         }
+        if not report.demo:
+            validate_accounting_evidence(value, provider)
+            if value.accounting_evidence is not None:
+                result['accounting_evidence'] = value.accounting_evidence
+            if value.accounting_state == NO_RECORDED_USAGE:
+                result.update({
+                    'accounting_state': NO_RECORDED_USAGE,
+                    'reconciliation_status': 'not_reconciled',
+                    'allow_recheck': True,
+                })
+        return result
 
     return {
         'report_date_utc': report.report_date.isoformat(),
@@ -446,10 +821,11 @@ def report_to_dict(report: BillingReport) -> dict[str, Any]:
             'type': 'selected_projects' if report.openai_project_ids else 'all_organization_projects',
             'project_ids': list(report.openai_project_ids),
         },
-        'providers': {'openai': provider_data(report.openai), 'xai': provider_data(report.xai)},
+        'providers': {'openai': provider_data(report.openai, 'openai'),
+                      'xai': provider_data(report.xai, 'xai')},
         'daily_total_usd': usd_text(report.daily_total),
         'month_to_date_total_usd': usd_text(report.month_to_date_total),
-        'notes': NOTES,
+        'notes': report_notes(report),
     }
 
 
@@ -472,12 +848,31 @@ def report_from_dict(data: Mapping[str, Any], expected_date: date) -> BillingRep
         breakdown = record.get('daily_breakdown_usd')
         if not isinstance(breakdown, dict):
             raise ReporterError(f'Stored report {name} breakdown is invalid')
-        return ProviderSpend(
+        if record.get('accounting_state') == NO_RECORDED_USAGE and set(record) != {
+            'daily_usd', 'month_to_date_usd', 'daily_breakdown_usd', 'accounting_evidence',
+            'accounting_state', 'reconciliation_status', 'allow_recheck',
+        }:
+            raise ReporterError(
+                'Stored inactive report accounting metadata is incomplete or unsupported',
+                code='response_schema_invalid', stage='schema',
+            )
+        spend = ProviderSpend(
             daily=decimal_value(record.get('daily_usd'), name),
             month_to_date=decimal_value(record.get('month_to_date_usd'), name),
             daily_breakdown={str(key): decimal_value(value, name)
                              for key, value in breakdown.items()},
+            accounting_evidence=record.get('accounting_evidence'),
+            accounting_state=record.get('accounting_state', RECORDED_SPENDING),
+            reconciliation_status=record.get('reconciliation_status'),
+            allow_recheck=record.get('allow_recheck'),
         )
+        if 'accounting_evidence' in record and record['accounting_evidence'] is None:
+            raise ReporterError(
+                'Stored report accounting evidence is invalid',
+                code='response_schema_invalid', stage='schema',
+            )
+        validate_accounting_evidence(spend, name)
+        return spend
 
     try:
         created_at = datetime.fromisoformat(str(data['generated_at_utc']))
@@ -537,6 +932,9 @@ def breakdown_rows(values: Mapping[str, Decimal], max_rows: int = 7) -> list[lis
 
 def create_pdf(report: BillingReport, output_path: Path) -> None:
     '''Produce a one- to two-page PDF without estimations or model-rate calculations.'''
+    if not report.demo:
+        validate_accounting_evidence(report.openai, 'openai')
+        validate_accounting_evidence(report.xai, 'xai')
     output_path.parent.mkdir(parents=True, exist_ok=True)
     doc = SimpleDocTemplate(
         str(output_path),
@@ -588,11 +986,14 @@ def create_pdf(report: BillingReport, output_path: Path) -> None:
             Paragraph('SAMPLE ONLY - SYNTHETIC FIGURES - NOT ACTUAL SPENDING', styles['SectionCustom']),
             Spacer(1, 3 * mm),
         ])
+    inactive = not report.demo and report.xai.accounting_state == NO_RECORDED_USAGE
+    xai_label = 'xAI / Grok (no recorded usage)' if inactive else 'xAI / Grok'
+    total_label = 'RECORDED TOTAL' if inactive else 'TOTAL'
     summary = [
         ['Provider', 'Yesterday (USD)', 'Month-to-date (USD)'],
         ['OpenAI', money(report.openai.daily), money(report.openai.month_to_date)],
-        ['xAI / Grok', money(report.xai.daily), money(report.xai.month_to_date)],
-        ['TOTAL', money(report.daily_total), money(report.month_to_date_total)],
+        [xai_label, money(report.xai.daily), money(report.xai.month_to_date)],
+        [total_label, money(report.daily_total), money(report.month_to_date_total)],
     ]
     table = Table(summary, colWidths=[60 * mm, 53 * mm, 53 * mm], hAlign='LEFT')
     table.setStyle(TableStyle([
@@ -610,6 +1011,12 @@ def create_pdf(report: BillingReport, output_path: Path) -> None:
     story.append(table)
     for title, spend in [('OpenAI - daily cost line items', report.openai),
                          ('xAI / Grok - daily usage descriptions', report.xai)]:
+        if not report.demo and spend.accounting_state == NO_RECORDED_USAGE:
+            story.append(KeepTogether([
+                Paragraph(title, styles['SectionCustom']),
+                Paragraph(html.escape(XAI_NO_RECORDED_USAGE_NOTE), styles['SmallCustom']),
+            ]))
+            continue
         data: list[list[Any]] = [[
             Paragraph('Description', styles['CellCustom']),
             Paragraph('USD', styles['AmountCustom']),
@@ -633,7 +1040,7 @@ def create_pdf(report: BillingReport, output_path: Path) -> None:
         Spacer(1, 6 * mm),
         HRFlowable(width='100%', thickness=0.5, color=colors.HexColor('#d8dfe7')),
         Spacer(1, 2 * mm),
-        Paragraph(html.escape(NOTES), styles['SmallCustom']),
+        Paragraph(html.escape(report_notes(report)), styles['SmallCustom']),
         Paragraph(
             f'Generated {generated_label}; '
             'daily boundaries: 00:00:00-23:59:59 UTC.',
@@ -673,7 +1080,7 @@ def send_email(report: BillingReport, pdf_path: Path) -> None:
         f'xAI/Grok: {money(report.xai.daily)}\n'
         f'Daily total: {money(report.daily_total)}\n'
         f'Month-to-date: {money(report.month_to_date_total)}\n\n'
-        f'{NOTES}\n\nFull report is attached as PDF.'
+        f'{report_notes(report)}\n\nFull report is attached as PDF.'
     )
     email.set_content(plain)
     email.add_alternative(
@@ -687,7 +1094,7 @@ def send_email(report: BillingReport, pdf_path: Path) -> None:
         f'<td>{money(report.xai.month_to_date)}</td></tr>'
         f'<tr><th>Total</th><th>{money(report.daily_total)}</th>'
         f'<th>{money(report.month_to_date_total)}</th></tr></table>'
-        f'<p><small>{html.escape(NOTES)}</small></p>',
+        f'<p><small>{html.escape(report_notes(report))}</small></p>',
         subtype='html',
     )
     email.add_attachment(pdf_path.read_bytes(), maintype='application', subtype='pdf', filename=pdf_path.name)
