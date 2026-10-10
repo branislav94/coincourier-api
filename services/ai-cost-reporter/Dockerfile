@@ -7,6 +7,7 @@ RUN pip install --no-cache-dir -r requirements.txt \
     && mkdir -p /data/reports \
     && chown -R reporter:reporter /data/reports
 COPY app.py drive_delivery.py apps_script_delivery.py ./
+COPY scripts/billing_smoke_test.py ./scripts/
 USER reporter
 ENV PYTHONDONTWRITEBYTECODE=1 \
     PYTHONUNBUFFERED=1 \

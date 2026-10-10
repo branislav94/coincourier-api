@@ -14,11 +14,11 @@ import sys
 from contextlib import contextmanager
 from dataclasses import dataclass, field
 from datetime import date, datetime, timedelta, timezone
-from decimal import Decimal, InvalidOperation
+from decimal import Context, Decimal, DecimalException, ROUND_HALF_EVEN, localcontext
 from email.message import EmailMessage
 from pathlib import Path
 from tempfile import NamedTemporaryFile
-from typing import Any, Iterator, Mapping
+from typing import Any, Iterable, Iterator, Mapping
 
 import requests
 from filelock import FileLock, Timeout
@@ -45,6 +45,11 @@ from drive_delivery import DriveDeliveryError, DrivePublisher, refresh_access_to
 
 OPENAI_COSTS_URL = 'https://api.openai.com/v1/organization/costs'
 XAI_BASE_URL = 'https://management-api.x.ai'
+MAX_MONEY_DIGITS = 1024
+MAX_MONEY_EXPONENT = 256
+MAX_BILLING_RESPONSE_BYTES = 16 * 1024 * 1024
+MAX_BILLING_ROWS = 100000
+MAX_BILLING_PAGES = 1000
 NOTES = (
     'Provider-reported API consumption in USD, not a card-payment statement. '
     'Values can be adjusted after reporting; taxes, prepaid credit purchases, '
@@ -80,35 +85,129 @@ class BillingReport:
     @property
     def daily_total(self) -> Decimal:
         '''Return the combined daily cost in USD.'''
-        return self.openai.daily + self.xai.daily
+        return exact_sum((self.openai.daily, self.xai.daily))
 
     @property
     def month_to_date_total(self) -> Decimal:
         '''Return the combined month-to-date cost in USD.'''
-        return self.openai.month_to_date + self.xai.month_to_date
+        return exact_sum((self.openai.month_to_date, self.xai.month_to_date))
 
 
-def money(amount: Decimal) -> str:
-    '''Format amounts to the cent only at presentation time.'''
-    return f'${amount:,.2f}'
+@dataclass(frozen=True)
+class BillingConfiguration:
+    '''Validated provider scope with authentication excluded from representations.'''
+
+    openai_admin_key: str = field(repr=False)
+    xai_management_key: str = field(repr=False)
+    xai_team_id: str
+    openai_project_ids: tuple[str, ...]
+
+
+def validate_billing_date(report_date: date) -> None:
+    '''Reject partial UTC days and unsupported historical dates before networking.'''
+    if (type(report_date) is not date or report_date < date(2000, 1, 1)
+            or report_date >= datetime.now(timezone.utc).date()):
+        raise ReporterError('Report date must be a fully completed UTC billing day from 2000 onward')
+
+
+def billing_period_utc(report_date: date) -> tuple[datetime, datetime]:
+    '''Return the month-to-date half-open UTC interval, including the report day.'''
+    validate_billing_date(report_date)
+    start = datetime(report_date.year, report_date.month, 1, tzinfo=timezone.utc)
+    next_day = report_date + timedelta(days=1)
+    return start, datetime(next_day.year, next_day.month, next_day.day, tzinfo=timezone.utc)
+
+
+def parse_openai_project_ids(raw: str) -> tuple[str, ...]:
+    '''Parse explicitly selected projects; blank means the complete organization.'''
+    if not isinstance(raw, str):
+        raise ReporterError('OPENAI_PROJECT_IDS must be comma-separated project IDs')
+    if not raw.strip():
+        return ()
+    values = tuple(value.strip() for value in raw.split(','))
+    if not all(re.fullmatch(r'proj_[A-Za-z0-9_-]{1,128}', value, re.ASCII) for value in values):
+        raise ReporterError('OPENAI_PROJECT_IDS must be comma-separated project IDs')
+    return tuple(dict.fromkeys(values))
+
+
+def validate_billing_configuration(report_date: date) -> BillingConfiguration:
+    '''Validate both providers before the first API request; never echo credentials.'''
+    validate_billing_date(report_date)
+    project_ids = parse_openai_project_ids(os.environ.get('OPENAI_PROJECT_IDS', ''))
+    team_id = required_env('XAI_TEAM_ID')
+    if re.fullmatch(r'[A-Za-z0-9_-]{1,128}', team_id, re.ASCII) is None:
+        raise ReporterError('XAI_TEAM_ID has an invalid format')
+
+    def header_key(variable: str) -> str:
+        '''Require printable ASCII bearer material with no whitespace or controls.'''
+        value = os.environ.get(variable, '')
+        if not value or not value.strip():
+            raise ReporterError(f'Required environment variable {variable} is not set')
+        if len(value) > 4096 or any(ord(character) <= 32 or ord(character) >= 127 for character in value):
+            raise ReporterError(f'{variable} has an invalid credential format')
+        return value
+
+    return BillingConfiguration(header_key('OPENAI_ADMIN_KEY'), header_key('XAI_MANAGEMENT_KEY'),
+                                 team_id, project_ids)
 
 
 def decimal_value(value: object, context: str) -> Decimal:
-    '''Convert a provider numeric value without floating-point accumulation.'''
-    if isinstance(value, bool) or not isinstance(value, (int, float, str, Decimal)):
-        raise ReporterError(f'{context}: missing or invalid USD amount')
+    '''Accept finite exact monetary values within bounded precision and exponent.'''
+    if isinstance(value, bool) or not isinstance(value, (int, str, Decimal)):
+        raise ReporterError(f'{context}: missing or invalid exact USD amount')
+    if isinstance(value, str) and (len(value) > MAX_MONEY_DIGITS * 2
+            or re.fullmatch(r'-?(?:0|[1-9][0-9]*)(?:\.[0-9]+)?(?:[eE][+-]?[0-9]+)?', value, re.ASCII) is None):
+        raise ReporterError(f'{context}: invalid USD amount')
     try:
-        result = Decimal(str(value))
-    except InvalidOperation as error:
-        raise ReporterError(f'{context}: invalid USD amount') from error
+        result = value if isinstance(value, Decimal) else Decimal(str(value))
+    except DecimalException:
+        raise ReporterError(f'{context}: invalid USD amount') from None
     if not result.is_finite():
         raise ReporterError(f'{context}: non-finite USD amount')
+    digits = result.as_tuple()
+    if (len(digits.digits) > MAX_MONEY_DIGITS or abs(digits.exponent) > MAX_MONEY_EXPONENT
+            or abs(result.adjusted()) > MAX_MONEY_EXPONENT):
+        raise ReporterError(f'{context}: USD amount exceeds bounded precision or exponent')
     return result
+
+
+def exact_sum(values: Iterable[Decimal]) -> Decimal:
+    '''Sum bounded decimal coefficients with integers, independent of ambient context.'''
+    amounts = [decimal_value(value, 'Cost aggregation') for value in values]
+    if not amounts:
+        return Decimal('0')
+    if len(amounts) > MAX_BILLING_ROWS:
+        raise ReporterError('Cost aggregation exceeded its record safety limit')
+    exponent = min(value.as_tuple().exponent for value in amounts)
+    total = 0
+    for amount in amounts:
+        number = amount.as_tuple()
+        coefficient = int(''.join(str(digit) for digit in number.digits))
+        if number.sign:
+            coefficient = -coefficient
+        total += coefficient * (10 ** (number.exponent - exponent))
+    digits = tuple(int(character) for character in str(abs(total)))
+    result = Decimal((int(total < 0), digits, exponent))
+    return decimal_value(result, 'Cost aggregation')
+
+
+def usd_text(amount: Decimal) -> str:
+    '''Format exact USD values without rounding or context-dependent exponent text.'''
+    return format(decimal_value(amount, 'Cost serialization'), 'f')
+
+
+def money(amount: Decimal) -> str:
+    '''Round cents explicitly with half-even rules only at presentation time.'''
+    amount = decimal_value(amount, 'Cost presentation')
+    with localcontext(Context(prec=MAX_MONEY_DIGITS, rounding=ROUND_HALF_EVEN)):
+        rounded = amount.quantize(Decimal('0.01'), rounding=ROUND_HALF_EVEN)
+        return f'${rounded:,.2f}'
 
 
 def session_with_retry() -> requests.Session:
     '''Create a retrying HTTP session for read-only provider billing queries.'''
     session = requests.Session()
+    session.trust_env = False
     retry = Retry(
         total=3,
         backoff_factor=0.5,
@@ -121,15 +220,31 @@ def session_with_retry() -> requests.Session:
 
 
 def response_json(response: requests.Response, provider: str) -> Mapping[str, Any]:
-    '''Validate an HTTP response without logging sensitive response bodies.'''
+    '''Decode raw provider JSON numbers as Decimal and suppress sensitive bodies.'''
+    if not 200 <= response.status_code < 300:
+        raise ReporterError(f'{provider} billing request failed: HTTP {response.status_code}')
+    content = response.content
+    if not isinstance(content, bytes) or not content or len(content) > MAX_BILLING_RESPONSE_BYTES:
+        raise ReporterError(f'{provider} billing response is empty or exceeds its size limit')
+
+    def object_pairs(pairs: list[tuple[str, Any]]) -> dict[str, Any]:
+        '''Reject duplicate JSON keys rather than accepting ambiguous accounting data.'''
+        result: dict[str, Any] = {}
+        for key, value in pairs:
+            if key in result:
+                raise ValueError('Duplicate JSON key')
+            result[key] = value
+        return result
+
+    def invalid_constant(value: str) -> None:
+        '''Reject extensions such as NaN/Infinity before interpreting any value.'''
+        raise ValueError('Non-finite JSON constant')
+
     try:
-        response.raise_for_status()
-    except requests.HTTPError as error:
-        raise ReporterError(f'{provider} billing request failed: HTTP {response.status_code}') from error
-    try:
-        body = response.json()
-    except ValueError as error:
-        raise ReporterError(f'{provider} billing response was not JSON') from error
+        body = json.loads(content.decode('utf-8'), parse_float=Decimal,
+                          object_pairs_hook=object_pairs, parse_constant=invalid_constant)
+    except (ValueError, UnicodeError, DecimalException, RecursionError):
+        raise ReporterError(f'{provider} billing response was not valid unambiguous JSON') from None
     if not isinstance(body, dict):
         raise ReporterError(f'{provider} billing response was not an object')
     return body
@@ -139,139 +254,174 @@ def fetch_openai_costs(
     session: requests.Session, admin_key: str, report_date: date,
     project_ids: tuple[str, ...] = (),
 ) -> ProviderSpend:
-    '''Retrieve OpenAI month-to-date actual cost buckets, including pagination.'''
-    month_start = report_date.replace(day=1)
-    start = int(datetime(month_start.year, month_start.month, month_start.day, tzinfo=timezone.utc).timestamp())
-    end_day = report_date + timedelta(days=1)
-    end = int(datetime(end_day.year, end_day.month, end_day.day, tzinfo=timezone.utc).timestamp())
+    '''Read complete UTC cost buckets, verifying project scope and pagination.'''
+    start_time, end_time = billing_period_utc(report_date)
+    if (not isinstance(project_ids, tuple)
+            or not all(isinstance(value, str) and re.fullmatch(r'proj_[A-Za-z0-9_-]{1,128}', value, re.ASCII)
+                       for value in project_ids)):
+        raise ReporterError('OPENAI_PROJECT_IDS contains an invalid project ID')
+    project_ids = tuple(dict.fromkeys(project_ids))
+    start = int(start_time.timestamp())
+    end = int(end_time.timestamp())
     params: dict[str, Any] = {
-        'start_time': start,
-        'end_time': end,
-        'bucket_width': '1d',
-        'group_by': ['line_item'],
+        'start_time': start, 'end_time': end, 'bucket_width': '1d',
+        'group_by[]': ['line_item', 'project_id'] if project_ids else ['line_item'],
         'limit': 180,
     }
     if project_ids:
-        params['project_ids'] = list(project_ids)
-    daily = Decimal('0')
-    month_to_date = Decimal('0')
-    breakdown: dict[str, Decimal] = {}
+        params['project_ids[]'] = list(project_ids)
+    daily_costs: list[Decimal] = []
+    all_costs: list[Decimal] = []
+    breakdown_costs: dict[str, list[Decimal]] = {}
     seen_pages: set[str] = set()
-    while True:
+    seen_buckets: set[int] = set()
+    for _ in range(MAX_BILLING_PAGES):
         try:
-            response = session.get(
-                OPENAI_COSTS_URL,
-                headers={'Authorization': f'Bearer {admin_key}'},
-                params=params,
-                timeout=30,
-            )
-        except requests.RequestException as error:
-            raise ReporterError('OpenAI billing request failed: network error') from error
+            response = session.get(OPENAI_COSTS_URL,
+                                   headers={'Authorization': f'Bearer {admin_key}'},
+                                   params=params, timeout=30, allow_redirects=False, verify=True)
+        except requests.RequestException:
+            raise ReporterError('OpenAI billing request failed: network error') from None
         body = response_json(response, 'OpenAI')
+        if body.get('object') != 'page':
+            raise ReporterError('OpenAI billing response is not a costs page')
         buckets = body.get('data')
         if not isinstance(buckets, list):
             raise ReporterError('OpenAI billing response omitted cost buckets')
         for bucket in buckets:
-            if not isinstance(bucket, dict) or not isinstance(bucket.get('results'), list):
+            if (not isinstance(bucket, dict) or bucket.get('object') != 'bucket'
+                    or not isinstance(bucket.get('results'), list)):
                 raise ReporterError('OpenAI billing response contains an invalid bucket')
-            bucket_timestamp = bucket.get('start_time')
-            if isinstance(bucket_timestamp, bool) or not isinstance(bucket_timestamp, int):
-                raise ReporterError('OpenAI billing bucket omitted its UTC start time')
-            bucket_date = datetime.fromtimestamp(bucket_timestamp, timezone.utc).date()
-            if not month_start <= bucket_date <= report_date:
-                raise ReporterError('OpenAI returned a bucket outside the requested billing period')
+            timestamp = bucket.get('start_time')
+            ending = bucket.get('end_time')
+            if (type(timestamp) is not int or type(ending) is not int
+                    or timestamp % 86400 != 0 or ending != timestamp + 86400
+                    or not start <= timestamp < end):
+                raise ReporterError('OpenAI billing bucket does not cover a complete requested UTC day')
+            if timestamp in seen_buckets:
+                raise ReporterError('OpenAI billing response repeated a UTC bucket across pages')
+            seen_buckets.add(timestamp)
+            seen_items: set[tuple[str | None, str | None]] = set()
             for result in bucket['results']:
-                if not isinstance(result, dict) or not isinstance(result.get('amount'), dict):
-                    raise ReporterError('OpenAI billing entry omitted its amount')
+                if (not isinstance(result, dict) or result.get('object') != 'organization.costs.result'
+                        or not isinstance(result.get('amount'), dict)):
+                    raise ReporterError('OpenAI billing entry omitted its recorded cost amount')
+                project = result.get('project_id')
+                if project_ids and (not isinstance(project, str) or project not in project_ids):
+                    raise ReporterError('OpenAI returned a cost outside the requested project scope')
+                line_item = result.get('line_item')
+                if line_item is not None and not isinstance(line_item, str):
+                    raise ReporterError('OpenAI billing line item is invalid')
+                identity = (project if project_ids else None, line_item)
+                if identity in seen_items:
+                    raise ReporterError('OpenAI billing bucket repeated a grouped cost record')
+                seen_items.add(identity)
                 amount = result['amount']
-                if str(amount.get('currency', '')).lower() != 'usd':
+                if not isinstance(amount.get('currency'), str) or amount['currency'].lower() != 'usd':
                     raise ReporterError('OpenAI returned a non-USD billing amount')
                 cost = decimal_value(amount.get('value'), 'OpenAI')
-                month_to_date += cost
-                if bucket_date == report_date:
-                    daily += cost
-                    label = str(result.get('line_item') or 'Uncategorized')
-                    breakdown[label] = breakdown.get(label, Decimal('0')) + cost
+                all_costs.append(cost)
+                if len(all_costs) > MAX_BILLING_ROWS:
+                    raise ReporterError('OpenAI billing response exceeded its record safety limit')
+                if timestamp == end - 86400:
+                    daily_costs.append(cost)
+                    breakdown_costs.setdefault(line_item or 'Uncategorized', []).append(cost)
         has_more = body.get('has_more')
-        if not isinstance(has_more, bool):
+        if type(has_more) is not bool:
             raise ReporterError('OpenAI billing response omitted pagination state')
-        if not has_more:
-            break
+        # The current official SDK declares next_page optional with default None.
         page = body.get('next_page')
-        if not isinstance(page, str) or not page or page in seen_pages:
-            raise ReporterError('OpenAI billing pagination cursor is invalid')
+        if not has_more:
+            if page is not None:
+                raise ReporterError('OpenAI billing pagination completion is contradictory')
+            break
+        if not buckets or not isinstance(page, str) or not page or len(page) > 4096 or page in seen_pages:
+            raise ReporterError('OpenAI billing pagination cursor is invalid or made no progress')
         seen_pages.add(page)
         params['page'] = page
-    return ProviderSpend(daily=daily, month_to_date=month_to_date, daily_breakdown=breakdown)
+    else:
+        raise ReporterError('OpenAI billing pagination exceeded its safety limit')
+    # An explicit empty bucket represents a zero day. Missing buckets are not
+    # documented as zero, so completeness must be demonstrated before publishing.
+    if seen_buckets != set(range(start, end, 86400)):
+        raise ReporterError('OpenAI billing response has incomplete UTC-day coverage; no zero costs inferred')
+    return ProviderSpend(exact_sum(daily_costs), exact_sum(all_costs),
+                         {name: exact_sum(values) for name, values in breakdown_costs.items()})
 
 
 def fetch_xai_costs(
-    session: requests.Session, management_key: str, team_id: str, report_date: date
+    session: requests.Session, management_key: str, team_id: str, report_date: date,
 ) -> ProviderSpend:
-    '''Retrieve xAI's billed USD usage series through its Management API.'''
-    month_start = report_date.replace(day=1)
-    payload = {
-        'analyticsRequest': {
-            'timeRange': {
-                'startTime': f'{month_start.isoformat()} 00:00:00',
-                'endTime': f'{report_date.isoformat()} 23:59:59',
-                'timezone': 'Etc/GMT',
-            },
-            'timeUnit': 'TIME_UNIT_DAY',
-            'values': [{'name': 'usd', 'aggregation': 'AGGREGATION_SUM'}],
-            'groupBy': ['description'],
-            'filters': [],
-        }
-    }
-    if not re.fullmatch(r'[a-zA-Z0-9_-]{1,128}', team_id):
+    '''Read dense USD billing series over a documented half-open UTC interval.'''
+    start_time, end_time = billing_period_utc(report_date)
+    if not isinstance(team_id, str) or re.fullmatch(r'[A-Za-z0-9_-]{1,128}', team_id, re.ASCII) is None:
         raise ReporterError('XAI_TEAM_ID has an invalid format')
+    payload = {'analyticsRequest': {
+        'timeRange': {'startTime': start_time.strftime('%Y-%m-%d %H:%M:%S'),
+                      'endTime': end_time.strftime('%Y-%m-%d %H:%M:%S'), 'timezone': 'Etc/GMT'},
+        'timeUnit': 'TIME_UNIT_DAY',
+        'values': [{'name': 'usd', 'aggregation': 'AGGREGATION_SUM'}],
+        'groupBy': ['description'], 'filters': [],
+    }}
     try:
-        response = session.post(
-            f'{XAI_BASE_URL}/v1/billing/teams/{team_id}/usage',
-            headers={'Authorization': f'Bearer {management_key}'},
-            json=payload,
-            timeout=30,
-        )
-    except requests.RequestException as error:
-        raise ReporterError('xAI billing request failed: network error') from error
+        response = session.post(f'{XAI_BASE_URL}/v1/billing/teams/{team_id}/usage',
+                                headers={'Authorization': f'Bearer {management_key}'},
+                                json=payload, timeout=30, allow_redirects=False, verify=True)
+    except requests.RequestException:
+        raise ReporterError('xAI billing request failed: network error') from None
     body = response_json(response, 'xAI')
     if body.get('limitReached') is True:
         raise ReporterError('xAI billing analytics were truncated; refusing to report partial costs')
     if body.get('limitReached') is not False:
         raise ReporterError('xAI billing response omitted the completeness flag')
     series = body.get('timeSeries')
-    if not isinstance(series, list):
-        raise ReporterError('xAI billing response omitted usage time series')
-    daily = Decimal('0')
-    month_to_date = Decimal('0')
-    breakdown: dict[str, Decimal] = {}
+    if not isinstance(series, list) or not series:
+        raise ReporterError('xAI billing response has no accounting coverage; no zero costs inferred')
+    daily_costs: list[Decimal] = []
+    all_costs: list[Decimal] = []
+    breakdown_costs: dict[str, list[Decimal]] = {}
+    expected_days = {start_time + timedelta(days=offset)
+                     for offset in range((end_time - start_time).days)}
+    groups: set[str] = set()
     for group in series:
         if not isinstance(group, dict) or not isinstance(group.get('dataPoints'), list):
             raise ReporterError('xAI returned an invalid usage group')
-        group_names = group.get('groupLabels') or group.get('group') or []
-        label = str(group_names[0]) if isinstance(group_names, list) and group_names else 'Uncategorized'
+        labels = group.get('groupLabels', group.get('group'))
+        if not isinstance(labels, list) or len(labels) != 1 or not isinstance(labels[0], str) or not labels[0]:
+            raise ReporterError('xAI billing response omitted its grouped description')
+        label = labels[0]
+        if label in groups:
+            raise ReporterError('xAI billing response repeated a grouped usage series')
+        groups.add(label)
+        seen_days: set[datetime] = set()
         for point in group['dataPoints']:
-            if not isinstance(point, dict) or not isinstance(point.get('values'), list):
-                raise ReporterError('xAI returned an invalid usage data point')
-            values = point['values']
-            if len(values) != 1:
-                raise ReporterError('xAI billing series has an unexpected number of metrics')
+            if (not isinstance(point, dict) or not isinstance(point.get('values'), list)
+                    or len(point['values']) != 1 or not isinstance(point.get('timestamp'), str)):
+                raise ReporterError('xAI returned an invalid USD billing data point')
             try:
-                timestamp = str(point['timestamp']).replace('Z', '+00:00')
-                point_time = datetime.fromisoformat(timestamp)
-            except (ValueError, KeyError) as error:
-                raise ReporterError('xAI billing usage timestamp is invalid') from error
-            if point_time.tzinfo is None:
-                raise ReporterError('xAI usage timestamps must include a timezone')
-            point_date = point_time.astimezone(timezone.utc).date()
-            if not month_start <= point_date <= report_date:
-                raise ReporterError('xAI returned a day outside the requested billing period')
-            cost = decimal_value(values[0], 'xAI')
-            month_to_date += cost
-            if point_date == report_date:
-                daily += cost
-                breakdown[label] = breakdown.get(label, Decimal('0')) + cost
-    return ProviderSpend(daily=daily, month_to_date=month_to_date, daily_breakdown=breakdown)
+                point_time = datetime.fromisoformat(point['timestamp'].replace('Z', '+00:00'))
+                if point_time.tzinfo is None:
+                    raise ValueError('Timestamp has no timezone')
+                point_time = point_time.astimezone(timezone.utc)
+            except ValueError:
+                raise ReporterError('xAI billing usage timestamp is invalid or has no timezone') from None
+            if (point_time not in expected_days or point_time.hour or point_time.minute
+                    or point_time.second or point_time.microsecond):
+                raise ReporterError('xAI billing point is outside the requested complete UTC days')
+            if point_time in seen_days:
+                raise ReporterError('xAI billing response repeated a daily data point')
+            seen_days.add(point_time)
+            cost = decimal_value(point['values'][0], 'xAI')
+            all_costs.append(cost)
+            if len(all_costs) > MAX_BILLING_ROWS:
+                raise ReporterError('xAI billing response exceeded its record safety limit')
+            if point_time == end_time - timedelta(days=1):
+                daily_costs.append(cost)
+                breakdown_costs.setdefault(label, []).append(cost)
+        if seen_days != expected_days:
+            raise ReporterError('xAI billing series has incomplete dense UTC-day coverage; no zero costs inferred')
+    return ProviderSpend(exact_sum(daily_costs), exact_sum(all_costs),
+                         {name: exact_sum(values) for name, values in breakdown_costs.items()})
 
 
 def report_to_dict(report: BillingReport) -> dict[str, Any]:
@@ -279,10 +429,10 @@ def report_to_dict(report: BillingReport) -> dict[str, Any]:
     def provider_data(value: ProviderSpend) -> dict[str, Any]:
         '''Represent one provider with full monetary precision.'''
         return {
-            'daily_usd': str(value.daily),
-            'month_to_date_usd': str(value.month_to_date),
+            'daily_usd': usd_text(value.daily),
+            'month_to_date_usd': usd_text(value.month_to_date),
             'daily_breakdown_usd': {
-                name: str(amount) for name, amount in sorted(value.daily_breakdown.items())
+                name: usd_text(amount) for name, amount in sorted(value.daily_breakdown.items())
             },
         }
 
@@ -297,8 +447,8 @@ def report_to_dict(report: BillingReport) -> dict[str, Any]:
             'project_ids': list(report.openai_project_ids),
         },
         'providers': {'openai': provider_data(report.openai), 'xai': provider_data(report.xai)},
-        'daily_total_usd': str(report.daily_total),
-        'month_to_date_total_usd': str(report.month_to_date_total),
+        'daily_total_usd': usd_text(report.daily_total),
+        'month_to_date_total_usd': usd_text(report.month_to_date_total),
         'notes': NOTES,
     }
 
@@ -375,10 +525,10 @@ def write_json_atomic(target: Path, data: Mapping[str, Any]) -> None:
 
 def breakdown_rows(values: Mapping[str, Decimal], max_rows: int = 7) -> list[list[str]]:
     '''Return a bounded table without silently losing smaller cost entries.'''
-    ranked = sorted(values.items(), key=lambda item: (-item[1], item[0]))
+    ranked = sorted(values.items(), key=lambda item: (item[1].copy_negate(), item[0]))
     rows = [[name[:95], money(value)] for name, value in ranked[:max_rows]]
     if len(ranked) > max_rows:
-        rest_total = sum((value for _, value in ranked[max_rows:]), Decimal('0'))
+        rest_total = exact_sum(value for _, value in ranked[max_rows:])
         rows.append([f'Other ({len(ranked) - max_rows} line items)', money(rest_total)])
     if not rows:
         rows.append(['No recorded spend', '$0.00'])
@@ -711,15 +861,12 @@ def demo_report(report_date: date) -> BillingReport:
 
 def get_live_report(session: requests.Session, report_date: date) -> BillingReport:
     '''Fetch both providers; require both to succeed before any output is delivered.'''
-    openai_key = required_env('OPENAI_ADMIN_KEY')
-    xai_key = required_env('XAI_MANAGEMENT_KEY')
-    team_id = required_env('XAI_TEAM_ID')
-    raw_project_ids = recipient_list(os.environ.get('OPENAI_PROJECT_IDS', ''))
-    if not all(re.fullmatch(r'proj_[A-Za-z0-9_-]{1,128}', value) for value in raw_project_ids):
-        raise ReporterError('OPENAI_PROJECT_IDS must be comma-separated project IDs')
-    project_ids = tuple(dict.fromkeys(raw_project_ids))
-    openai = fetch_openai_costs(session, openai_key, report_date, project_ids)
-    xai = fetch_xai_costs(session, xai_key, team_id, report_date)
+    configuration = validate_billing_configuration(report_date)
+    session.trust_env = False
+    project_ids = configuration.openai_project_ids
+    openai = fetch_openai_costs(session, configuration.openai_admin_key, report_date, project_ids)
+    xai = fetch_xai_costs(session, configuration.xai_management_key,
+                         configuration.xai_team_id, report_date)
     return BillingReport(
         report_date=report_date,
         openai=openai,

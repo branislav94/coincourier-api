@@ -22,7 +22,7 @@ Keep the GetNewsAPI and reporter Python environments separate. Install reporter 
 
 GetNewsAPI code, functions, databases, dependencies, Compose files and production configuration remain unchanged. Its existing root Dockerfile copies only `GetNewsAPI/` and specific `maintenance/` directories, so the reporter cannot enter that image. No root Dockerfile or `.dockerignore` edit is required. Reporter CI is a separate root workflow at `.github/workflows/ai-cost-reporter-offline.yml`, with its commands working in this service directory and dependency caching keyed to `services/ai-cost-reporter/requirements.txt`. GitHub requires workflows at the repository-root [`.github/workflows` location](https://docs.github.com/en/actions/reference/workflows-and-actions/workflow-syntax); a nested service workflow is not used.
 
-The old `scripts/publish_to_github.ps1` helper is intentionally omitted. It initializes and publishes a standalone repository, which could create nested Git metadata inside the monorepo. The separately authorized legacy OAuth helper remains available. The user now authorizes publication of the reviewed reporter changes with commit message `Complete AI Cost Reporter Google Drive integration` and a non-force push to `origin/dev`. Dokploy deployment, production scheduling, billing requests and further Google changes remain separately authorized actions. The original `api-test` checkout and its pending files remain untouched.
+The old `scripts/publish_to_github.ps1` helper is intentionally omitted. It initializes and publishes a standalone repository, which could create nested Git metadata inside the monorepo. The separately authorized legacy OAuth helper remains available. The Google delivery integration was published at `7786e1d`. The current authorized phases correct billing accounting, run offline checks, prepare a read-only billing smoke helper, and publish reviewed reporter changes with commit message `Correct AI Cost Reporter billing accounting` to `origin/dev` without force. Actual provider requests, Dokploy deployment, production scheduling and further Google changes remain separately authorized actions. The original `api-test` checkout and its pending files remain untouched.
 
 ```text
 Dokploy Application Schedule Job: 09:00 Europe/Belgrade
@@ -39,8 +39,8 @@ Costs describe provider-recorded API consumption. They exclude tax, credit purch
 
 ## Credentials and billing scope
 
-- Use a newly rotated OpenAI **organization Admin API key** and xAI **Management key**, with the intended xAI team ID. Previously disclosed keys must be revoked and replaced before deployment.
-- `OPENAI_PROJECT_IDS` blank means the OpenAI organization; a comma-separated list requests only those projects. xAI always covers the configured team. Read the project-filter compatibility note below before relying on scoped totals.
+- Use an existing, newly rotated OpenAI **organization Admin API key** with access to organization costs and an xAI **Management key** with billing-read access for the intended team. Previously disclosed keys must be revoked and replaced before any separately authorized live check or deployment. No credential generation or retrieval is part of the current work.
+- `OPENAI_PROJECT_IDS` blank means the OpenAI organization; a comma-separated list requests only those projects. Scoped responses must identify a requested project on every result. xAI always covers the configured team, without an assumed project breakdown. Live provider acceptance and console reconciliation remain pending.
 - Never paste credentials into chat, source, logs, reports, Git or build arguments. Keep report output and delivery markers on protected persistent storage. `.env`, `.secrets/`, credential files and local reports are Git-ignored and Docker-ignored.
 - Apps Script delivery uses a random shared secret in **two permanent stores only**: Apps Script Script Properties and protected Dokploy environment variables. The existing live TEST deployment already has a configured secret; this publication does not generate, disclose or rotate it. It requires no Desktop OAuth client JSON or Python OAuth tokens. Leave `GOOGLE_OAUTH_*` empty for this backend; earlier OAuth secrets are not used.
 
@@ -266,6 +266,8 @@ This command requires separately authorized, newly rotated provider keys. The re
 
 Python tests mock network calls and cover successful upload, body-signing vectors, invalid signature/expired timestamp rejection responses, duplicate retry, malformed success responses, delivery failures, redirect safety, bounded files and durable snapshot/marker behavior. The Node harness executes the actual `Code.gs` with local doubles for Google services, including Drive, Properties, Utilities and LockService. It exercises authentication, replay expiration, payload tampering, duplicate/conflict handling, partial creation/replacement failures and read-free GET behavior. No test uses a deployment credential or makes production requests.
 
+Billing-accounting verification on 2026-10-10 passed **106 Python tests and 28 Node scenarios**. The isolated Docker image `ai-cost-reporter:billing-validation-20261010` discovered 106 tests: 103 passed and three Node-dependent tests were skipped, with those three passing on the host. With networking disabled, its bundled smoke helper's default plan and non-root demo passed while the unchanged `sleep infinity` command kept the container running. The production command rejected absent billing keys before provider access. Independent GetNewsAPI validation passed 505 tests with 62 infrastructure-dependent skips, and all 148 public source-file hashes matched. No live provider requests, new Google changes or deployment were performed.
+
 Historical local verification on 2026-10-09 passed all 61 Python tests and 28 Node receiver scenarios. The isolated Docker image ran 61 Python tests: 58 passed and three Node-dependent tests were skipped, with those tests passing on the host. A network-disabled container running its default `sleep infinity` command accepted the demo through `docker exec` as the unprivileged reporter user; PDF/JSON files in a named report volume survived container recreation. Temporary test containers and volumes were then removed. The helper passed offline, and `--live` without a process secret failed before network access; no Google POST was performed during those offline checks. Independent GetNewsAPI validation passed 505 tests with 62 infrastructure-dependent skips against a snapshot of its 148 unchanged public source-file hashes. The later user-reported live result is recorded above. Publication is now authorized; Dokploy deployment and billing smoke tests remain pending separate authorization.
 
 The Node harness cannot prove Google's actual runtime, account consent, Drive permissions, redirect behavior, service availability, concurrency or quotas. Use the guarded TEST helper and dedicated private test parent described above to verify actual Google delivery without billing calls. Ordinary demo outputs remain rejected. Offline regression tests cover partial failures, expired/replayed requests and production force replacement; the live TEST helper intentionally forbids replacement. Never log the secret, signature, body or report contents. Provider billing smoke tests require newly rotated billing keys and separate authorization.
@@ -286,13 +288,76 @@ docker run --rm --network none ai-cost-reporter:local python /app/app.py --demo 
 
 The final build argument selects the [Docker build context](https://docs.docker.com/build/concepts/context/); using the repository root as the reporter context would mix the two applications. The existing GetNewsAPI root build remains independent and copies only its explicit application/maintenance paths. The reporter build contains only this service's runtime files.
 
-## Billing compatibility and legacy OAuth backend
+## Billing accounting and completeness
 
-The existing billing implementation is retained. [OpenAI's Costs API](https://developers.openai.com/api/reference/resources/admin/subresources/organization/subresources/usage/methods/costs) documents inclusive starts, exclusive ends, daily USD buckets, project filtering and cursor pagination. [xAI Management Billing](https://docs.x.ai/developers/rest-api-reference/management/billing) documents the team USD analytics endpoint and `limitReached`; truncated responses are rejected. Billing finalization and scope must still be checked with an authorized live request before claiming operational accuracy.
+Billing uses actual provider-recorded USD consumption, with daily and month-to-date totals for the same scope. OpenAI uses `GET https://api.openai.com/v1/organization/costs` with an organization Admin key; [OpenAI's Costs API](https://developers.openai.com/api/reference/resources/admin/subresources/organization/subresources/usage/methods/costs) defines inclusive Unix-second starts, exclusive ends, daily buckets, project filtering and cursor pagination. [Administration guidance](https://developers.openai.com/api/reference/administration/overview) confirms the Admin-key requirement.
 
-**Numeric precision remains an accuracy limitation:** billing responses currently use default `response.json()` floating-point decoding before amounts are converted with `Decimal(str(value))`. High-precision JSON numeric values can lose source digits during decoding; Decimal aggregation cannot restore those digits. This delivery work preserves the existing billing code.
+xAI uses the read-only analytics `POST https://management-api.x.ai/v1/billing/teams/{team_id}/usage` with a separate Management key. The body requests `usd` with `AGGREGATION_SUM`, `TIME_UNIT_DAY`, `groupBy=["description"]`, no additional filters and `timezone="Etc/GMT"`. This POST reads historical usage; it does not update billing settings or make an inference request. The [expanded official billing schema](https://docs.x.ai/developers/rest-api-reference/management/billing.md) defines an exclusive `endTime` and dense daily points, so the request ends at the **next UTC midnight**, including the complete final day. The example ending at `23:59:59` is not used. `limitReached=true` means a truncated result.
 
-**OpenAI project-filter encoding remains a known compatibility check:** offline inspection of installed official Python SDK 1.70.0 showed bracketed arrays (`project_ids[]=...`, `group_by[]=line_item`); the existing `requests` implementation sends repeated unbracketed parameter names. The [official Python API reference](https://developers.openai.com/api/reference/python/resources/admin/subresources/organization/subresources/usage/methods/costs) confirms an array but does not establish server acceptance of the current encoding. This delivery change does not claim live project-scoped totals are verified.
+Provider JSON numeric values now decode directly to `Decimal` from the raw JSON, before any floating-point conversion. Validated exact aggregation preserves source decimal digits and does not depend on the ambient Decimal context. JSON and smoke-summary amounts retain full fixed-point decimal text; PDF monetary display rounds to cents only at presentation. Non-finite or malformed monetary values fail. This corrects the earlier float-decoding precision limitation.
+
+OpenAI arrays use the official SDK's bracketed wire convention: repeated `project_ids[]` and `group_by[]`. The unfiltered request groups by line item; a scoped request also groups by project ID and rejects missing/null IDs or IDs outside the requested list. [The official API reference](https://developers.openai.com/api/reference/resources/admin/subresources/organization/subresources/usage/methods/costs) documents arrays, while offline SDK/request tests establish the chosen serialization. Actual server acceptance and project-scoped totals still need an authorized live check.
+
+Completeness checks are deliberately strict. OpenAI must return unique, correctly bounded daily UTC buckets for every requested month-to-date day and complete pagination with explicit `has_more=false`; a terminal cursor may be null or omitted. An explicit covered bucket with empty results may be zero; missing buckets are unknown. xAI must explicitly return `limitReached=false` and exactly one UTC-midnight point per requested day in **each** unique description series. Empty series collections, missing/duplicate dates, invalid values, incomplete or truncated data fail; they are not converted to $0. The xAI schema does not define an empty series collection as confirmed zero consumption, so the reporter fails closed until that case can be independently established.
+
+[xAI's Management guide](https://docs.x.ai/developers/management-api-guide) distinguishes the Management key from an inference key. Select the minimum team-scoped billing-read access available in the current console and verify its actual permission names before a live check. [Usage Explorer](https://docs.x.ai/console/usage) defaults to USD consumption. Compare usage consumption rather than credit purchases, prepaid balances or invoice amounts including tax. Billing finalization and scope must still be reconciled with an authorized live request before claiming production accuracy.
+
+## Read-only billing smoke check and console reconciliation
+
+[scripts/billing_smoke_test.py](scripts/billing_smoke_test.py) defaults offline. It prints a `prepared_offline` plan for the selected date without reading provider credential, team or project environment values, loading `.env` or making requests. The default date is the previous complete UTC day; an explicit date must also be a completed day. From the service directory:
+
+```powershell
+python .\scripts\billing_smoke_test.py --date 2026-10-06
+```
+
+**Live OpenAI and xAI verification is pending.** Current phases authorize this helper's preparation, offline tests and publication only. Use `--live` only after separate explicit approval, with existing newly rotated credentials and the intended scope supplied privately through process environment variables. It queries both providers through the same validated accounting path as the reporter; there is no provider-selection flag. OpenAI Costs GET and xAI's documented read-only analytics POST are the only allowed requests, with TLS verification, redirects disabled and environment proxy/netrc settings disabled. The helper does not create reports, PDF/JSON files or markers, send notifications, upload to Drive, invoke models or alter billing configuration.
+
+For a future approved local check, use a fresh PowerShell session in the reporter environment. This example reads the two keys and team ID privately, passes them only through named environment variables, and clears the temporary variables and native buffers even on failure. Optional OpenAI project IDs are scope metadata; blank requests the organization. Do not paste credentials into chat or command arguments.
+
+```powershell
+$aiCostBillingInputs = @{}
+$aiCostBillingBuffers = @{}
+try {
+    foreach ($aiCostBillingName in @('OPENAI_ADMIN_KEY', 'XAI_MANAGEMENT_KEY', 'XAI_TEAM_ID')) {
+        $aiCostBillingInputs[$aiCostBillingName] = Read-Host $aiCostBillingName -AsSecureString
+        $aiCostBillingBuffers[$aiCostBillingName] = [Runtime.InteropServices.Marshal]::SecureStringToBSTR($aiCostBillingInputs[$aiCostBillingName])
+        [Environment]::SetEnvironmentVariable(
+            $aiCostBillingName,
+            [Runtime.InteropServices.Marshal]::PtrToStringBSTR($aiCostBillingBuffers[$aiCostBillingName]),
+            'Process'
+        )
+    }
+    $env:OPENAI_PROJECT_IDS = Read-Host 'Exact OpenAI project IDs, comma-separated (blank = organization)'
+    python .\scripts\billing_smoke_test.py --date 2026-10-06 --live
+    if ($LASTEXITCODE -ne 0) { throw 'Billing smoke check failed; inspect the sanitized status.' }
+} finally {
+    foreach ($aiCostBillingName in @('OPENAI_ADMIN_KEY', 'XAI_MANAGEMENT_KEY', 'XAI_TEAM_ID', 'OPENAI_PROJECT_IDS')) {
+        Remove-Item -LiteralPath ('Env:\' + $aiCostBillingName) -ErrorAction SilentlyContinue
+    }
+    foreach ($aiCostBillingBuffer in $aiCostBillingBuffers.Values) {
+        [Runtime.InteropServices.Marshal]::ZeroFreeBSTR($aiCostBillingBuffer)
+    }
+    foreach ($aiCostBillingInput in $aiCostBillingInputs.Values) {
+        $aiCostBillingInput.Dispose()
+    }
+    Remove-Variable aiCostBillingInputs, aiCostBillingBuffers, aiCostBillingName, aiCostBillingBuffer, aiCostBillingInput -ErrorAction SilentlyContinue
+}
+```
+
+The reporter image includes the helper at `/app/scripts/billing_smoke_test.py`. After both deployment and a live check are separately authorized, the corresponding running-container command inherits protected reporter environment settings:
+
+```bash
+docker exec REPORTER_CONTAINER python /app/scripts/billing_smoke_test.py --date 2026-10-06 --live
+```
+
+A successful helper result prints sanitized status, exact USD daily/month-to-date provider and combined totals, the UTC ranges, OpenAI scope, xAI team ID and `generated_at_utc`. This is the local snapshot timestamp after both reads, not provider billing finality; record the console observation time as well. Errors report the fixed `BILLING_SMOKE_FAILED` status without raw provider bodies or traceback text. An API success is a query snapshot, not a reconciled final invoice. Match it against the consoles as follows:
+
+1. Select the same OpenAI organization and exact project list, or all projects for a blank list. Select the configured xAI team with no extra API-key/model filters, using USD consumption rather than tokens or credit purchases.
+2. Use UTC dates for both consoles. For report date `2026-10-06`, daily is `[2026-10-06T00:00:00Z, 2026-10-07T00:00:00Z)`; month-to-date is `[2026-10-01T00:00:00Z, 2026-10-07T00:00:00Z)`. The 09:00 Serbian job schedule does not change these boundaries.
+3. Compare both providers' daily and month-to-date values individually before comparing their combined total. Console display rounding can hide decimal digits; retain the helper's exact text privately and use an exact console export if needed. An exact zero must have explicit covered data; incomplete or empty xAI responses require investigation.
+4. Record the observation time and recheck after late billing or corrections. An ordinary reporter rerun preserves the delivered snapshot. An intentional reconciled replacement requires separately approved `--force-resend`; the read-only helper never modifies that snapshot or Drive.
+
+## Legacy OAuth backend
 
 For existing installations, an unset `GOOGLE_DRIVE_BACKEND` defaults to **`oauth`** for compatibility. The updated public `.env.example` explicitly demonstrates `apps_script` and its two required protected variables, while retaining optional legacy settings. The retained OAuth backend uses `GOOGLE_OAUTH_CLIENT_ID`, `GOOGLE_OAUTH_CLIENT_SECRET`, `GOOGLE_OAUTH_REFRESH_TOKEN` and `GOOGLE_DRIVE_FOLDER_NAME`, with its original `YYYY / YYYY-MM` folder convention. It is configured separately and is unnecessary for Apps Script.
 

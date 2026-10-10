@@ -5,7 +5,7 @@ from __future__ import annotations
 import json
 import tempfile
 import unittest
-from datetime import date, datetime, timezone
+from datetime import date, datetime, timedelta, timezone
 from decimal import Decimal
 from pathlib import Path
 from unittest.mock import patch
@@ -21,6 +21,7 @@ class FakeResponse:
     def __init__(self, data: dict[str, object], status_code: int = 200) -> None:
         '''Store a JSON payload and status code for deterministic tests.'''
         self.data = data
+        self.content = json.dumps(data, separators=(',', ':'), allow_nan=False).encode('utf-8')
         self.status_code = status_code
 
     def raise_for_status(self) -> None:
@@ -56,31 +57,34 @@ class FakeSession:
         return self.post_responses.pop(0)
 
 
+def cost_bucket(day: date, values: list[tuple[str, object, str]] | None = None) -> dict[str, object]:
+    '''Represent a complete documented daily costs bucket, including explicit zero days.'''
+    timestamp = int(datetime(day.year, day.month, day.day, tzinfo=timezone.utc).timestamp())
+    return {'object': 'bucket', 'start_time': timestamp, 'end_time': timestamp + 86400,
+            'results': [{'object': 'organization.costs.result',
+                         'amount': {'value': value, 'currency': currency}, 'line_item': label,
+                         'project_id': None}
+                        for label, value, currency in (values or [])]}
+
+
+def zero_buckets() -> list[dict[str, object]]:
+    '''Supply provider-explicit zero records for each requested month-to-date day.'''
+    return [cost_bucket(date(2026, 10, day)) for day in range(1, 7)]
+
+
 class OpenAIBillingTests(unittest.TestCase):
     '''Validate OpenAI cost aggregation and pagination.'''
 
     def test_pagination_and_daily_month_to_date(self) -> None:
         '''Sum the requested date only for daily, and all month buckets for MTD.'''
+        prior = zero_buckets()[:5]
+        prior[4] = cost_bucket(date(2026, 10, 5), [('Prior', '5.0', 'usd')])
+        current = cost_bucket(date(2026, 10, 6), [('Tokens', '1.1111', 'usd'), ('Tools', '2.22', 'usd')])
         session = FakeSession(get_responses=[
-            FakeResponse({
-                'data': [
-                    {'start_time': 1791158400, 'results': [
-                        {'amount': {'value': 5.0, 'currency': 'usd'}, 'line_item': 'Prior'}
-                    ]},
-                    {'start_time': 1791244800, 'results': [
-                        {'amount': {'value': 1.1111, 'currency': 'usd'}, 'line_item': 'Tokens'}
-                    ]},
-                ],
-                'has_more': True,
-                'next_page': 'cursor-2',
-            }),
-            FakeResponse({
-                'data': [{'start_time': 1791244800, 'results': [
-                    {'amount': {'value': 2.22, 'currency': 'usd'}, 'line_item': 'Tools'}
-                ]}],
-                'has_more': False,
-                'next_page': None,
-            }),
+            FakeResponse({'object': 'page', 'data': prior,
+                          'has_more': True, 'next_page': 'cursor-2'}),
+            FakeResponse({'object': 'page', 'data': [current],
+                          'has_more': False, 'next_page': None}),
         ])
         spend = app.fetch_openai_costs(session, 'test-secret', date(2026, 10, 6))
         self.assertEqual(spend.daily, Decimal('3.3311'))
@@ -90,11 +94,10 @@ class OpenAIBillingTests(unittest.TestCase):
 
     def test_invalid_currency_is_rejected(self) -> None:
         '''Never mix currencies or silently record a zero in place of spend.'''
+        buckets = zero_buckets()
+        buckets[5] = cost_bucket(date(2026, 10, 6), [('Tokens', '1', 'eur')])
         session = FakeSession(get_responses=[FakeResponse({
-            'data': [{'start_time': 1791244800, 'results': [
-                {'amount': {'value': 1, 'currency': 'eur'}}
-            ]}],
-            'has_more': False,
+            'object': 'page', 'data': buckets, 'has_more': False, 'next_page': None,
         })])
         with self.assertRaisesRegex(app.ReporterError, 'non-USD'):
             app.fetch_openai_costs(session, 'test-secret', date(2026, 10, 6))
@@ -115,11 +118,14 @@ class XAIBillingTests(unittest.TestCase):
             'limitReached': False,
             'timeSeries': [
                 {'groupLabels': ['Grok A'], 'dataPoints': [
-                    {'timestamp': '2026-10-05T00:00:00Z', 'values': [3.5]},
-                    {'timestamp': '2026-10-06T00:00:00Z', 'values': [1.1111]},
+                    {'timestamp': f'2026-10-{day:02d}T00:00:00Z',
+                     'values': [{5: '3.5', 6: '1.1111'}.get(day, '0')]}
+                    for day in range(1, 7)
                 ]},
                 {'groupLabels': ['Grok B'], 'dataPoints': [
-                    {'timestamp': '2026-10-06T00:00:00Z', 'values': [2.22]},
+                    {'timestamp': f'2026-10-{day:02d}T00:00:00Z',
+                     'values': ['2.22' if day == 6 else '0']}
+                    for day in range(1, 7)
                 ]},
             ],
         })])
@@ -129,6 +135,7 @@ class XAIBillingTests(unittest.TestCase):
         self.assertEqual(spend.daily_breakdown['Grok B'], Decimal('2.22'))
         payload = session.post_json[0]['analyticsRequest']
         self.assertEqual(payload['timeRange']['timezone'], 'Etc/GMT')
+        self.assertEqual(payload['timeRange']['endTime'], '2026-10-07 00:00:00')
         self.assertEqual(payload['values'][0]['name'], 'usd')
 
     def test_reject_truncated_usage(self) -> None:
@@ -235,10 +242,13 @@ class DocumentAndDeliveryTests(unittest.TestCase):
 
     def test_optional_project_scope_sent_to_openai(self) -> None:
         '''Ensure an optional project filter is sent to the costs endpoint.'''
-        session = FakeSession(get_responses=[FakeResponse({'data': [], 'has_more': False})])
+        session = FakeSession(get_responses=[FakeResponse({
+            'object': 'page', 'data': zero_buckets(), 'has_more': False, 'next_page': None,
+        })])
         project_ids = ('proj_example123',)
         app.fetch_openai_costs(session, 'dummy-token', date(2026, 10, 6), project_ids)
-        self.assertEqual(session.get_params[0]['project_ids'], list(project_ids))
+        self.assertEqual(session.get_params[0]['project_ids[]'], list(project_ids))
+        self.assertEqual(session.get_params[0]['group_by[]'], ['line_item', 'project_id'])
 
     def test_drive_marker_prevents_repeated_upload(self) -> None:
         '''The same UTC report must not be repeatedly uploaded on schedule retries.'''

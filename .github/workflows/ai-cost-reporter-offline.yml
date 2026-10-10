@@ -40,6 +40,10 @@ jobs:
         run: python app.py --demo --date 2026-10-06 --output-dir ./reports
       - name: Build the independent reporter image
         run: docker build --file Dockerfile --tag ai-cost-reporter:ci .
+      - name: Validate the read-only billing command without networking
+        run: >-
+          docker run --rm --network none ai-cost-reporter:ci
+          python /app/scripts/billing_smoke_test.py --date 2026-10-06
       - name: Validate the container without networking
         run: >-
           docker run --rm --network none ai-cost-reporter:ci

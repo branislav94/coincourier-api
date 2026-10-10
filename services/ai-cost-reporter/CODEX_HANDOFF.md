@@ -12,16 +12,38 @@ The user reports live TEST status `api_confirmed`: three authenticated successes
 
 The reported [TEST folder](https://drive.google.com/drive/folders/131uquIdcNrqVymYjPsVJYhxAI61eM14l) contains the reported files `ai-cost-report-TEST-2026-10-06.pdf` and `ai-cost-report-TEST-2026-10-06.json`. **Independent owner inspection remains pending:** confirm the two files, visible TEST content and no duplicate copies. The owner should then manually set `AI_COST_TEST_UPLOADS_ENABLED=false` or remove it; this change is not confirmed.
 
-The user now authorizes commit `Complete AI Cost Reporter Google Drive integration` and a non-force push to `origin/dev`, limited to the reviewed reporter changes. The earlier migration was published at `0de106d`; publication receipts for this follow-up are reported separately, without predicting a new commit hash here. Keep the original `api-test` checkout and pending files untouched. Dokploy deployment, production configuration/scheduling, further Google changes and billing smoke tests remain outside this authorization. No configured secret is read, printed, generated or rotated.
+The Google integration was published at `7786e1d`, following the earlier migration at `0de106d`. Current phases 1–3 authorize billing-accounting corrections, offline validation, preparation of a read-only billing smoke helper, then commit `Correct AI Cost Reporter billing accounting` and a non-force push to `origin/dev`. Publication receipts are reported separately, without predicting a new commit hash here. Keep the original `api-test` checkout and pending files untouched. Live provider requests, Dokploy deployment, production configuration/scheduling and further Google changes remain outside this authorization. No configured secret is read, printed, generated or rotated.
 
-## Publication verification on 2026-10-10
+## Current billing-accounting corrections
+
+- Provider numeric JSON decodes directly to Decimal from raw JSON, correcting the pre-existing float-decoding digit loss. Validated aggregation uses exact arithmetic independent of the ambient Decimal context; `usd_text` keeps full fixed-point decimal text in JSON/smoke summaries while PDF monetary display rounds cents only at presentation.
+- OpenAI uses the official SDK-style bracketed array parameters. Scoped requests include project grouping and reject missing/null/unrequested result project IDs; unique exact daily UTC buckets and completed pagination are required for the complete month-to-date interval. Terminal `next_page` may be null or omitted only with explicit `has_more=false` and complete coverage.
+- xAI uses the documented read-only historical analytics POST with exclusive next-day midnight end, `Etc/GMT`, USD SUM and daily granularity. Every unique description series must contain every requested UTC-midnight day exactly once; explicit `limitReached=false` is required. Empty collections, missing/duplicate/out-of-range days and truncated data fail closed.
+- `scripts/billing_smoke_test.py [--date YYYY-MM-DD] [--live]` defaults to an offline plan without reading provider environment values or making requests. Explicit `--live` is prepared for a future separately approved check, using both providers through the same accounting code, fixed read-only endpoints, TLS verification and no redirects/environment proxy/netrc settings. It writes no reports, files or markers and performs no uploads, notifications, inference or billing mutations.
+- The helper is included in the reporter image at `/app/scripts/billing_smoke_test.py`. A future approved container check uses `python /app/scripts/billing_smoke_test.py --date 2026-10-06 --live` through `docker exec`, with protected environment already configured. Current work does not run it live.
+- A successful future check includes `generated_at_utc`, the local snapshot timestamp after both provider reads, along with exact daily/month-to-date totals and scopes. This does not establish provider billing finality; compare against console observations with their own timestamps.
+- Live OpenAI and xAI status is pending. The synthetic Google result does not verify provider auth, query scope, monetary accuracy, completeness, billing latency or console reconciliation. README documents the future private environment setup, exact UTC daily/month-to-date comparison and delayed-billing procedure.
+
+## Current billing-phase validation on 2026-10-10
+
+The reviewed billing corrections passed offline checks before the authorized publication. The actual commit/push receipt is reported separately.
+
+- Host Python: **106/106 passed**, including dedicated billing-correctness and read-only smoke tests. Separate Node receiver suite: **28/28 passed**.
+- Docker image `ai-cost-reporter:billing-validation-20261010` built successfully, ID `sha256:fc45b1ddd82944b299401de41bf8f19a4886c1c6bcae98ed3997ddaddb372c97`. Its suite discovered 106 tests: **103 passed, three Node-dependent tests skipped**; those three passed on the host.
+- With networking disabled, the bundled smoke helper's default offline plan and non-root demo passed. The unchanged `sleep infinity` command kept the container running for `docker exec`. The exact production command failed safely on absent billing keys before provider access.
+- Independent GetNewsAPI regression validation passed **505 tests with 62 infrastructure-dependent skips**. All **148 public source-file hashes** matched the existing application; its functions, dependencies, database/Compose and production configuration remain unchanged.
+- No live OpenAI/xAI requests, credential inspection/generation, new Google operation, Dokploy deployment or production scheduling was performed. Live provider acceptance and console reconciliation remain pending separate approval.
+
+The following older integration results are retained as historical context.
+
+## Historical Google-integration verification on 2026-10-10
 
 The reviewed integration passed the full offline rerun for the authorized publication. These checks validate the changes; the actual commit/push receipt is reported separately.
 
 - All 61 Python tests and all 28 mocked Node receiver scenarios passed.
 - The isolated Docker suite passed 58 tests and skipped three Node-dependent tests, which passed on the host.
 - Independent GetNewsAPI regression validation passed 505 tests with 62 infrastructure-dependent skips. Existing news application sources and configuration remain unchanged.
-- Billing code was preserved. The read-only accuracy audit identified the existing numeric-decoding precision limitation below; live billing and project-filter acceptance remain unverified.
+- At that integration stage billing code was preserved. Its read-only audit identified float-decoding and array-wire compatibility issues subsequently corrected by the current billing-accounting work. Live billing and project-filter acceptance remain unverified.
 
 ## Historical offline TEST preparation on 2026-10-09
 
@@ -44,7 +66,7 @@ These checks preceded the user-reported live result. At that time the changes we
 
 ## Delivery-verification and publication boundaries
 
-Current work publishes the reviewed reporter integration after the user-reported guarded TEST check. The user authorizes the stated commit and non-force push to `origin/dev`, while Dokploy deployment, production configuration changes and OpenAI/xAI billing requests remain separately authorized actions. The original `api-test` checkout, current branch and pending log/diff files remain untouched; never display their contents, stash, reset, modify or commit them. Private fingerprints may verify preservation.
+Current work publishes reviewed billing-accounting corrections and offline smoke preparation after the completed Google integration. The user authorizes the stated commit and non-force push to `origin/dev`, while Dokploy deployment, production configuration changes and OpenAI/xAI billing requests remain separately authorized actions. The original `api-test` checkout, current branch and pending log/diff files remain untouched; never display their contents, stash, reset, modify or commit them. Private fingerprints may verify preservation.
 
 The receiver's TEST extension retains protocol v1. It uses signed `ai-cost-report-TEST-YYYY-MM-DD.pdf/json` filenames and JSON `data_type=SYNTHETIC_DELIVERY_TEST` with `test_namespace`, bound by the signed raw JSON hash. Normal actual-report semantics and ordinary demo rejection remain unchanged. TEST requires `replace=false` and both Google Script Properties `AI_COST_TEST_UPLOADS_ENABLED=true` and `AI_COST_TEST_PARENT_FOLDER_ID`. Files go only to the dedicated private parent at `AI Cost Reporter Tests/<namespace>/YYYY/MM`; there is no production-parent or My Drive-root fallback.
 
@@ -86,11 +108,15 @@ These results belong to the original standalone source project before migration.
 
 ## Billing implementation and open accuracy checks
 
-Existing OpenAI pagination/line-item aggregation, xAI USD analytics/truncation checks, daily and month-to-date reporting and explicit scope remain intact. Both provider responses must succeed. UTC report days are independent of the job's Serbian execution timezone; billing may be delayed or adjusted.
+Daily/month-to-date actual provider USD reporting, explicit project/team scope and complete UTC days remain the accounting semantics. Both provider responses must succeed and pass completeness checks. UTC report days are independent of the job's Serbian execution timezone; billing may be delayed or adjusted.
 
-The existing `response_json()` path calls `response.json()` with default floating-point decoding before amounts become `Decimal(str(value))`. High-precision JSON numbers can lose source digits before Decimal aggregation, which cannot recover them. This is a remaining billing accuracy limitation; the implementation was deliberately preserved.
+The earlier default `response.json()` float decoding is replaced with raw JSON Decimal parsing. Exact aggregation prevents source digit loss before reporting and avoids ambient Decimal-context rounding. Monetary schema/currency/non-finite checks fail explicitly. This is verified offline, not by querying real billing.
 
-Official OpenAI REST/Python docs confirm `project_ids` is an array. Offline inspection of installed official OpenAI Python SDK **1.70.0** showed bracketed query names (`project_ids[]=...` and `group_by[]=line_item`); the existing `requests` path emits repeated unbracketed names. Server acceptance of that encoding and live project-scoped accuracy remain unverified. Treat this as a separate compatibility check; do not claim live scoped totals are correct from offline mocks.
+The [official OpenAI Costs reference](https://developers.openai.com/api/reference/resources/admin/subresources/organization/subresources/usage/methods/costs) defines project/group arrays and an inclusive start/exclusive end. The updated request uses the official SDK's bracketed names (`project_ids[]` and `group_by[]`) and scoped project grouping/identity checks. SDK-aligned serialization is verified offline; server acceptance and live project-scoped accuracy remain unverified.
+
+The [full xAI billing schema](https://docs.x.ai/developers/rest-api-reference/management/billing.md) explicitly defines exclusive `endTime` and dense points. A complete day therefore ends at the next midnight, rather than `23:59:59`. Empty `timeSeries` is not documented as verified zero, so the current policy treats it as unknown and fails closed. Use minimum team-scoped billing-read access and verify the actual permission names offered by the current console.
+
+After separate approval, use existing newly rotated provider keys privately and run the helper for a complete day. Compare exact daily/month-to-date amounts with both consoles using the same UTC periods and project/team scope, not purchases, balances or tax-inclusive invoices. Capture the observation timestamp and recheck delayed billing. Preserve existing snapshots; a deliberate replacement uses separately approved `--force-resend`. No provider live result or console reconciliation is claimed yet.
 
 ## Next verification steps
 
@@ -106,8 +132,8 @@ Official OpenAI REST/Python docs confirm `project_ids` is an array. Offline insp
 3. From the CoinCourier API repository root, build with `docker build -f services/ai-cost-reporter/Dockerfile -t ai-cost-reporter:local services/ai-cost-reporter`. Run its offline container demo with networking disabled; preserve the unchanged `python /app/app.py` scheduled command in its independent application. Verify Dokploy's installed scheduler supports `Europe/Belgrade` and displays the expected next local 09:00 execution before enabling its schedule.
 4. The user-reported TEST result already establishes helper response validation for that invocation. Keep the existing script editor, secret and target folder private; no new receiver deployment or setup is part of publication. Future manual Google changes require explanation and separate authorization. No Desktop OAuth JSON is used.
 5. The owner must independently inspect the reported TEST PDF/JSON and confirm no duplicates, then manually disable/remove `AI_COST_TEST_UPLOADS_ENABLED`. These actions remain unconfirmed. Later separately authorized TEST checks use the documented guarded helper, dedicated namespace and `replace=false`. Node doubles cover partial failures and other protocol cases but do not establish Google concurrency or quotas.
-6. Before production billing smoke tests, revoke and replace previously disclosed OpenAI/xAI keys. Use only authorized, newly rotated credentials. Verify BOTH billing providers and intended scope/UTC periods; log only safe status/amount summaries. Do not assert live compatibility from documentation alone.
-7. Complete the authorized publication with commit message `Complete AI Cost Reporter Google Drive integration` and a non-force push to `origin/dev`, after staged-file review and credential-safe scans. Report the actual publication receipt separately. Do not deploy Dokploy, enable a production schedule, alter GetNewsAPI or query billing providers.
+6. Current work prepares the billing helper but makes no provider requests. After separate live approval, use existing newly rotated keys supplied privately through process environment only; do not read credential files or generate/retrieve keys. Run `scripts/billing_smoke_test.py --date 2026-10-06 --live` to verify BOTH providers, then compare exact daily/month-to-date UTC amounts and scope with the consoles. Log only sanitized status/amount summaries. Previously disclosed keys must be revoked/replaced; do not assert live compatibility from offline tests.
+7. Complete the authorized publication with commit message `Correct AI Cost Reporter billing accounting` and a non-force push to `origin/dev`, after staged-file review and credential-safe scans. Report the actual publication receipt separately. Do not deploy Dokploy, enable a production schedule, alter GetNewsAPI or query billing providers.
 
 ## Operational details
 

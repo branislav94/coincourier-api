@@ -20,7 +20,8 @@ reports
 example
 pdf-render
 tests
-scripts
+scripts/*
+!scripts/billing_smoke_test.py
 *.zip
 *.pdf
 *.delivery.json
