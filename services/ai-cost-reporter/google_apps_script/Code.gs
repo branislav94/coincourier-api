@@ -30,7 +30,9 @@ function doPost(e) {
     }
     aiCostCheckTime_(request.timestamp);
     const decoded = request.files.map(aiCostDecode_);
-    aiCostValidateContents_(request.report_date, decoded);
+    const route = aiCostValidateContents_(request.report_date, decoded);
+    if (route.mode === 'test' && request.replace) aiCostFail_('invalid_request');
+    const testParentId = route.mode === 'test' ? aiCostTestParentId_(properties) : null;
 
     lock = LockService.getScriptLock();
     locked = lock.tryLock(10000);
@@ -38,13 +40,16 @@ function doPost(e) {
     // Recheck after waiting; the same lock protects nonces, folders and files.
     aiCostCheckTime_(request.timestamp);
     aiCostRememberNonce_(properties, request);
-    const parentId = properties.getProperty('AI_COST_PARENT_FOLDER_ID');
+    const parentId = route.mode === 'test'
+      ? testParentId : properties.getProperty('AI_COST_PARENT_FOLDER_ID');
     if (parentId && !aiCostMatches_(parentId, /^[A-Za-z0-9_-]{1,256}$/)) {
       aiCostFail_('configuration_error');
     }
     const parent = parentId ? DriveApp.getFolderById(parentId) : DriveApp.getRootFolder();
-    const root = aiCostFolder_(parent, 'AI Infrastructure Costs');
-    const year = aiCostFolder_(root, request.report_date.slice(0, 4));
+    const root = aiCostFolder_(parent, route.mode === 'test'
+      ? 'AI Cost Reporter Tests' : 'AI Infrastructure Costs');
+    const destination = route.mode === 'test' ? aiCostFolder_(root, route.namespace) : root;
+    const year = aiCostFolder_(destination, request.report_date.slice(0, 4));
     const month = aiCostFolder_(year, request.report_date.slice(5, 7));
     // Preflight BOTH names before writing either artifact. Never pick an arbitrary
     // duplicate or silently accept another report's content under the same name.
@@ -86,10 +91,16 @@ function doPost(e) {
       }
       files[index === 0 ? 'pdf' : 'json'] = {id: id, name: file.name, sha256: file.sha256};
     });
-    return aiCostResponse_({
+    const response = {
       ok: true, version: 1, report_date: request.report_date,
       duplicate: plans.every(function (plan) { return plan.unchanged; }), files: files
-    });
+    };
+    if (route.mode === 'test') {
+      response.mode = 'test';
+      response.test_namespace = route.namespace;
+      response.folder_id = month.getId();
+    }
+    return aiCostResponse_(response);
   } catch (error) {
     // Never return/log exception text, request bodies, signatures, secrets or Drive details.
     return aiCostResponse_({ok: false, error: error.aiCostCode || 'storage_failure'});
@@ -146,7 +157,9 @@ function aiCostParse_(e) {
     aiCostKeys_(file, ['name', 'mime_type', 'size', 'sha256', 'content_base64']);
     const extension = index === 0 ? 'pdf' : 'json';
     const limit = index === 0 ? AI_COST_MAX_PDF_BYTES : AI_COST_MAX_JSON_BYTES;
-    if (file.name !== 'ai-cost-report-' + day + '.' + extension ||
+    const productionName = 'ai-cost-report-' + day + '.' + extension;
+    const testName = 'ai-cost-report-TEST-' + day + '.' + extension;
+    if ((file.name !== productionName && file.name !== testName) ||
         file.mime_type !== 'application/' + extension ||
         !Number.isSafeInteger(file.size) || file.size < 1 || file.size > limit ||
         !aiCostMatches_(file.sha256, /^[0-9a-f]{64}$/) ||
@@ -156,6 +169,9 @@ function aiCostParse_(e) {
       aiCostFail_('invalid_request');
     }
   });
+  const testNames = request.files[0].name === 'ai-cost-report-TEST-' + day + '.pdf';
+  const jsonName = (testNames ? 'ai-cost-report-TEST-' : 'ai-cost-report-') + day + '.json';
+  if (request.files[1].name !== jsonName) aiCostFail_('invalid_request');
   return request;
 }
 
@@ -182,7 +198,7 @@ function aiCostDecode_(file) {
     sha256: file.sha256, bytes: bytes};
 }
 
-/** Check PDF markers and the reporter's live JSON date/provider metadata. */
+/** Check PDF markers and hash-authenticated production or test JSON metadata. */
 function aiCostValidateContents_(day, files) {
   const pdf = files[0].bytes;
   const head = aiCostAscii_(pdf.slice(0, 5));
@@ -196,11 +212,34 @@ function aiCostValidateContents_(day, files) {
   let report;
   try { report = JSON.parse(text); } catch (error) { aiCostFail_('invalid_request'); }
   if (!aiCostObject_(report) || report.report_date_utc !== day ||
-      report.data_type !== 'PROVIDER_REPORTED_API_SPEND' || report.currency !== 'USD' ||
+      report.currency !== 'USD' ||
       !aiCostObject_(report.providers) || !aiCostObject_(report.providers.openai) ||
       !aiCostObject_(report.providers.xai)) {
     aiCostFail_('invalid_request');
   }
+  const testNames = files[0].name === 'ai-cost-report-TEST-' + day + '.pdf';
+  if (testNames) {
+    if (report.data_type !== 'SYNTHETIC_DELIVERY_TEST' ||
+        !aiCostMatches_(report.test_namespace, /^test-[a-z0-9](?:[a-z0-9-]{0,46}[a-z0-9])?$/)) {
+      aiCostFail_('invalid_request');
+    }
+    return {mode: 'test', namespace: report.test_namespace};
+  }
+  if (report.data_type !== 'PROVIDER_REPORTED_API_SPEND') aiCostFail_('invalid_request');
+  return {mode: 'production'};
+}
+
+/** Test uploads never fall back to the production parent or owner Drive root. */
+function aiCostTestParentId_(properties) {
+  if (properties.getProperty('AI_COST_TEST_UPLOADS_ENABLED') !== 'true') {
+    aiCostFail_('test_uploads_disabled');
+  }
+  const parentId = properties.getProperty('AI_COST_TEST_PARENT_FOLDER_ID');
+  if (!aiCostMatches_(parentId, /^[A-Za-z0-9_-]{1,256}$/) ||
+      parentId === properties.getProperty('AI_COST_PARENT_FOLDER_ID')) {
+    aiCostFail_('configuration_error');
+  }
+  return parentId;
 }
 
 /** Keep a durable nonce until its signed timestamp leaves the acceptance window. */

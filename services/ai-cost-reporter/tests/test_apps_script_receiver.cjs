@@ -95,6 +95,27 @@ function envelope(options = {}) {
   });
 }
 
+function testEnvelope(options = {}) {
+  const namespace = options.namespace || 'test-offline-safety';
+  const synthetic = record({ data_type: 'SYNTHETIC_DELIVERY_TEST', test_namespace: namespace,
+    notes: ['SYNTHETIC DELIVERY TEST: no provider billing records were fetched.'] });
+  const request = envelope({ ...options, record: options.record || synthetic });
+  request.files.forEach((file, index) => {
+    file.name = `ai-cost-report-TEST-${REPORT_DATE}.${index === 0 ? 'pdf' : 'json'}`;
+  });
+  return sign(request);
+}
+
+function enableTestUploads(receiver) {
+  receiver.state.lockHeld = true;
+  const parent = receiver.root.createFolder('PRIVATE SYNTHETIC VERIFICATION');
+  receiver.state.lockHeld = false;
+  receiver.state.driveOperations = 0;
+  receiver.state.properties.set('AI_COST_TEST_UPLOADS_ENABLED', 'true');
+  receiver.state.properties.set('AI_COST_TEST_PARENT_FOLDER_ID', parent.id);
+  return parent;
+}
+
 function runtime(options = {}) {
   const state = {
     now: options.now || NOW,
@@ -569,9 +590,143 @@ test('future-skew nonce remains reserved until its full acceptance window ends',
   assert.equal(receiver.state.properties.has('AI_COST_NONCE_' + request.nonce), true);
 });
 
+test('synthetic uploads are disabled by default before any Drive operation', () => {
+  rejectedBeforeDrive(testEnvelope());
+  for (const enabled of ['TRUE', '1', 'true\n', 'false']) {
+    const receiver = runtime();
+    enableTestUploads(receiver);
+    receiver.state.properties.set('AI_COST_TEST_UPLOADS_ENABLED', enabled);
+    assert.equal(receiver.post(testEnvelope()).ok, false);
+    assert.equal(receiver.state.driveOperations, 0);
+  }
+});
+
+test('synthetic uploads require a configured test parent before Drive access', () => {
+  for (const parentId of [null, '', '../other-folder', 'invalid\n']) {
+    const receiver = runtime();
+    enableTestUploads(receiver);
+    if (parentId === null) receiver.state.properties.delete('AI_COST_TEST_PARENT_FOLDER_ID');
+    else receiver.state.properties.set('AI_COST_TEST_PARENT_FOLDER_ID', parentId);
+    assert.equal(receiver.post(testEnvelope()).ok, false);
+    assert.equal(receiver.state.driveOperations, 0);
+  }
+  const sameParent = runtime();
+  const configured = enableTestUploads(sameParent);
+  sameParent.state.properties.set('AI_COST_PARENT_FOLDER_ID', configured.id);
+  assert.equal(sameParent.post(testEnvelope()).ok, false);
+  assert.equal(sameParent.state.driveOperations, 0);
+});
+
+test('test uploads and fresh retries remain under their private namespace and retain IDs', () => {
+  const receiver = runtime();
+  const parent = enableTestUploads(receiver);
+  const first = receiver.post(testEnvelope());
+  assert.equal(first.ok, true);
+  assert.equal(first.mode, 'test');
+  assert.equal(first.test_namespace, 'test-offline-safety');
+  assert.equal(first.duplicate, false);
+  const repeated = receiver.post(testEnvelope());
+  assert.equal(repeated.ok, true);
+  assert.equal(repeated.duplicate, true);
+  assert.deepEqual(repeated.files, first.files);
+  assert.equal(repeated.folder_id, first.folder_id);
+  assert.equal(receiver.state.files.length, 2);
+  assert.deepEqual(receiver.state.folders.map(folder => folder.name), [
+    'My Drive', 'PRIVATE SYNTHETIC VERIFICATION', 'AI Cost Reporter Tests',
+    'test-offline-safety', '2026', '10',
+  ]);
+  assert.equal(parent.folders[0].name, 'AI Cost Reporter Tests');
+  assert.equal(receiver.state.folders.some(folder => folder.name === 'AI Infrastructure Costs'), false);
+  for (const file of receiver.state.files) {
+    assert.equal(file.parent.id, first.folder_id);
+    assert.equal(file._name().includes('-TEST-'), true);
+  }
+});
+
+test('an invalid test signature cannot create files or consume a nonce before valid retry', () => {
+  const receiver = runtime();
+  enableTestUploads(receiver);
+  const valid = testEnvelope();
+  const invalid = { ...valid, signature: '0'.repeat(64) };
+  assert.equal(receiver.post(invalid).ok, false);
+  assert.equal(receiver.state.driveOperations, 0);
+  assert.equal(receiver.state.properties.has('AI_COST_NONCE_' + valid.nonce), false);
+  assert.equal(receiver.post(valid).ok, true);
+  assert.equal(receiver.state.files.length, 2);
+});
+
+test('test expiry and replay fail without extra Drive operations', () => {
+  const receiver = runtime();
+  enableTestUploads(receiver);
+  assert.equal(receiver.post(testEnvelope({ timestamp: NOW - 301 })).ok, false);
+  assert.equal(receiver.state.driveOperations, 0);
+  const request = testEnvelope();
+  assert.equal(receiver.post(request).ok, true);
+  const previousOperations = receiver.state.driveOperations;
+  assert.equal(receiver.post(request).ok, false);
+  assert.equal(receiver.state.driveOperations, previousOperations);
+});
+
+test('test naming, synthetic provenance, namespace and replacement gates are independent', () => {
+  const mutations = [
+    request => { request.files[0].name = `ai-cost-report-${REPORT_DATE}.pdf`; },
+    request => { request.replace = true; },
+  ];
+  for (const mutate of mutations) {
+    const receiver = runtime();
+    enableTestUploads(receiver);
+    const request = testEnvelope();
+    mutate(request);
+    assert.equal(receiver.post(sign(request)).ok, false);
+    assert.equal(receiver.state.driveOperations, 0);
+  }
+  for (const override of [
+    { data_type: 'PROVIDER_REPORTED_API_SPEND' },
+    { test_namespace: '../production' }, { test_namespace: 'test-UPPER' },
+    { test_namespace: 'test-name\n' }, { test_namespace: '' },
+  ]) {
+    const receiver = runtime();
+    enableTestUploads(receiver);
+    const synthetic = record({ data_type: 'SYNTHETIC_DELIVERY_TEST',
+      test_namespace: 'test-offline-safety', ...override });
+    assert.equal(receiver.post(testEnvelope({ record: synthetic })).ok, false);
+    assert.equal(receiver.state.driveOperations, 0);
+  }
+  const normalNames = envelope({ record: record({ data_type: 'SYNTHETIC_DELIVERY_TEST',
+    test_namespace: 'test-offline-safety' }) });
+  const receiver = runtime();
+  enableTestUploads(receiver);
+  assert.equal(receiver.post(normalNames).ok, false);
+  assert.equal(receiver.state.driveOperations, 0);
+});
+
+test('test-mode configuration cannot change ordinary production report routing', () => {
+  const receiver = runtime();
+  const testParent = enableTestUploads(receiver);
+  const normal = receiver.post(envelope());
+  assert.equal(normal.ok, true);
+  assert.equal(receiver.root.folders.some(folder => folder.name === 'AI Infrastructure Costs'), true);
+  assert.equal(testParent.folders.length, 0);
+  assert.equal(normal.mode, undefined);
+  assert.equal(receiver.state.files.every(file => !file._name().includes('-TEST-')), true);
+});
+
+test('partial test-pair failure retries preserve one pair within the test namespace', () => {
+  const receiver = runtime();
+  enableTestUploads(receiver);
+  receiver.state.failCreate = 2;
+  assert.equal(receiver.post(testEnvelope()).ok, false);
+  assert.equal(receiver.state.files.length, 1);
+  receiver.state.failCreate = 0;
+  assert.equal(receiver.post(testEnvelope()).ok, true);
+  assert.equal(receiver.state.files.length, 2);
+  assert.equal(receiver.state.folders.some(folder => folder.name === 'AI Infrastructure Costs'), false);
+});
+
 if (process.argv.includes('--request')) {
   const input = JSON.parse(fs.readFileSync(0, 'utf8'));
   const receiver = runtime({ now: input.now || NOW });
+  if (input.enable_test_uploads) enableTestUploads(receiver);
   const response = receiver.post(input.envelope);
   process.stdout.write(JSON.stringify({ response,
     drive_operations: receiver.state.driveOperations,

@@ -31,6 +31,8 @@ _NONCE = re.compile(r'[0-9a-f]{32}\Z', re.ASCII)
 _TIMESTAMP = re.compile(r'(0|[1-9][0-9]{0,10})\Z', re.ASCII)
 _FILE_ID = re.compile(r'[A-Za-z0-9_-]{1,256}\Z', re.ASCII)
 _DEPLOYMENT_PATH = re.compile(r'/macros/s/[A-Za-z0-9_-]{1,256}/exec\Z', re.ASCII)
+_TEST_NAMESPACE = re.compile(r'test-[a-z0-9](?:[a-z0-9-]{0,46}[a-z0-9])?\Z', re.ASCII)
+TEST_DATA_TYPE = 'SYNTHETIC_DELIVERY_TEST'
 
 
 class AppsScriptDeliveryError(RuntimeError):
@@ -67,6 +69,8 @@ def canonical_string(envelope: Mapping[str, Any]) -> str:
     The HMAC key is the UTF-8 bytes of the literal 64-character hexadecimal
     secret, not the decoded random bytes. File hashes cover the raw file bytes;
     neither base64 content nor JSON formatting is included in this string.
+    Test mode and namespace are authenticated by the JSON hash; they add
+    no unsigned routing fields or additional canonical signing lines.
     '''
     try:
         files = envelope['files']
@@ -81,12 +85,16 @@ def canonical_string(envelope: Mapping[str, Any]) -> str:
                 or not isinstance(files, list) or len(files) != 2):
             raise ValueError('Invalid signing fields')
         date_text = envelope['report_date']
+        if not isinstance(files[0], dict):
+            raise ValueError('Invalid file signing fields')
+        is_test = files[0].get('name') == f'ai-cost-report-TEST-{date_text}.pdf'
+        filename_prefix = 'ai-cost-report-TEST-' if is_test else 'ai-cost-report-'
         lines = [CANONICAL_PREFIX, envelope['timestamp'], envelope['nonce'],
                  date_text, '1' if envelope['replace'] else '0']
         for index, (extension, mime_type, maximum) in enumerate(FILE_TYPES):
             item = files[index]
             if (not isinstance(item, dict)
-                    or item.get('name') != f'ai-cost-report-{date_text}.{extension}'
+                    or item.get('name') != f'{filename_prefix}{date_text}.{extension}'
                     or item.get('mime_type') != mime_type
                     or type(item.get('size')) is not int or not 0 < item['size'] <= maximum
                     or not isinstance(item.get('sha256'), str)
@@ -141,40 +149,56 @@ def _read_artifact(path: Path, expected_name: str, maximum: int) -> bytes:
     return content
 
 
-def build_envelope(
-    report_date: date, pdf_path: Path, json_path: Path, secret: str,
-    replace: bool = False, *, timestamp: str | None = None, nonce: str | None = None,
-) -> dict[str, Any]:
-    '''Validate artifacts and create a fresh authenticated upload request.
+def validate_test_namespace(namespace: str) -> None:
+    '''Require an ASCII test-prefixed slug that cannot traverse Drive hierarchy.'''
+    if not isinstance(namespace, str) or _TEST_NAMESPACE.fullmatch(namespace) is None:
+        raise AppsScriptDeliveryError('Test namespace must be a test-prefixed lowercase slug of 6-53 characters')
 
-    Timestamp/nonce overrides exist for offline cross-language protocol vectors.
-    Publication always uses the current timestamp and a cryptographically random
-    nonce, including when retrying after a response was lost.
-    '''
+
+def _validate_report_metadata(
+    report: Any, date_text: str, test_namespace: str | None = None,
+) -> None:
+    '''Keep production provenance strict and validate separately labeled test data.'''
+    expected_type = TEST_DATA_TYPE if test_namespace is not None else 'PROVIDER_REPORTED_API_SPEND'
+    if (not isinstance(report, dict) or report.get('data_type') != expected_type
+            or report.get('currency') != 'USD' or report.get('report_date_utc') != date_text
+            or not isinstance(report.get('providers'), dict)
+            or not all(isinstance(report['providers'].get(provider), dict)
+                       for provider in ('openai', 'xai'))):
+        raise AppsScriptDeliveryError('JSON artifact is not the expected provider billing report'
+                                      if test_namespace is None else 'JSON artifact is not a synthetic delivery test')
+    if test_namespace is not None:
+        validate_test_namespace(test_namespace)
+        if report.get('test_namespace') != test_namespace:
+            raise AppsScriptDeliveryError('JSON artifact does not match the test namespace')
+
+
+def _build_report_envelope(
+    report_date: date, pdf_path: Path, json_path: Path, secret: str, replace: bool,
+    timestamp: str | None, nonce: str | None, test_namespace: str | None,
+) -> dict[str, Any]:
+    '''Build one bounded V1 request with mode authenticated through file bytes.'''
     _validate_secret(secret)
     if (type(report_date) is not date or report_date < date(2000, 1, 1)
             or report_date >= datetime.now(timezone.utc).date()):
         raise AppsScriptDeliveryError('Report date must be a completed UTC day from 2000 onward')
     if type(replace) is not bool:
         raise AppsScriptDeliveryError('Report replacement flag must be a boolean')
+    if test_namespace is not None:
+        validate_test_namespace(test_namespace)
+        if replace:
+            raise AppsScriptDeliveryError('Synthetic delivery tests cannot replace Drive files')
     date_text = report_date.isoformat()
+    filename_prefix = 'ai-cost-report-TEST-' if test_namespace is not None else 'ai-cost-report-'
     files: list[dict[str, Any]] = []
     for index, (extension, mime_type, maximum) in enumerate(FILE_TYPES):
-        filename = f'ai-cost-report-{date_text}.{extension}'
+        filename = f'{filename_prefix}{date_text}.{extension}'
         content = _read_artifact(Path((pdf_path, json_path)[index]), filename, maximum)
         if extension == 'pdf':
             if not content.startswith(b'%PDF-') or b'%%EOF' not in content[-1024:]:
                 raise AppsScriptDeliveryError('PDF report artifact has an invalid format')
         else:
-            report = _strict_json(content, 'Report artifact')
-            if (not isinstance(report, dict)
-                    or report.get('data_type') != 'PROVIDER_REPORTED_API_SPEND'
-                    or report.get('currency') != 'USD'
-                    or report.get('report_date_utc') != date_text
-                    or not isinstance(report.get('providers'), dict)
-                    or not all(isinstance(report['providers'].get(provider), dict)
-                               for provider in ('openai', 'xai'))):
-                raise AppsScriptDeliveryError('JSON artifact is not the expected provider billing report')
+            _validate_report_metadata(_strict_json(content, 'Report artifact'), date_text, test_namespace)
         files.append({'name': filename, 'mime_type': mime_type, 'size': len(content),
                       'sha256': hashlib.sha256(content).hexdigest(),
                       'content_base64': base64.b64encode(content).decode('ascii')})
@@ -184,6 +208,64 @@ def build_envelope(
                 'report_date': date_text, 'replace': replace, 'files': files}
     envelope['signature'] = sign_envelope(envelope, secret)
     return envelope
+
+
+def build_envelope(
+    report_date: date, pdf_path: Path, json_path: Path, secret: str,
+    replace: bool = False, *, timestamp: str | None = None, nonce: str | None = None,
+) -> dict[str, Any]:
+    '''Build a production-only upload; synthetic data stays rejected.
+
+    Timestamp/nonce overrides exist for offline protocol vectors. Ordinary
+    publication uses fresh authentication, including on duplicate retries.
+    '''
+    return _build_report_envelope(report_date, pdf_path, json_path, secret, replace,
+                                  timestamp, nonce, None)
+
+
+def build_test_envelope(
+    report_date: date, pdf_path: Path, json_path: Path, secret: str, test_namespace: str,
+    *, timestamp: str | None = None, nonce: str | None = None,
+) -> dict[str, Any]:
+    '''Build a separately labeled synthetic upload, using the unchanged V1 signer.'''
+    return _build_report_envelope(report_date, pdf_path, json_path, secret, False,
+                                  timestamp, nonce, test_namespace)
+
+
+def _test_envelope_namespace(envelope: Mapping[str, Any]) -> str:
+    '''Validate a test request before sending without preempting remote auth checks.'''
+    canonical_string(envelope)
+    if (set(envelope) != {'version', 'timestamp', 'nonce', 'report_date', 'replace', 'files', 'signature'}
+            or envelope['replace'] is not False
+            or not isinstance(envelope.get('signature'), str)
+            or _HEX_SECRET.fullmatch(envelope['signature']) is None):
+        raise AppsScriptDeliveryError('Synthetic delivery test envelope is invalid')
+    date_text = envelope['report_date']
+    report: Any = None
+    for index, (extension, mime_type, maximum) in enumerate(FILE_TYPES):
+        item = envelope['files'][index]
+        encoded = item.get('content_base64')
+        if (set(item) != {'name', 'mime_type', 'size', 'sha256', 'content_base64'}
+                or item['name'] != f'ai-cost-report-TEST-{date_text}.{extension}'
+                or not isinstance(encoded, str) or len(encoded) != 4 * ((item['size'] + 2) // 3)):
+            raise AppsScriptDeliveryError('Synthetic delivery test artifact is invalid')
+        try:
+            content = base64.b64decode(encoded, validate=True)
+        except (ValueError, UnicodeError):
+            raise AppsScriptDeliveryError('Synthetic delivery test artifact has invalid base64') from None
+        if (len(content) != item['size'] or len(content) > maximum
+                or base64.b64encode(content).decode('ascii') != encoded
+                or hashlib.sha256(content).hexdigest() != item['sha256']):
+            raise AppsScriptDeliveryError('Synthetic delivery test artifact integrity is invalid')
+        if extension == 'pdf':
+            if not content.startswith(b'%PDF-') or b'%%EOF' not in content[-1024:]:
+                raise AppsScriptDeliveryError('PDF report artifact has an invalid format')
+        else:
+            report = _strict_json(content, 'Report artifact')
+    namespace = report.get('test_namespace') if isinstance(report, dict) else None
+    validate_test_namespace(namespace)
+    _validate_report_metadata(report, date_text, namespace)
+    return namespace
 
 
 class AppsScriptPublisher:
@@ -257,7 +339,7 @@ class AppsScriptPublisher:
             code = data.get('error')
             safe_codes = {'invalid_request', 'invalid_signature', 'expired_timestamp',
                           'replayed_request', 'replay_capacity', 'storage_failure',
-                          'conflict', 'duplicates', 'busy', 'configuration_error'}
+                          'conflict', 'duplicates', 'busy', 'configuration_error', 'test_uploads_disabled'}
             if isinstance(code, str) and code in safe_codes:
                 raise AppsScriptDeliveryError(f'Apps Script delivery rejected: {code}')
             raise AppsScriptDeliveryError('Apps Script response did not confirm successful delivery')
@@ -281,12 +363,9 @@ class AppsScriptPublisher:
             raise AppsScriptDeliveryError('Apps Script response did not identify two distinct report files')
         return result
 
-    def publish(
-        self, report_date: date, pdf_path: Path, json_path: Path, replace: bool = False,
-    ) -> dict[str, str]:
-        '''Publish both reports; a new attempt uses a fresh timestamp and nonce.'''
-        envelope = build_envelope(report_date, pdf_path, json_path, self.secret, replace)
-        body = json.dumps(envelope, ensure_ascii=True, separators=(',', ':'),
+    def _submit(self, envelope: Mapping[str, Any]) -> bytes:
+        '''Send one bounded V1 envelope with the established safe response transport.'''
+        body = json.dumps(dict(envelope), ensure_ascii=True, separators=(',', ':'),
                           allow_nan=False).encode('utf-8')
         if len(body) > MAX_REQUEST_BYTES:
             raise AppsScriptDeliveryError('Apps Script request exceeds its size limit')
@@ -297,7 +376,39 @@ class AppsScriptPublisher:
                 destination = self._redirect_url(response)
                 response.close()
                 response = self._request('GET', destination)
-            response_body = self._response_body(response)
+            return self._response_body(response)
         finally:
             response.close()
-        return self._validate_result(response_body, envelope)
+
+    def publish(
+        self, report_date: date, pdf_path: Path, json_path: Path, replace: bool = False,
+    ) -> dict[str, str]:
+        '''Publish actual provider reports; retries use fresh timestamps and nonces.'''
+        envelope = build_envelope(report_date, pdf_path, json_path, self.secret, replace)
+        return self._validate_result(self._submit(envelope), envelope)
+
+    def submit_test_envelope(self, envelope: Mapping[str, Any]) -> dict[str, Any]:
+        '''Send an isolated test request, including intentional auth-rejection checks.
+
+        Do not verify/recompute the HMAC or enforce timestamp age locally: the
+        authenticated receiver must demonstrate signature, expiry and replay
+        rejection. Test labels, namespace, bounds and file hashes stay required.
+        '''
+        namespace = _test_envelope_namespace(envelope)
+        body = self._submit(envelope)
+        files = self._validate_result(body, envelope)
+        data = _strict_json(body, 'Apps Script response')
+        folder_id = data.get('folder_id')
+        if (data.get('mode') != 'test' or data.get('test_namespace') != namespace
+                or not isinstance(folder_id, str) or _FILE_ID.fullmatch(folder_id) is None
+                or folder_id in files.values()):
+            raise AppsScriptDeliveryError('Apps Script response did not confirm isolated test delivery')
+        return {**files, 'folder_id': folder_id, 'test_namespace': namespace,
+                'duplicate': data['duplicate']}
+
+    def publish_test(
+        self, report_date: date, pdf_path: Path, json_path: Path, test_namespace: str,
+    ) -> dict[str, Any]:
+        '''Upload explicitly synthetic files to a separately configured test hierarchy.'''
+        envelope = build_test_envelope(report_date, pdf_path, json_path, self.secret, test_namespace)
+        return self.submit_test_envelope(envelope)
