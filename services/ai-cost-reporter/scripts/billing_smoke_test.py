@@ -35,6 +35,8 @@ COMPLETENESS_CODES = frozenset({
     'incomplete_coverage', 'pagination_invalid', 'pagination_limit', 'response_truncated',
     'no_accounting_data', 'duplicate_data', 'out_of_range_day', 'aggregation_mismatch',
 })
+MAX_NORMAL_AMOUNT_METADATA = 16
+MAX_FLAGGED_AMOUNT_METADATA = 64
 
 
 class BillingSmokeError(RuntimeError):
@@ -47,6 +49,40 @@ class SafeArgumentParser(argparse.ArgumentParser):
     def error(self, message: str) -> None:
         '''Reject invalid CLI input without echoing an accidentally supplied secret.'''
         raise BillingSmokeError('Invalid arguments')
+
+
+class AmountMetadataCollector:
+    '''Keep bounded numeric shapes, prioritizing amounts that failed the earlier policy.'''
+
+    def __init__(self) -> None:
+        '''Allocate counters and samples only when explicitly selected by the operator.'''
+        self.observed_amount_count = 0
+        self.normal: list[dict[str, Any]] = []
+        self.flagged: list[dict[str, Any]] = []
+        self.amount_metadata_truncated = False
+
+    def observe(self, metadata: dict[str, Any]) -> None:
+        '''Accept only independently sanitized field paths, enums and bounded numeric statistics.'''
+        safe = app.sanitize_amount_metadata(metadata)
+        if safe is None:
+            raise app.ReporterError('Invalid numeric diagnostic metadata',
+                                    code='response_schema_invalid', stage='schema')
+        self.observed_amount_count += 1
+        flagged = safe['validation_rule'] != 'accepted' or safe['legacy_validation_rule'] is not None
+        target = self.flagged if flagged else self.normal
+        limit = MAX_FLAGGED_AMOUNT_METADATA if flagged else MAX_NORMAL_AMOUNT_METADATA
+        if len(target) < limit:
+            target.append(safe)
+        else:
+            self.amount_metadata_truncated = True
+
+    def summary(self) -> dict[str, Any]:
+        '''Return numeric shapes without amounts, response contents or configuration values.'''
+        return {
+            'observed_amount_count': self.observed_amount_count,
+            'amount_metadata': self.flagged + self.normal,
+            'amount_metadata_truncated': self.amount_metadata_truncated,
+        }
 
 
 def schema_metadata(response: requests.Response | None, query_mode: str) -> dict[str, Any]:
@@ -331,7 +367,7 @@ def diagnostic_failure(error: Exception, session: ReadOnlyBillingSession | None)
                         safe_missing.append(value)
                 except ValueError:
                     continue
-    return {
+    result = {
         **evidence, 'status': 'failed', 'failure_stage': stage, 'failure_code': code,
         'error_category': category,
         'authentication_rejected': category == 'authentication_rejected',
@@ -344,6 +380,11 @@ def diagnostic_failure(error: Exception, session: ReadOnlyBillingSession | None)
         'accounting_state': 'UNKNOWN',
         'daily_usage_state': 'unknown', 'month_to_date_usage_state': 'unknown',
     }
+    if 'amount_metadata' in details:
+        metadata = app.sanitize_amount_metadata(details['amount_metadata'])
+        if metadata is not None:
+            result['amount_metadata'] = metadata
+    return result
 
 
 def billing_evidence(spend: app.ProviderSpend, provider: str) -> str:
@@ -422,19 +463,27 @@ def validate_management_key(session: ReadOnlyBillingSession, management_key: str
     return {'key_scope': scopes.get(scope, 'unknown'), 'team_linkage': linkage}
 
 
-def diagnose_openai(report_date: date) -> dict[str, dict[str, Any]]:
+def diagnose_openai(report_date: date, *, include_amount_metadata: bool = False) -> dict[str, dict[str, Any]]:
     '''Read OpenAI costs independently while retaining the configured project scope.'''
     session = None
+    collector = AmountMetadataCollector() if include_amount_metadata else None
     try:
         configuration = app.validate_openai_billing_configuration(report_date)
         with ReadOnlyBillingSession(None, diagnostic=True, provider='openai') as session:
+            options = {'amount_observer': collector.observe} if collector is not None else {}
             spend = app.fetch_openai_costs(session, configuration.admin_key,
-                                          report_date, configuration.project_ids)
+                                          report_date, configuration.project_ids, **options)
             result = diagnostic_cost_success(spend, session, provider='openai')
         result['openai_scope'] = 'selected_projects' if configuration.project_ids else 'organization'
         result['configured_project_count'] = len(configuration.project_ids)
     except Exception as error:
         result = diagnostic_failure(error, session)
+    if collector is not None:
+        # Rejected amount metadata is retained separately even if bounded
+        # sampling omitted it. A successful read can explain the legacy guard.
+        if isinstance(result.get('amount_metadata'), dict):
+            result['failed_amount_metadata'] = result.pop('amount_metadata')
+        result.update(collector.summary())
     return {'openai_costs': result}
 
 
@@ -479,14 +528,15 @@ def diagnose_xai(report_date: date) -> dict[str, dict[str, Any]]:
     return {'xai_management_key_validation': key_result, 'xai_billing': billing_result}
 
 
-def diagnose_billing(report_date: date, provider: str = 'both') -> dict[str, Any]:
+def diagnose_billing(report_date: date, provider: str = 'both',
+                     *, include_amount_metadata: bool = False) -> dict[str, Any]:
     '''Collect independent read-only checks without creating a combined cost report.'''
     app.validate_billing_date(report_date)
-    if provider not in {'both', 'openai', 'xai'}:
+    if provider not in {'both', 'openai', 'xai'} or (include_amount_metadata and provider == 'xai'):
         raise BillingSmokeError('Invalid provider selection')
     checks = {}
     if provider in {'both', 'openai'}:
-        checks.update(diagnose_openai(report_date))
+        checks.update(diagnose_openai(report_date, include_amount_metadata=include_amount_metadata))
     if provider in {'both', 'xai'}:
         checks.update(diagnose_xai(report_date))
     accepted = all(check['status'] in {'costs_confirmed', 'key_confirmed', 'recorded_usage_absent'}
@@ -513,11 +563,15 @@ def main(argv: list[str] | None = None) -> int:
                         help='Report safe, independent provider checks instead of a combined cost read')
     parser.add_argument('--provider', choices=('both', 'openai', 'xai'),
                         help='Select diagnostic checks; defaults to both, requires --diagnostic')
+    parser.add_argument('--amount-metadata', action='store_true',
+                        help='Include bounded OpenAI numeric types, digit counts, exponents and validation rules')
     args = None
     try:
         args = parser.parse_args(argv)
         if args.provider is not None and not args.diagnostic:
             raise BillingSmokeError('Provider selection requires diagnostics')
+        if args.amount_metadata and (not args.diagnostic or args.provider == 'xai'):
+            raise BillingSmokeError('Amount metadata requires OpenAI diagnostics')
         try:
             report_date = (date.fromisoformat(args.date) if args.date else
                            datetime.now(timezone.utc).date() - timedelta(days=1))
@@ -525,11 +579,20 @@ def main(argv: list[str] | None = None) -> int:
             raise app.ReporterError('Invalid report date', code='invalid_report_date', stage='preflight') from None
         app.validate_billing_date(report_date)
         if args.diagnostic and args.live:
-            result = diagnose_billing(report_date, args.provider or 'both')
+            result = diagnose_billing(report_date, args.provider or 'both',
+                                      include_amount_metadata=args.amount_metadata)
         else:
             result = read_billing_costs(report_date) if args.live else offline_plan(report_date)
             if args.diagnostic:
                 result.update({'diagnostic': True, 'provider_selection': args.provider or 'both'})
+                if args.amount_metadata:
+                    result['numeric_diagnostics'] = {
+                        'enabled': True, 'provider': 'openai',
+                        'metadata_only': True,
+                        'max_normal_samples': MAX_NORMAL_AMOUNT_METADATA,
+                        'max_flagged_samples': MAX_FLAGGED_AMOUNT_METADATA,
+                        'scope': 'Keep the existing OPENAI_PROJECT_IDS configuration unchanged',
+                    }
                 selected = args.provider or 'both'
                 result['required_environment'] = (
                     ['OPENAI_ADMIN_KEY'] if selected == 'openai' else

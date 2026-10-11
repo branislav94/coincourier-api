@@ -18,7 +18,7 @@ from decimal import Context, Decimal, DecimalException, ROUND_HALF_EVEN, localco
 from email.message import EmailMessage
 from pathlib import Path
 from tempfile import NamedTemporaryFile
-from typing import Any, Iterable, Iterator, Mapping
+from typing import Any, Callable, Iterable, Iterator, Mapping
 
 import requests
 from filelock import FileLock, Timeout
@@ -47,6 +47,10 @@ OPENAI_COSTS_URL = 'https://api.openai.com/v1/organization/costs'
 XAI_BASE_URL = 'https://management-api.x.ai'
 MAX_MONEY_DIGITS = 1024
 MAX_MONEY_EXPONENT = 256
+MAX_OPENAI_AMOUNT_DIGITS = 1024
+MAX_ACCOUNTING_AMOUNT_DIGITS = 1536
+MAX_ACCOUNTING_AMOUNT_SCALE = 1024
+MAX_ACCOUNTING_ADJUSTED_EXPONENT = 256
 MAX_BILLING_RESPONSE_BYTES = 16 * 1024 * 1024
 MAX_BILLING_ROWS = 100000
 MAX_BILLING_PAGES = 1000
@@ -65,6 +69,55 @@ NOTES = (
     'subscriptions and server hosting are not included. Totals use unrounded '
     'values; independently rounded lines can differ by a cent.'
 )
+
+
+_AMOUNT_METADATA_KEYS = frozenset({
+    'numeric_type', 'decimal_digit_count', 'exponent', 'adjusted_exponent', 'finite',
+    'validation_rule', 'legacy_validation_rule', 'response_field_path',
+})
+_AMOUNT_TYPES = frozenset({'decimal', 'integer', 'string', 'float', 'boolean', 'null', 'other'})
+_AMOUNT_RULES = frozenset({
+    'accepted', 'numeric_type', 'numeric_syntax', 'numeric_text_length', 'decimal_conversion',
+    'non_finite', 'coefficient_precision', 'fractional_scale', 'magnitude',
+})
+_LEGACY_AMOUNT_RULES = frozenset({
+    'coefficient_precision', 'decimal_exponent', 'adjusted_exponent', 'non_finite', 'type', 'syntax',
+})
+
+
+def sanitize_amount_metadata(value: object) -> dict[str, Any] | None:
+    '''Copy only fixed numeric shape diagnostics, never monetary digits or provider fields.'''
+    if not isinstance(value, dict) or set(value) != _AMOUNT_METADATA_KEYS:
+        return None
+    if not isinstance(value['numeric_type'], str) or value['numeric_type'] not in _AMOUNT_TYPES:
+        return None
+    if not isinstance(value['validation_rule'], str) or value['validation_rule'] not in _AMOUNT_RULES:
+        return None
+    legacy = value['legacy_validation_rule']
+    if legacy is not None and (not isinstance(legacy, str) or legacy not in _LEGACY_AMOUNT_RULES):
+        return None
+    count = value['decimal_digit_count']
+    if count is not None and (type(count) is not int or not 0 <= count <= 1000000000):
+        return None
+    for name in ('exponent', 'adjusted_exponent'):
+        number = value[name]
+        if number is not None and (type(number) is not int or not -10 ** 18 <= number <= 10 ** 18):
+            return None
+    if value['finite'] is not None and type(value['finite']) is not bool:
+        return None
+    path = value['response_field_path']
+    if not isinstance(path, str) or len(path) > 100:
+        return None
+    match = re.fullmatch(
+        r'pages\[(0|[1-9][0-9]{0,9})\]\.data\[(0|[1-9][0-9]{0,9})\]'
+        r'\.results\[(0|[1-9][0-9]{0,9})\]\.amount\.value', path, re.ASCII,
+    )
+    if match is None or any(int(index) > 1000000000 for index in match.groups()):
+        return None
+    return {name: value[name] for name in (
+        'numeric_type', 'decimal_digit_count', 'exponent', 'adjusted_exponent', 'finite',
+        'validation_rule', 'legacy_validation_rule', 'response_field_path',
+    )}
 
 
 class ReporterError(RuntimeError):
@@ -102,6 +155,9 @@ class ReporterError(RuntimeError):
         status = details.get('http_status')
         if type(status) is int and 100 <= status <= 599:
             self.details['http_status'] = status
+        amount_metadata = sanitize_amount_metadata(details.get('amount_metadata'))
+        if amount_metadata is not None:
+            self.details['amount_metadata'] = amount_metadata
         missing = details.get('missing_utc_days')
         if isinstance(missing, (list, tuple)) and len(missing) <= 31:
             valid_dates: list[str] = []
@@ -309,9 +365,147 @@ def decimal_value(value: object, context: str) -> Decimal:
     return result
 
 
+def _amount_numeric_type(value: object) -> str:
+    '''Classify source types without converting or representing the supplied value.'''
+    if value is None:
+        return 'null'
+    if isinstance(value, bool):
+        return 'boolean'
+    if isinstance(value, Decimal):
+        return 'decimal'
+    if isinstance(value, int):
+        return 'integer'
+    if isinstance(value, str):
+        return 'string'
+    if isinstance(value, float):
+        return 'float'
+    return 'other'
+
+
+def _legacy_amount_rule(amount: Decimal) -> str | None:
+    '''Describe the original bounds without normalizing or rounding a Decimal.'''
+    if not amount.is_finite():
+        return 'non_finite'
+    number = amount.as_tuple()
+    if len(number.digits) > MAX_MONEY_DIGITS:
+        return 'coefficient_precision'
+    if abs(number.exponent) > MAX_MONEY_EXPONENT:
+        return 'decimal_exponent'
+    if abs(amount.adjusted()) > MAX_MONEY_EXPONENT:
+        return 'adjusted_exponent'
+    return None
+
+
+def _canonical_amount(amount: Decimal) -> Decimal:
+    '''Remove insignificant zeros by tuple construction, independent of Decimal context.'''
+    if amount.is_zero():
+        return Decimal('0')
+    number = amount.as_tuple()
+    end = len(number.digits)
+    while number.digits[end - 1] == 0:
+        end -= 1
+    if end == len(number.digits):
+        return amount
+    return Decimal((number.sign, number.digits[:end], number.exponent + len(number.digits) - end))
+
+
+def _bounded_accounting_amount(
+    value: object, context: str, max_digits: int, *,
+    field_path: str | None = None, observer: Callable[[dict[str, Any]], None] | None = None,
+) -> Decimal:
+    '''Check precision, fractional scale and magnitude independently using exact tuples.'''
+    metadata: dict[str, Any] = {
+        'numeric_type': _amount_numeric_type(value), 'decimal_digit_count': None,
+        'exponent': None, 'adjusted_exponent': None, 'finite': None,
+        'validation_rule': 'accepted', 'legacy_validation_rule': None,
+        'response_field_path': field_path,
+    }
+
+    def publish_metadata(rule: str) -> dict[str, Any] | None:
+        '''Expose a bounded shape copy; never expose source values through the callback.'''
+        metadata['validation_rule'] = rule
+        safe = sanitize_amount_metadata(metadata)
+        if observer is not None and safe is not None:
+            try:
+                observer(dict(safe))
+            except Exception:
+                raise ReporterError(
+                    'OpenAI amount diagnostic observer failed', code='internal_error', stage='amount',
+                ) from None
+        return safe
+
+    def reject(rule: str) -> None:
+        '''Raise one fixed failure with optional sanitized amount shape diagnostics.'''
+        safe = publish_metadata(rule)
+        raise ReporterError(
+            f'{context}: invalid or unbounded exact USD amount', code='invalid_usd_amount', stage='amount',
+            details={'amount_metadata': safe} if safe is not None else None,
+        ) from None
+
+    if isinstance(value, bool) or not isinstance(value, (int, str, Decimal)):
+        metadata['legacy_validation_rule'] = 'type'
+        reject('numeric_type')
+    if isinstance(value, str):
+        if len(value) > max_digits * 2:
+            metadata['legacy_validation_rule'] = 'syntax'
+            reject('numeric_text_length')
+        if re.fullmatch(r'-?(?:0|[1-9][0-9]*)(?:\.[0-9]+)?(?:[eE][+-]?[0-9]+)?', value, re.ASCII) is None:
+            metadata['legacy_validation_rule'] = 'syntax'
+            reject('numeric_syntax')
+    try:
+        amount = value if isinstance(value, Decimal) else Decimal(value)
+    except (DecimalException, ValueError, OverflowError):
+        reject('decimal_conversion')
+    number = amount.as_tuple()
+    metadata['decimal_digit_count'] = len(number.digits)
+    metadata['finite'] = amount.is_finite()
+    if amount.is_finite():
+        for name, number_value in (('exponent', number.exponent), ('adjusted_exponent', amount.adjusted())):
+            if -10 ** 18 <= number_value <= 10 ** 18:
+                metadata[name] = number_value
+    metadata['legacy_validation_rule'] = _legacy_amount_rule(amount)
+    if not amount.is_finite():
+        reject('non_finite')
+    canonical = _canonical_amount(amount)
+    number = canonical.as_tuple()
+    if len(number.digits) > max_digits:
+        reject('coefficient_precision')
+    if max(0, -number.exponent) > MAX_ACCOUNTING_AMOUNT_SCALE:
+        reject('fractional_scale')
+    if canonical.adjusted() > MAX_ACCOUNTING_ADJUSTED_EXPONENT:
+        reject('magnitude')
+    publish_metadata('accepted')
+    # Existing valid amounts retain their exact representation and snapshot text.
+    return amount if metadata['legacy_validation_rule'] is None else canonical
+
+
+def openai_decimal_value(
+    value: object, *, field_path: str,
+    observer: Callable[[dict[str, Any]], None] | None = None,
+) -> Decimal:
+    '''Read exact OpenAI money with bounded significant digits, scale and magnitude.'''
+    probe = {
+        'numeric_type': 'other', 'decimal_digit_count': None, 'exponent': None,
+        'adjusted_exponent': None, 'finite': None, 'validation_rule': 'accepted',
+        'legacy_validation_rule': None, 'response_field_path': field_path,
+    }
+    if sanitize_amount_metadata(probe) is None:
+        raise ReporterError(
+            'OpenAI amount diagnostic field path is invalid', code='response_schema_invalid', stage='schema',
+        )
+    return _bounded_accounting_amount(
+        value, 'OpenAI', MAX_OPENAI_AMOUNT_DIGITS, field_path=field_path, observer=observer,
+    )
+
+
+def accounting_output_decimal_value(value: object, context: str) -> Decimal:
+    '''Bound exact derived costs while allowing wider coefficients from source aggregation.'''
+    return _bounded_accounting_amount(value, context, MAX_ACCOUNTING_AMOUNT_DIGITS)
+
+
 def exact_sum(values: Iterable[Decimal]) -> Decimal:
     '''Sum bounded decimal coefficients with integers, independent of ambient context.'''
-    amounts = [decimal_value(value, 'Cost aggregation') for value in values]
+    amounts = [accounting_output_decimal_value(value, 'Cost aggregation') for value in values]
     if not amounts:
         return Decimal('0')
     if len(amounts) > MAX_BILLING_ROWS:
@@ -327,24 +521,26 @@ def exact_sum(values: Iterable[Decimal]) -> Decimal:
     total = 0
     for amount in amounts:
         number = amount.as_tuple()
-        coefficient = int(''.join(str(digit) for digit in number.digits))
+        coefficient = 0
+        for digit in number.digits:
+            coefficient = coefficient * 10 + digit
         if number.sign:
             coefficient = -coefficient
         total += coefficient * (10 ** (number.exponent - exponent))
-    digits = tuple(int(character) for character in str(abs(total)))
+    digits = Decimal(abs(total)).as_tuple().digits
     result = Decimal((int(total < 0), digits, exponent))
-    return decimal_value(result, 'Cost aggregation')
+    return accounting_output_decimal_value(result, 'Cost aggregation')
 
 
 def usd_text(amount: Decimal) -> str:
     '''Format exact USD values without rounding or context-dependent exponent text.'''
-    return format(decimal_value(amount, 'Cost serialization'), 'f')
+    return format(accounting_output_decimal_value(amount, 'Cost serialization'), 'f')
 
 
 def money(amount: Decimal) -> str:
     '''Round cents explicitly with half-even rules only at presentation time.'''
-    amount = decimal_value(amount, 'Cost presentation')
-    with localcontext(Context(prec=MAX_MONEY_DIGITS, rounding=ROUND_HALF_EVEN)):
+    amount = accounting_output_decimal_value(amount, 'Cost presentation')
+    with localcontext(Context(prec=MAX_ACCOUNTING_AMOUNT_DIGITS, rounding=ROUND_HALF_EVEN)):
         rounded = amount.quantize(Decimal('0.01'), rounding=ROUND_HALF_EVEN)
         return f'${rounded:,.2f}'
 
@@ -421,7 +617,8 @@ def response_json(response: requests.Response, provider: str) -> Mapping[str, An
 
 def fetch_openai_costs(
     session: requests.Session, admin_key: str, report_date: date,
-    project_ids: tuple[str, ...] = (),
+    project_ids: tuple[str, ...] = (), *,
+    amount_observer: Callable[[dict[str, Any]], None] | None = None,
 ) -> ProviderSpend:
     '''Read complete UTC cost buckets, verifying project scope and pagination.'''
     start_time, end_time = billing_period_utc(report_date)
@@ -447,7 +644,7 @@ def fetch_openai_costs(
     breakdown_costs: dict[str, list[Decimal]] = {}
     seen_pages: set[str] = set()
     seen_buckets: set[int] = set()
-    for _ in range(MAX_BILLING_PAGES):
+    for page_index in range(MAX_BILLING_PAGES):
         try:
             response = session.get(OPENAI_COSTS_URL,
                                    headers={'Authorization': f'Bearer {admin_key}'},
@@ -469,7 +666,7 @@ def fetch_openai_costs(
                 'OpenAI billing response omitted cost buckets',
                 code='response_schema_invalid', stage='schema',
             )
-        for bucket in buckets:
+        for bucket_index, bucket in enumerate(buckets):
             if (not isinstance(bucket, dict) or bucket.get('object') != 'bucket'
                     or not isinstance(bucket.get('results'), list)):
                 raise ReporterError(
@@ -492,7 +689,7 @@ def fetch_openai_costs(
                 )
             seen_buckets.add(timestamp)
             seen_items: set[tuple[str | None, str | None]] = set()
-            for result in bucket['results']:
+            for result_index, result in enumerate(bucket['results']):
                 if (not isinstance(result, dict) or result.get('object') != 'organization.costs.result'
                         or not isinstance(result.get('amount'), dict)):
                     raise ReporterError(
@@ -524,7 +721,12 @@ def fetch_openai_costs(
                         'OpenAI returned a non-USD billing amount',
                         code='unsupported_currency', stage='amount',
                     )
-                cost = decimal_value(amount.get('value'), 'OpenAI')
+                cost = openai_decimal_value(
+                    amount.get('value'),
+                    field_path=(f'pages[{page_index}].data[{bucket_index}].results[{result_index}]'
+                                '.amount.value'),
+                    observer=amount_observer,
+                )
                 all_costs.append(cost)
                 if len(all_costs) > MAX_BILLING_ROWS:
                     raise ReporterError(
@@ -856,10 +1058,11 @@ def report_from_dict(data: Mapping[str, Any], expected_date: date) -> BillingRep
                 'Stored inactive report accounting metadata is incomplete or unsupported',
                 code='response_schema_invalid', stage='schema',
             )
+        amount_reader = accounting_output_decimal_value if name == 'openai' else decimal_value
         spend = ProviderSpend(
-            daily=decimal_value(record.get('daily_usd'), name),
-            month_to_date=decimal_value(record.get('month_to_date_usd'), name),
-            daily_breakdown={str(key): decimal_value(value, name)
+            daily=amount_reader(record.get('daily_usd'), name),
+            month_to_date=amount_reader(record.get('month_to_date_usd'), name),
+            daily_breakdown={str(key): amount_reader(value, name)
                              for key, value in breakdown.items()},
             accounting_evidence=record.get('accounting_evidence'),
             accounting_state=record.get('accounting_state', RECORDED_SPENDING),
@@ -894,9 +1097,9 @@ def report_from_dict(data: Mapping[str, Any], expected_date: date) -> BillingRep
         generated_at=created_at,
         openai_project_ids=tuple(project_ids),
     )
-    if decimal_value(data.get('daily_total_usd'), 'Stored total') != report.daily_total:
+    if accounting_output_decimal_value(data.get('daily_total_usd'), 'Stored total') != report.daily_total:
         raise ReporterError('Stored daily cost total disagrees with provider totals')
-    if decimal_value(data.get('month_to_date_total_usd'), 'Stored MTD total') != report.month_to_date_total:
+    if accounting_output_decimal_value(data.get('month_to_date_total_usd'), 'Stored MTD total') != report.month_to_date_total:
         raise ReporterError('Stored month-to-date total disagrees with provider totals')
     return report
 

@@ -260,7 +260,12 @@ class BillingReaderErrorTests(unittest.TestCase):
             body = openai_page()
             body['data'][5]['results'] = [record(value)]
             error = self.failure(lambda: self.openai(body), 'invalid_usd_amount', 'amount')
-            self.assertEqual(error.details, {})
+            self.assertEqual(set(error.details), {'amount_metadata'})
+            metadata = error.details['amount_metadata']
+            self.assertEqual(app.sanitize_amount_metadata(metadata), metadata)
+            self.assertEqual(metadata['response_field_path'], 'pages[0].data[5].results[0].amount.value')
+            self.assertNotEqual(metadata['validation_rule'], 'accepted')
+            self.assertNotIn('offline-private-value-marker', repr(error.details))
             self.assertNotIn('offline-private-value-marker', str(error))
         body = openai_page()
         body['data'][5]['results'] = [record('1')]
