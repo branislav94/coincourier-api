@@ -22,7 +22,7 @@ import gpt_processor
 import publish_to_wp
 from publishing.models import PublicationArticle, PublicationContext, PublicationResult
 from publishing.service import PublishingService, build_publication_key
-from publishing.wordpress import persistence, publisher
+from publishing.wordpress import persistence, publisher, seo
 from repositories.publication import PublicationClaim, PublicationRepository
 from repositories.raw_news import ProcessingClaim, RawNewsRepository
 from repositories.state import claim_prefix, is_claim_deadlock, safe_error_message
@@ -41,6 +41,12 @@ ARTICLE = {
     "seo_focus": "Durable focus",
     "seo_meta": "Durable description",
     "seo_canonical": "https://canonical.example/one",
+    "published": 0,
+    "publish_status": "fresh",
+    "publish_attempt_count": 0,
+    "publish_claim_token": None,
+    "wp_post_url": None,
+    "wp_post_created_at": None,
     "wp_post_id": None,
     "wp_media_id": None,
     "wp_media_metadata_json": None,
@@ -107,7 +113,7 @@ class FakeCursor:
             row = self.database.rich
             state = row.get("publish_status")
             eligible = not row.get("published") and (
-                state in (None, "pending", "retryable")
+                state in (None, "fresh", "pending", "retryable")
                 or (
                     state in ("claimed", "post_created")
                     and row.get("publish_claimed_at") == "expired"
@@ -193,7 +199,7 @@ class FakeClaimDatabase:
         self.rich = {
             **ARTICLE,
             "published": 0,
-            "publish_status": "pending",
+            "publish_status": "fresh",
             "publish_claim_token": None,
             "publish_claimed_at": None,
             "publish_attempt_count": 0,
@@ -570,6 +576,20 @@ class ProcessingWiringTests(unittest.TestCase):
         sql, params = cursor.execute.call_args.args
         self.assertIn("raw_article_id", sql)
         self.assertEqual(params[1], 44)
+        insert, duplicate = sql.split("ON DUPLICATE KEY UPDATE", 1)
+        self.assertIn("publish_status", insert)
+        self.assertIn("fresh", insert)
+        self.assertNotIn("publish_status", duplicate)
+        with (
+            patch.object(gpt_processor, "PROCESS_DURABLE_CLAIMS_ENABLED", False),
+            patch.object(gpt_processor, "get_db_connection", return_value=connection),
+        ):
+            gpt_processor.store_rich_news(record, original)
+        sql, _params = cursor.execute.call_args.args
+        insert, duplicate = sql.split("ON DUPLICATE KEY UPDATE", 1)
+        self.assertIn("publish_status", insert)
+        self.assertIn("fresh", insert)
+        self.assertNotIn("publish_status", duplicate)
 
 
 class PublishingRepositoryTests(unittest.TestCase):
@@ -628,6 +648,7 @@ class ServiceRepository:
         self.claimed = False
         self.completed = False
         self.failed = False
+        self.manual_review = False
         self.events = []
         self.complete_result = True
 
@@ -637,7 +658,7 @@ class ServiceRepository:
         self.claimed = True
         return PublicationClaim(self.token, dict(self.row), 1)
 
-    def save_identity(self, rich_id, token, raw_id, key):
+    def save_identity(self, rich_id, token, raw_id, key, *, expected_post_id=None, expected_post_url=None):
         self.events.append("identity-local")
         self.row.update(raw_article_id=raw_id, publication_key=key)
         return token == self.token and rich_id == self.row["id"]
@@ -664,6 +685,11 @@ class ServiceRepository:
     def fail(self, *_args):
         self.failed = True
         self.events.append("fail")
+        return True
+
+    def require_manual_reconciliation(self, *_args):
+        self.manual_review = True
+        self.events.append("manual-review")
         return True
 
     def release_interrupted(self, *_args):
@@ -700,7 +726,7 @@ class ServicePublisher:
     def publish(self, _article, image, context):
         self.events.append("publish")
         self.published_images.append(image)
-        if self.publish_result.success and self.publish_result.external_id:
+        if self.publish_result.external_id:
             context.persist_external_state(
                 self.publish_result.external_id,
                 self.publish_result.external_url,
@@ -783,6 +809,33 @@ class PublishingServiceTests(unittest.TestCase):
         self.assertFalse(repository.completed)
         self.assertTrue(repository.failed)
 
+    def test_metadata_partial_failure_does_not_complete_durable_state(self) -> None:
+        """Known external identity stays retryable until metadata synchronization succeeds."""
+        repository = ServiceRepository()
+        adapter = ServicePublisher()
+        adapter.publish_result = PublicationResult(success=False, external_id=101, created=True,
+                                                   error="yoast_metadata:response_mismatch")
+        result = PublishingService(repository, adapter, Mock(return_value=(None, {}))).publish_due(1)
+        self.assertEqual(result["failed"], 1)
+        self.assertEqual(result["succeeded"], 0)
+        self.assertFalse(repository.completed)
+        self.assertTrue(repository.failed)
+        self.assertNotIn("complete", repository.events)
+        self.assertEqual(repository.row["wp_post_id"], 101)
+        self.assertIn("post-local", repository.events)
+
+    def test_historical_no_pointer_requires_reconciliation_before_image_work(self):
+        repository = ServiceRepository({**ARTICLE, "publish_status": "pending"})
+        image_preparer = Mock()
+        with patch.object(publisher.session, "post") as post:
+            result = PublishingService(repository, publisher.WordPressPublisher(), image_preparer).publish_due(1)
+        self.assertEqual(result, {"attempted": 1, "succeeded": 0, "failed": 1})
+        image_preparer.assert_not_called()
+        post.assert_not_called()
+        self.assertFalse(repository.completed)
+        self.assertTrue(repository.manual_review)
+        self.assertFalse(repository.failed)
+
     def test_reconciliation_finishes_published_state(self):
         repository = ServiceRepository()
         adapter = ServicePublisher()
@@ -835,6 +888,9 @@ class WordPressReconciliationTests(unittest.TestCase):
     def setUp(self):
         self.article = PublicationArticle.from_mapping(ARTICLE)
         self.key = build_publication_key(8, 3, ARTICLE["news_url"])
+        target = patch.object(publisher, "WP_API_URL", "https://wp.example")
+        target.start()
+        self.addCleanup(target.stop)
 
     def context(self, **overrides):
         values = {
@@ -843,6 +899,7 @@ class WordPressReconciliationTests(unittest.TestCase):
             "raw_article_id": 3,
             "rich_article_id": 8,
             "source_url": ARTICLE["news_url"],
+            "creation_is_fresh": True,
         }
         values.update(overrides)
         return PublicationContext(**values)
@@ -850,63 +907,66 @@ class WordPressReconciliationTests(unittest.TestCase):
     def test_local_wp_post_id_prevents_second_post(self):
         callback = Mock()
         with (
-            patch.object(publisher.mysql.connector, "connect", return_value=wp_connection()),
-            patch.object(persistence, "find_post_by_id", return_value={"ID": 101, "guid": "url"}),
-            patch.object(persistence, "write_publication_metadata"),
+            patch.object(publisher.mysql.connector, "connect") as sql,
+            patch.object(publisher.session, "get", return_value=wp_response(
+                200, {"id": 101, "link": "https://wp.example/101", "type": "post", "status": "publish"},
+            )) as get,
+            patch.object(persistence, "write_publication_metadata") as identity,
             patch.object(publisher, "write_yoast_metadata"),
             patch.object(publisher.session, "post") as post,
         ):
             result = publisher.WordPressPublisher().publish(
-                self.article,
-                None,
+                self.article, None,
                 self.context(existing_external_id=101, persist_external_state=callback),
             )
         self.assertTrue(result.reconciled)
+        self.assertTrue(result.success)
+        self.assertEqual(result.external_id, 101)
+        callback.assert_called_once_with(101, "https://wp.example/101")
+        self.assertEqual(get.call_args.kwargs["params"], {
+            "context": "edit", "_fields": "id,link,type,status",
+        })
+        sql.assert_not_called()
+        identity.assert_not_called()
         post.assert_not_called()
 
-    def test_publication_key_lookup_recovers_and_persists_external_id(self):
-        callback = Mock()
+    def test_missing_saved_id_never_trusts_stale_wordpress_sql_key_lookup(self) -> None:
+        """A database marker cannot establish ownership on the serving WordPress instance."""
         with (
-            patch.object(publisher.mysql.connector, "connect", return_value=wp_connection()),
-            patch.object(
-                persistence,
-                "find_post_by_publication_key",
-                return_value={"ID": 102, "guid": "https://wp.example/102"},
-            ),
-            patch.object(persistence, "write_publication_metadata"),
-            patch.object(publisher, "write_yoast_metadata"),
+            patch.object(publisher.mysql.connector, "connect") as sql,
+            patch.object(persistence, "find_post_by_publication_key",
+                         return_value={"ID": 102, "guid": "https://stale.example/102"}) as lookup,
+            patch.object(publisher.session, "get") as get,
             patch.object(publisher.session, "post") as post,
         ):
-            result = publisher.WordPressPublisher().publish(
-                self.article,
-                None,
-                self.context(persist_external_state=callback),
-            )
-        self.assertEqual(result.external_id, 102)
-        callback.assert_called_once_with(102, "https://wp.example/102")
+            result = publisher.WordPressPublisher().reconcile(self.article, self.context())
+        self.assertIsNone(result)
+        sql.assert_not_called()
+        lookup.assert_not_called()
+        get.assert_not_called()
         post.assert_not_called()
 
-    def test_local_wp_post_id_with_different_identity_is_rejected(self):
+    def test_local_wp_post_id_with_different_rest_identity_is_rejected(self) -> None:
+        """The REST response must identify the saved post before any metadata mutation."""
         with (
-            patch.object(publisher.mysql.connector, "connect", return_value=wp_connection()),
-            patch.object(
-                persistence,
-                "find_post_by_id",
-                return_value={"ID": 101, "guid": "url", "publication_key": "different"},
-            ),
+            patch.object(publisher.mysql.connector, "connect") as sql,
+            patch.object(publisher.session, "get", return_value=wp_response(
+                200, {"id": 999, "link": "https://wp.example/999", "type": "post", "status": "publish"},
+            )),
             patch.object(persistence, "write_publication_metadata") as write,
             patch.object(publisher.session, "post") as post,
         ):
             result = publisher.WordPressPublisher().publish(
-                self.article,
-                None,
-                self.context(existing_external_id=101),
+                self.article, None, self.context(existing_external_id=101),
             )
         self.assertFalse(result.success)
+        self.assertEqual(result.external_id, 101)
+        sql.assert_not_called()
         write.assert_not_called()
         post.assert_not_called()
 
-    def test_new_post_persists_identity_and_local_id_before_yoast(self):
+    def test_new_post_persists_local_id_before_yoast_without_wordpress_marker(self) -> None:
+        """A committed application pointer precedes SEO delivery on the owning API."""
         events = []
         callback = Mock(side_effect=lambda *_args: events.append("local-id"))
         adapter = publisher.WordPressPublisher()
@@ -914,61 +974,52 @@ class WordPressReconciliationTests(unittest.TestCase):
             patch.object(adapter, "reconcile", return_value=None),
             patch.object(publisher, "ensure_category", return_value=1),
             patch.object(publisher, "ensure_term", return_value=2),
-            patch.object(
-                publisher.session,
-                "post",
-                return_value=wp_response(201, {"id": 103, "link": "https://wp.example/103"}),
-            ),
-            patch.object(publisher.mysql.connector, "connect", return_value=wp_connection()),
-            patch.object(
-                persistence,
-                "write_publication_metadata",
-                side_effect=lambda *_args: events.append("wp-meta"),
-            ),
-            patch.object(
-                publisher,
-                "write_yoast_metadata",
-                side_effect=lambda *_args, **_kwargs: events.append("yoast"),
-            ),
+            patch.object(publisher.session, "post", return_value=wp_response(
+                201, {"id": 103, "link": "https://wp.example/103"},
+            )),
+            patch.object(publisher.mysql.connector, "connect") as sql,
+            patch.object(persistence, "write_publication_metadata") as marker,
+            patch.object(publisher, "write_yoast_metadata",
+                         side_effect=lambda *_args, **_kwargs: events.append("yoast")),
             patch("builtins.print"),
         ):
             result = adapter.publish(self.article, None, self.context(persist_external_state=callback))
         self.assertTrue(result.created)
-        self.assertEqual(events, ["wp-meta", "local-id", "yoast"])
+        self.assertEqual(events, ["local-id", "yoast"])
+        sql.assert_not_called()
+        marker.assert_not_called()
 
-    def test_local_save_failure_after_201_retries_via_wp_meta_without_second_post(self):
-        stored = {}
+    def test_local_save_failure_retains_returned_id_and_prevents_create_on_known_id_retry(self) -> None:
+        """A failed local identity save surfaces the returned post ID and skips SEO mutation."""
         callback = Mock(side_effect=[RuntimeError("local unavailable"), None])
-
-        def lookup(_conn, key):
-            return stored.get(key)
-
-        def write_meta(_conn, post_id, metadata):
-            stored[metadata[persistence.PUBLICATION_KEY_META]] = {
-                "ID": post_id,
-                "guid": "https://wp.example/104",
-            }
-
         adapter = publisher.WordPressPublisher()
         with (
             patch.object(publisher, "ensure_category", return_value=1),
             patch.object(publisher, "ensure_term", return_value=2),
-            patch.object(
-                publisher.session,
-                "post",
-                return_value=wp_response(201, {"id": 104, "link": "https://wp.example/104"}),
-            ) as post,
-            patch.object(publisher.mysql.connector, "connect", return_value=wp_connection()),
-            patch.object(persistence, "find_post_by_publication_key", side_effect=lookup),
-            patch.object(persistence, "write_publication_metadata", side_effect=write_meta),
-            patch.object(publisher, "write_yoast_metadata"),
+            patch.object(publisher.session, "post", return_value=wp_response(
+                201, {"id": 104, "link": "https://wp.example/104"},
+            )) as post,
+            patch.object(publisher.session, "get", return_value=wp_response(
+                200, {"id": 104, "link": "https://wp.example/104", "type": "post", "status": "publish"},
+            )),
+            patch.object(publisher.mysql.connector, "connect") as sql,
+            patch.object(publisher, "write_yoast_metadata") as metadata,
             patch("builtins.print"),
         ):
-            with self.assertRaises(RuntimeError):
-                adapter.publish(self.article, None, self.context(persist_external_state=callback))
-            result = adapter.publish(self.article, None, self.context(persist_external_state=callback))
+            first = adapter.publish(self.article, None, self.context(persist_external_state=callback))
+            self.assertFalse(first.success)
+            self.assertEqual(first.external_id, 104)
+            self.assertTrue(first.created)
+            metadata.assert_not_called()
+            result = adapter.publish(
+                self.article, None,
+                self.context(existing_external_id=first.external_id, persist_external_state=callback),
+            )
         self.assertTrue(result.reconciled)
+        self.assertTrue(result.success)
         self.assertEqual(post.call_count, 1)
+        sql.assert_not_called()
+        metadata.assert_called_once()
 
     def test_yoast_failure_retries_via_local_id_without_second_post(self):
         saved = {}
@@ -980,31 +1031,30 @@ class WordPressReconciliationTests(unittest.TestCase):
         with (
             patch.object(publisher, "ensure_category", return_value=1),
             patch.object(publisher, "ensure_term", return_value=2),
-            patch.object(
-                publisher.session,
-                "post",
-                return_value=wp_response(201, {"id": 105, "link": "https://wp.example/105"}),
-            ) as post,
-            patch.object(publisher.mysql.connector, "connect", return_value=wp_connection()),
-            patch.object(persistence, "find_post_by_publication_key", return_value=None),
-            patch.object(persistence, "find_post_by_id", return_value={"ID": 105, "guid": "url"}),
-            patch.object(persistence, "write_publication_metadata"),
-            patch.object(
-                publisher,
-                "write_yoast_metadata",
-                side_effect=[RuntimeError("yoast unavailable"), None],
-            ),
+            patch.object(publisher.session, "post", return_value=wp_response(
+                201, {"id": 105, "link": "https://wp.example/105"},
+            )) as post,
+            patch.object(publisher.session, "get", return_value=wp_response(
+                200, {"id": 105, "link": "https://wp.example/105", "type": "post", "status": "publish"},
+            )),
+            patch.object(publisher.mysql.connector, "connect") as sql,
+            patch.object(publisher, "write_yoast_metadata",
+                         side_effect=[seo.MetadataSyncError("synthetic_failure"), None]),
             patch("builtins.print"),
         ):
-            with self.assertRaises(RuntimeError):
-                adapter.publish(self.article, None, self.context(persist_external_state=save_local))
+            failed = adapter.publish(self.article, None, self.context(persist_external_state=save_local))
+            self.assertFalse(failed.success)
+            self.assertEqual(failed.external_id, saved["id"])
+            self.assertTrue(failed.created)
+            self.assertTrue(failed.error)
             result = adapter.publish(
-                self.article,
-                None,
+                self.article, None,
                 self.context(existing_external_id=saved["id"], persist_external_state=save_local),
             )
         self.assertTrue(result.reconciled)
+        self.assertTrue(result.success)
         self.assertEqual(post.call_count, 1)
+        sql.assert_not_called()
 
     def test_publication_metadata_contains_all_coincourier_keys(self):
         with patch.object(persistence, "write_publication_metadata") as write:
@@ -1059,6 +1109,7 @@ class PublishingWiringTests(unittest.TestCase):
         lock = MagicMock()
         lock.is_connected.return_value = True
         adapter = Mock()
+        adapter.reconcile.return_value = None
         adapter.publish.return_value = PublicationResult(success=True, external_id=101)
         with (
             patch.object(publisher, "PUBLISH_DURABLE_STATE_ENABLED", False),
@@ -1067,6 +1118,9 @@ class PublishingWiringTests(unittest.TestCase):
             patch.object(publisher, "_release_lock", return_value=True),
             patch.object(publisher, "_count_due_now", return_value=1),
             patch.object(publisher, "fetch_unpublished", return_value=[ARTICLE]),
+            patch.object(publisher, "PublicationRepository", return_value=Mock(
+                get_external_post_state=Mock(return_value=ARTICLE),
+            )),
             patch.object(publisher, "upload_image", return_value=(None, {})),
             patch.object(publisher, "mark_news_as_published") as mark,
             patch.object(publisher, "WordPressPublisher", return_value=adapter),

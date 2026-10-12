@@ -1802,6 +1802,7 @@ def store_rich_news(record: dict, original: dict) -> None:
         record["seo_slug"],
         record["seo_meta"],
     )
+    # Only a new INSERT proves freshness; duplicate rows retain their prior state.
     if PROCESS_DURABLE_CLAIMS_ENABLED:
         cur.execute(
             """
@@ -1809,8 +1810,8 @@ def store_rich_news(record: dict, original: dict) -> None:
               (news_url, raw_article_id, title, full_text, publish_date,
                source_name, category, hashtags, sentiment,
                tickers, image_url,
-               seo_focus, seo_slug, seo_meta)
-            VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s)
+               seo_focus, seo_slug, seo_meta, publish_status)
+            VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,'fresh')
             ON DUPLICATE KEY UPDATE
               raw_article_id = COALESCE(raw_article_id, VALUES(raw_article_id)),
               seo_focus = VALUES(seo_focus),
@@ -1826,8 +1827,8 @@ def store_rich_news(record: dict, original: dict) -> None:
               (news_url, title, full_text, publish_date,
                source_name, category, hashtags, sentiment,
                tickers, image_url,
-               seo_focus, seo_slug, seo_meta)
-            VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s)
+               seo_focus, seo_slug, seo_meta, publish_status)
+            VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,'fresh')
             ON DUPLICATE KEY UPDATE
               seo_focus = VALUES(seo_focus),
               seo_slug  = VALUES(seo_slug),

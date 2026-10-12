@@ -11,6 +11,7 @@ from openai import OpenAI
 import hashlib, random
 from datetime import datetime, timedelta, timezone
 from typing import Any
+from urllib.parse import urlsplit
 from config import (
     DB_CONFIG,
     GROK_API_KEY,
@@ -46,8 +47,9 @@ from publishing.models import (
     PublicationContext,
     PublicationImage,
     PublicationResult,
+    is_fresh_publication_state,
 )
-from publishing.service import PublishingService, publication_key_prefix
+from publishing.service import PublishingService, build_publication_key, publication_key_prefix
 from repositories.publication import PublicationRepository
 from publishing.wordpress import client as wordpress_client
 from publishing.wordpress import media as wordpress_media
@@ -206,18 +208,16 @@ def get_wp_prefix(conn) -> str:
     return wordpress_seo.get_wp_prefix(conn)
 
 
-def upsert_postmeta(conn, prefix: str, post_id: int, key: str, value: str) -> None:
-    wordpress_seo.upsert_postmeta(conn, prefix, post_id, key, value)
-
-
-def write_yoast_metadata(conn, post_id: int, **kwargs) -> None:
+def write_yoast_metadata(http_session: Any, post_id: int, **kwargs: Any) -> None:
+    '''Synchronize metadata through the existing authenticated WordPress client.'''
     wordpress_seo.write_yoast_metadata(
-        conn,
+        http_session,
         post_id,
-        get_prefix=get_wp_prefix,
-        upsert=upsert_postmeta,
+        api_base=WP_API_URL,
+        timeout=wordpress_client.WP_HTTP_TIMEOUT,
         **kwargs,
     )
+
 
 def _stable_choice(key: str, options: list[str]) -> str:
     """
@@ -313,6 +313,7 @@ def _count_due_now() -> int:
             FROM rich_crpytonews r
             JOIN cryptonewsapi c ON c.news_url = r.news_url
             WHERE r.published = 0
+              AND COALESCE(r.publish_status, 'pending') <> 'manual_review'
               AND c.chosen_for_publish = 1
               AND c.scheduled_for IS NOT NULL
               AND c.scheduled_for <= UTC_TIMESTAMP()
@@ -763,10 +764,11 @@ def fetch_unpublished(limit: int = 10) -> list[dict]:
     with mysql.connector.connect(**DB_CONFIG) as conn, conn.cursor(dictionary=True) as cur:
         cur.execute(
             f"""
-            SELECT r.*, c.scheduled_for, c.is_breaking
+            SELECT r.*, c.id AS durable_raw_article_id, c.scheduled_for, c.is_breaking
             FROM rich_crpytonews r
             JOIN cryptonewsapi c ON c.news_url = r.news_url
             WHERE r.published = 0
+              AND COALESCE(r.publish_status, 'pending') <> 'manual_review'
               AND c.chosen_for_publish = 1
               AND c.scheduled_for IS NOT NULL
               AND c.scheduled_for <= UTC_TIMESTAMP()
@@ -1506,82 +1508,80 @@ class WordPressPublisher:
         article: PublicationArticle,
         context: PublicationContext,
     ) -> PublicationResult | None:
-        if not context.publication_key:
-            return None
-
-        source = None
-        with mysql.connector.connect(**WP_DB_CONFIG) as wp_conn:
-            existing = None
-            if context.existing_external_id is not None:
-                existing = wordpress_persistence.find_post_by_id(
-                    wp_conn,
-                    context.existing_external_id,
-                )
-                source = "local"
-                decision = "reconcile-local-id"
-                if existing is None:
-                    logger.error(
-                        "[WP-IDEMPOTENCY] rich_article_id=%s publication_key=%s "
-                        "existing_wp_post_id=%s decision=local-id-missing",
-                        context.rich_article_id,
-                        publication_key_prefix(context.publication_key),
-                        context.existing_external_id,
-                    )
-                    return PublicationResult(
-                        success=False,
-                        external_id=context.existing_external_id,
-                        error="saved WordPress post ID no longer exists",
-                    )
-                existing_key = existing.get("publication_key")
-                if existing_key and existing_key != context.publication_key:
-                    logger.error(
-                        "[WP-IDEMPOTENCY] rich_article_id=%s publication_key=%s "
-                        "existing_wp_post_id=%s decision=local-id-key-mismatch",
-                        context.rich_article_id,
-                        publication_key_prefix(context.publication_key),
-                        context.existing_external_id,
-                    )
-                    return PublicationResult(
-                        success=False,
-                        external_id=context.existing_external_id,
-                        error="saved WordPress post ID has a different publication identity",
-                    )
-            else:
-                existing = wordpress_persistence.find_post_by_publication_key(
-                    wp_conn,
-                    context.publication_key,
-                )
-                decision = "reconcile-publication-key"
-                source = "wp-meta"
-                if existing is None:
-                    logger.info(
-                        "[WP-IDEMPOTENCY] rich_article_id=%s publication_key=%s "
-                        "existing_wp_post_id=none decision=create",
-                        context.rich_article_id,
-                        publication_key_prefix(context.publication_key),
-                    )
-                    return None
-
-            post_id = int(existing["ID"])
-            post_url = existing.get("guid")
-            logger.info(
-                "[WP-IDEMPOTENCY] rich_article_id=%s publication_key=%s "
-                "existing_wp_post_id=%s decision=%s",
-                context.rich_article_id,
-                publication_key_prefix(context.publication_key),
-                post_id,
-                decision,
+        '''Recover a saved application post ID through its owning REST API.'''
+        post_id = context.existing_external_id
+        if post_id is None:
+            if context.creation_is_fresh is True:
+                return None
+            code = 'post_identity_manual_reconciliation_required'
+            logger.error(
+                '[WP-IDEMPOTENCY] rich_article_id=%s decision=manual-reconciliation code=%s',
+                context.rich_article_id, code,
             )
-            self._write_publication_identity(wp_conn, post_id, context)
+            return PublicationResult(
+                success=False, external_url=context.existing_external_url, error=code,
+            )
+        post_url = context.existing_external_url
+        if type(post_id) is not int or post_id <= 0:
+            return self._metadata_failure(
+                post_id, post_url,
+                wordpress_seo.MetadataSyncError('post_reconcile_invalid_id'),
+                reconciled=True,
+            )
+        if post_url and not self._same_wordpress_origin(post_url):
+            return self._metadata_failure(
+                post_id, post_url,
+                wordpress_seo.MetadataSyncError('post_reconcile_site_mismatch'),
+                reconciled=True,
+            )
+        try:
+            response = session.get(
+                f'{WP_API_URL}/wp-json/wp/v2/posts/{post_id}',
+                params={'context': 'edit', '_fields': 'id,link,type,status'},
+                timeout=wordpress_client.WP_HTTP_TIMEOUT,
+            )
+            if response.status_code != 200:
+                raise wordpress_seo.MetadataSyncError(
+                    f'post_reconcile_http_status:{response.status_code}',
+                )
+            try:
+                payload = response.json()
+            except ValueError as exc:
+                raise wordpress_seo.MetadataSyncError('post_reconcile_invalid_json') from exc
+            if not isinstance(payload, dict) or type(payload.get('id')) is not int or payload['id'] != post_id:
+                raise wordpress_seo.MetadataSyncError('post_reconcile_id_mismatch')
+            if payload.get('type') != 'post' or not isinstance(payload.get('status'), str) or not payload['status'] or payload['status'] == 'trash':
+                raise wordpress_seo.MetadataSyncError('post_reconcile_invalid_post')
+            returned_url = payload.get('link')
+            if not isinstance(returned_url, str) or not self._same_wordpress_origin(returned_url):
+                raise wordpress_seo.MetadataSyncError('post_reconcile_site_mismatch')
+            post_url = returned_url
             if context.persist_external_state is not None:
-                context.persist_external_state(post_id, post_url)
-            self._write_yoast(wp_conn, post_id, article)
+                try:
+                    context.persist_external_state(post_id, post_url)
+                except Exception as exc:
+                    logger.error(
+                        '[WP-RECONCILE] wp_post_id=%s decision=identity-incomplete error_type=%s',
+                        post_id, type(exc).__name__,
+                    )
+                    return PublicationResult(
+                        success=False, external_id=post_id, external_url=post_url,
+                        reconciled=True, error=f'post_identity_persist:{type(exc).__name__}',
+                    )
+            self._write_yoast(post_id, article)
+        except requests.RequestException as exc:
+            return self._metadata_failure(
+                post_id, post_url,
+                wordpress_seo.MetadataSyncError(f'post_reconcile_transport:{type(exc).__name__}'),
+                reconciled=True,
+            )
+        except wordpress_seo.MetadataSyncError as exc:
+            return self._metadata_failure(post_id, post_url, exc, reconciled=True)
 
         logger.info(
-            "[WP-RECONCILE] rich_article_id=%s wp_post_id=%s source=%s decision=complete",
+            '[WP-RECONCILE] rich_article_id=%s wp_post_id=%s source=rest decision=complete',
             context.rich_article_id,
             post_id,
-            source,
         )
         return PublicationResult(
             success=True,
@@ -1589,6 +1589,25 @@ class WordPressPublisher:
             external_url=post_url,
             reconciled=True,
         )
+
+    @staticmethod
+    def _same_wordpress_origin(post_url: str) -> bool:
+        '''Reject saved IDs whose captured URL belongs to another site.'''
+        try:
+            post = urlsplit(post_url)
+            target = urlsplit(WP_API_URL)
+            return (
+                post.scheme.lower() in ('http', 'https')
+                and post.scheme.lower() == target.scheme.lower()
+                and post.hostname is not None
+                and post.hostname == target.hostname
+                and (post.port or (443 if post.scheme.lower() == 'https' else 80))
+                    == (target.port or (443 if target.scheme.lower() == 'https' else 80))
+                and post.username is None
+                and post.password is None
+            )
+        except ValueError:
+            return False
 
     def external_media_exists(self, external_id: int) -> bool:
         with mysql.connector.connect(**WP_DB_CONFIG) as wp_conn:
@@ -1630,14 +1649,53 @@ class WordPressPublisher:
         )
 
     @staticmethod
-    def _write_yoast(wp_conn: Any, post_id: int, article: PublicationArticle) -> None:
+    def _validate_yoast(article: PublicationArticle) -> None:
+        '''Reject incomplete SEO fields before creating a new post.'''
+        wordpress_seo.validate_yoast_metadata(
+            focus_keyword=article.seo_focus,
+            description=article.seo_description,
+            title=article.seo_title if article.seo_title is not None else article.title,
+            canonical_url=article.canonical_url,
+        )
+
+    @staticmethod
+    def _write_yoast(post_id: int, article: PublicationArticle) -> None:
+        '''Keep native fields separate from the three registered Yoast fields.'''
         write_yoast_metadata(
-            wp_conn,
+            session,
             post_id,
             focus_keyword=article.seo_focus,
-            description=article.seo_description or "",
-            title=article.title or "",
+            description=article.seo_description,
+            title=article.seo_title if article.seo_title is not None else article.title,
             canonical_url=article.canonical_url,
+        )
+
+    @staticmethod
+    def _metadata_failure(
+        post_id: int | None,
+        post_url: str | None,
+        error: wordpress_seo.MetadataSyncError,
+        *,
+        created: bool = False,
+        reconciled: bool = False,
+        media_id: int | None = None,
+    ) -> PublicationResult:
+        '''Expose partial success while retaining the known publication identity.'''
+        logger.error(
+            '[WP-SEO] wp_post_id=%s created=%s reconciled=%s decision=incomplete code=%s',
+            post_id,
+            created,
+            reconciled,
+            error.code,
+        )
+        return PublicationResult(
+            success=False,
+            external_id=post_id,
+            external_url=post_url,
+            media_external_id=media_id,
+            created=created,
+            reconciled=reconciled,
+            error=error.code,
         )
 
     def publish(
@@ -1646,6 +1704,12 @@ class WordPressPublisher:
         image: PublicationImage | None,
         context: PublicationContext,
     ) -> PublicationResult:
+        try:
+            self._validate_yoast(article)
+        except wordpress_seo.MetadataSyncError as exc:
+            return self._metadata_failure(
+                context.existing_external_id, context.existing_external_url, exc,
+            )
         reconciled = self.reconcile(article, context)
         if reconciled is not None:
             return reconciled
@@ -1692,8 +1756,18 @@ class WordPressPublisher:
                 if tag.strip()
             ],
         }
+        if article.excerpt is not None:
+            post_data['excerpt'] = article.excerpt
         if image:
             post_data["featured_media"] = image.external_id
+
+        if context.persist_creation_intent is not None:
+            try:
+                context.persist_creation_intent()
+            except Exception as exc:
+                code = f'post_creation_intent_persist:{type(exc).__name__}'
+                logger.error('[WP-IDEMPOTENCY] decision=creation-blocked code=%s', code)
+                return PublicationResult(success=False, error=code)
 
         response = session.post(
             f"{WP_API_URL}/wp-json/wp/v2/posts",
@@ -1701,39 +1775,45 @@ class WordPressPublisher:
             timeout=wordpress_client.WP_HTTP_TIMEOUT,
         )
         if response.status_code != 201:
-            error_text = response.text
-            print("❌ Error publishing post:", error_text)
-            return PublicationResult(success=False, error=error_text)
+            error_code = f'post_create_http_status:{response.status_code}'
+            logger.error('[WP-PUBLISH] decision=failed code=%s', error_code)
+            return PublicationResult(success=False, error=error_code)
 
         response_payload = response.json()
         post_id = response_payload["id"]
         post_url = response_payload.get("link")
-        print(f"✅ Published WP post {post_id} at {schedule_at_utc:%Y-%m-%d %H:%M:%S}Z")
+        logger.info('[WP-PUBLISH] wp_post_id=%s decision=post-created', post_id)
 
-        identity_error = None
-        if context.publication_key:
-            try:
-                with mysql.connector.connect(**WP_DB_CONFIG) as wp_conn:
-                    self._write_publication_identity(wp_conn, post_id, context)
-            except Exception as exc:
-                identity_error = exc
-        local_state_error = None
         if context.persist_external_state is not None:
             try:
                 context.persist_external_state(post_id, post_url)
             except Exception as exc:
-                local_state_error = exc
-        if identity_error is not None:
-            raise identity_error
-        if local_state_error is not None:
-            raise local_state_error
+                logger.error(
+                    '[WP-PUBLISH] wp_post_id=%s decision=identity-incomplete error_type=%s',
+                    post_id,
+                    type(exc).__name__,
+                )
+                return PublicationResult(
+                    success=False,
+                    external_id=post_id,
+                    external_url=post_url,
+                    media_external_id=image.external_id if image else None,
+                    created=True,
+                    error=f'post_identity_persist:{type(exc).__name__}',
+                )
 
         if image:
             record_image_usage(image.metadata, post_id, article.title)
 
-        with mysql.connector.connect(**WP_DB_CONFIG) as wp_conn:
-            self._write_yoast(wp_conn, post_id, article)
+        try:
+            self._write_yoast(post_id, article)
+        except wordpress_seo.MetadataSyncError as exc:
+            return self._metadata_failure(
+                post_id, post_url, exc, created=True,
+                media_id=image.external_id if image else None,
+            )
 
+        logger.info('[WP-SEO] wp_post_id=%s decision=metadata-sync-complete', post_id)
         return PublicationResult(
             success=True,
             external_id=post_id,
@@ -1763,7 +1843,8 @@ def publish_news_to_wp() -> dict[str, int | str]:
             - Optionally embed schema_jsonld as a <script type="application/ld+json"> block
             - POST to /wp/v2/posts with:
                 title, content, status=publish, slug, date_gmt, categories, tags
-            - On success: upsert Yoast SEO postmeta into WP DB (upsert_postmeta)
+            - Persist publication identity, update registered Yoast REST metadata,
+              and verify authenticated readback before completing publication.
             - Mark item published in rich_crpytonews (mark_news_as_published)
         5) Release lock in finally.
 
@@ -1856,30 +1937,88 @@ def publish_news_to_wp() -> dict[str, int | str]:
             }
 
         now_utc = datetime.utcnow().replace(tzinfo=timezone.utc)
-        context = PublicationContext(published_at_utc=now_utc)
         wordpress_publisher = WordPressPublisher()
+        publication_repository = PublicationRepository()
         succeeded = 0
         failed = 0
 
         for item in news_items:
-            featured_id, image_meta = upload_image(
-                item.get("image_url"),
-                title=item["title"],
-                hashtags=item.get("hashtags", ""),
-                article=item,
+            rich_id = int(item['id'])
+            raw_id_value = item.get('raw_article_id') or item.get('durable_raw_article_id')
+            raw_id = int(raw_id_value) if raw_id_value is not None else None
+            try:
+                saved_state = publication_repository.get_external_post_state(rich_id)
+            except Exception as exc:
+                logger.error(
+                    '[WP-PUBLISH] rich_article_id=%s decision=identity-state-unavailable error_type=%s',
+                    rich_id,
+                    type(exc).__name__,
+                )
+                failed += 1
+                continue
+
+            def persist_external(
+                post_id: int,
+                post_url: str | None,
+                article_id: int = rich_id,
+            ) -> None:
+                '''Save legacy post identity before exposing metadata failures.'''
+                if not publication_repository.save_legacy_external_post(article_id, post_id, post_url):
+                    raise RuntimeError('publication identity could not be saved')
+
+            def persist_creation_intent(article_id: int = rich_id) -> None:
+                '''Consume explicit fresh provenance before the first remote CREATE.'''
+                if not publication_repository.begin_legacy_creation(article_id):
+                    raise RuntimeError('fresh publication permission is unavailable')
+
+            context = PublicationContext(
+                published_at_utc=now_utc,
+                publication_key=item.get('publication_key') or build_publication_key(
+                    rich_id, raw_id, item.get('news_url'),
+                ),
+                raw_article_id=raw_id,
+                rich_article_id=rich_id,
+                source_url=item.get('news_url'),
+                existing_external_id=saved_state.get('wp_post_id'),
+                existing_external_url=saved_state.get('wp_post_url'),
+                persist_external_state=persist_external,
+                creation_is_fresh=is_fresh_publication_state(saved_state),
+                persist_creation_intent=persist_creation_intent,
             )
             article = PublicationArticle.from_mapping(item)
-            image = None
-            if featured_id:
-                image = PublicationImage(
-                    external_id=featured_id,
-                    metadata=image_meta,
-                )
-            result = wordpress_publisher.publish(article, image, context)
+            result = wordpress_publisher.reconcile(article, context)
+            if result is None:
+                try:
+                    wordpress_publisher._validate_yoast(article)
+                except wordpress_seo.MetadataSyncError as exc:
+                    result = wordpress_publisher._metadata_failure(None, None, exc)
+                else:
+                    featured_id, image_meta = upload_image(
+                        item.get('image_url'),
+                        title=item['title'],
+                        hashtags=item.get('hashtags', ''),
+                        article=item,
+                    )
+                    image = None
+                    if featured_id:
+                        image = PublicationImage(
+                            external_id=featured_id,
+                            metadata=image_meta,
+                        )
+                    result = wordpress_publisher.publish(article, image, context)
             if result.success:
-                mark_news_as_published(item["news_url"])
+                mark_news_as_published(item['news_url'])
                 succeeded += 1
             else:
+                if result.error == 'post_identity_manual_reconciliation_required':
+                    try:
+                        if not publication_repository.defer_legacy_manual_reconciliation(rich_id):
+                            raise RuntimeError('manual reconciliation state could not be saved')
+                    except Exception as exc:
+                        logger.error(
+                            '[WP-IDEMPOTENCY] rich_article_id=%s decision=manual-state-incomplete error_type=%s',
+                            rich_id, type(exc).__name__,
+                        )
                 failed += 1
 
         return {

@@ -13,7 +13,10 @@ from repositories.publication import PublicationClaim, PublicationRepository
 from repositories.state import claim_prefix, safe_error_message
 
 from .base import Publisher
-from .models import PublicationArticle, PublicationContext, PublicationImage, PublicationResult
+from .models import (
+    PublicationArticle, PublicationContext, PublicationImage, PublicationResult,
+    is_fresh_publication_state,
+)
 
 
 logger = logging.getLogger(__name__)
@@ -92,7 +95,11 @@ class PublishingService:
         try:
             if raw_id is None:
                 raise ValueError("durable raw article identity is unavailable")
-            if not self.repository.save_identity(rich_id, claim.token, raw_id, key):
+            if not self.repository.save_identity(
+                rich_id, claim.token, raw_id, key,
+                expected_post_id=_optional_int(row.get('wp_post_id')),
+                expected_post_url=row.get('wp_post_url'),
+            ):
                 raise RuntimeError("publication claim ownership was lost while saving identity")
 
             def persist_external(post_id: int, post_url: str | None) -> None:
@@ -112,6 +119,11 @@ class PublishingService:
                 source_url=row.get("news_url"),
                 existing_external_id=_optional_int(row.get("wp_post_id")),
                 persist_external_state=persist_external,
+                existing_external_url=row.get('wp_post_url'),
+                creation_is_fresh=(
+                    claim.attempt == 1 and not claim.recovered
+                    and is_fresh_publication_state(row)
+                ),
             )
             article = PublicationArticle.from_mapping(row)
 
@@ -212,6 +224,16 @@ class PublishingService:
     ) -> bool:
         rich_id = int(claim.article["id"])
         if not result.success:
+            if result.error == 'post_identity_manual_reconciliation_required':
+                if not self.repository.require_manual_reconciliation(
+                    rich_id, claim.token, result.error,
+                ):
+                    raise RuntimeError('publication ownership was lost while deferring reconciliation')
+                logger.error(
+                    '[WP-PUBLISH] rich_article_id=%s state=manual_review code=%s',
+                    rich_id, result.error,
+                )
+                return False
             error = RuntimeError(result.error or "publisher returned an unsuccessful result")
             self.repository.fail(
                 rich_id,

@@ -27,6 +27,8 @@ from publishing.wordpress import client, media, publisher, seo, taxonomy
 
 
 ARTICLE_ROW = {
+    "id": 11,
+    "durable_raw_article_id": 22,
     "title": "Bitcoin Markets Update",
     "full_text": "Markets liquidity improved on Coinbase.",
     "news_url": "https://news.example/article",
@@ -37,6 +39,13 @@ ARTICLE_ROW = {
     "seo_focus": "Bitcoin market liquidity",
     "seo_meta": "A focused market summary.",
     "seo_canonical": "https://canonical.example/article",
+    "published": 0,
+    "publish_status": "fresh",
+    "publish_attempt_count": 0,
+    "publish_claim_token": None,
+    "wp_post_id": None,
+    "wp_post_url": None,
+    "wp_post_created_at": None,
     "schema_jsonld": '{"@type":"NewsArticle"}',
 }
 PUBLISHED_AT = datetime(2026, 8, 31, 12, 34, 56, tzinfo=timezone.utc)
@@ -75,12 +84,16 @@ class CompatibilityTests(unittest.TestCase):
         lock_conn = MagicMock()
         lock_conn.is_connected.return_value = True
         adapter = Mock()
+        adapter.reconcile.return_value = None
         with (
             patch.object(publisher.mysql.connector, "connect", return_value=lock_conn),
             patch.object(publisher, "_get_lock", return_value=True),
             patch.object(publisher, "_release_lock", return_value=True),
             patch.object(publisher, "_count_due_now", return_value=1),
             patch.object(publisher, "fetch_unpublished", return_value=[ARTICLE_ROW]),
+            patch.object(publisher, "PublicationRepository", return_value=Mock(
+                get_external_post_state=Mock(return_value=ARTICLE_ROW),
+            )),
             patch.object(publisher, "upload_image", return_value=(None, {})),
             patch.object(publisher, "mark_news_as_published") as mark_published,
             patch.object(publisher, "WordPressPublisher", return_value=adapter) as adapter_type,
@@ -106,6 +119,7 @@ class CompatibilityTests(unittest.TestCase):
         lock_conn = MagicMock()
         lock_conn.is_connected.return_value = True
         adapter = Mock()
+        adapter.reconcile.return_value = None
         adapter.publish.return_value = publisher.PublicationResult(
             success=False,
             error="failed",
@@ -116,6 +130,9 @@ class CompatibilityTests(unittest.TestCase):
             patch.object(publisher, "_release_lock", return_value=True),
             patch.object(publisher, "_count_due_now", return_value=1),
             patch.object(publisher, "fetch_unpublished", return_value=[ARTICLE_ROW]),
+            patch.object(publisher, "PublicationRepository", return_value=Mock(
+                get_external_post_state=Mock(return_value=ARTICLE_ROW),
+            )),
             patch.object(publisher, "upload_image", return_value=(None, {})),
             patch.object(publisher, "mark_news_as_published") as mark_published,
             patch.object(publisher, "WordPressPublisher", return_value=adapter),
@@ -371,67 +388,56 @@ class TaxonomyTests(unittest.TestCase):
 
 
 class SeoAndDatabaseTests(unittest.TestCase):
-    def test_yoast_metadata_writes_remain_equivalent(self):
-        connection = Mock()
-        with (
-            patch.object(seo, "get_wp_prefix", return_value="site_") as prefix,
-            patch.object(seo, "upsert_postmeta") as upsert,
-        ):
-            seo.write_yoast_metadata(
-                connection,
-                91,
-                focus_keyword="focus",
-                description="d" * 170,
-                title="t" * 70,
-                canonical_url="https://canonical.example/post",
-            )
-        prefix.assert_called_once_with(connection)
-        self.assertEqual(
-            upsert.call_args_list,
-            [
-                call(connection, "site_", 91, "_yoast_wpseo_focuskw", "focus"),
-                call(connection, "site_", 91, "_yoast_wpseo_metadesc", "d" * 160),
-                call(connection, "site_", 91, "_yoast_wpseo_title", "t" * 58),
-                call(
-                    connection,
-                    "site_",
-                    91,
-                    "_yoast_wpseo_canonical",
-                    "https://canonical.example/post",
-                ),
-            ],
-        )
+    def test_yoast_metadata_native_rest_round_trip_preserves_full_fields(self) -> None:
+        """Write supported metadata through WordPress and verify an authenticated read."""
+        http = Mock()
+        expected = {"_yoast_wpseo_focuskw": "focus", "_yoast_wpseo_metadesc": "d" * 170,
+                    "_yoast_wpseo_title": "t" * 70}
+        http.post.return_value = response(status=200, body={"id": 91, "meta": expected})
+        http.get.return_value = response(status=200, body={"id": 91, "meta": expected})
+        with patch.object(seo, "get_wp_prefix") as prefix:
+            seo.write_yoast_metadata(http, 91, focus_keyword="focus", description="d" * 170,
+                                     title="t" * 70, canonical_url=None,
+                                     api_base="https://wp.example", timeout=(1, 2))
+        prefix.assert_not_called()
+        http.post.assert_called_once_with("https://wp.example/wp-json/wp/v2/posts/91",
+                                          json={"meta": expected}, timeout=(1, 2))
+        self.assertEqual(http.get.call_args.args[0], "https://wp.example/wp-json/wp/v2/posts/91")
+        self.assertEqual(http.get.call_args.kwargs["params"]["context"], "edit")
+        self.assertEqual(http.get.call_args.kwargs["timeout"], (1, 2))
 
-    def test_canonical_yoast_metadata_remains_conditional(self):
+    def test_custom_canonical_remains_outside_three_field_rest_contract(self) -> None:
+        """Leave canonical untouched while successfully synchronizing the supported fields."""
+        http = Mock()
+        fields = {
+            "_yoast_wpseo_focuskw": "focus", "_yoast_wpseo_title": "title",
+            "_yoast_wpseo_metadesc": "description",
+        }
+        http.post.return_value = response(status=200, body={"id": 92})
+        http.get.return_value = response(status=200, body={
+            "id": 92, "meta": {**fields, "_yoast_wpseo_canonical": "https://wp.example/existing"},
+        })
         with (
-            patch.object(seo, "get_wp_prefix", return_value="wp_"),
-            patch.object(seo, "upsert_postmeta") as upsert,
+            patch.object(seo, "get_wp_prefix") as prefix,
+            self.assertLogs(seo.logger, level="WARNING") as captured,
         ):
-            seo.write_yoast_metadata(
-                Mock(),
-                92,
-                focus_keyword="focus",
-                description="description",
-                title="title",
-                canonical_url=None,
-            )
-        self.assertEqual(upsert.call_count, 3)
-        self.assertNotIn(
-            "_yoast_wpseo_canonical",
-            [item.args[3] for item in upsert.call_args_list],
-        )
+            seo.write_yoast_metadata(http, 92, focus_keyword="focus", description="description",
+                                     title="title", canonical_url="https://canonical.example/post",
+                                     api_base="https://wp.example", timeout=(1, 2))
+        self.assertEqual(http.post.call_args.kwargs["json"], {"meta": fields})
+        self.assertEqual(http.get.call_count, 1)
+        self.assertIn("unsupported-rest-field", "\n".join(captured.output))
+        prefix.assert_not_called()
 
-    def test_postmeta_upsert_sql_and_commit_remain_equivalent(self):
-        connection = Mock()
-        cursor = Mock()
-        connection.cursor.return_value = cursor
-        seo.upsert_postmeta(connection, "wp7_", 93, "_yoast_wpseo_title", "Title")
-        sql, params = cursor.execute.call_args.args
-        self.assertIn("INSERT INTO wp7_postmeta", sql)
-        self.assertIn("ON DUPLICATE KEY UPDATE meta_value = VALUES(meta_value)", sql)
-        self.assertEqual(params, (93, "_yoast_wpseo_title", "Title"))
-        connection.commit.assert_called_once_with()
-        cursor.close.assert_called_once_with()
+    def test_missing_returned_metadata_fails_even_with_successful_http(self) -> None:
+        """Missing protected metadata cannot be accepted as synchronization success."""
+        http = Mock()
+        http.post.return_value = response(status=200, body={"id": 93})
+        http.get.return_value = response(status=200, body={"id": 93})
+        with self.assertRaises(seo.MetadataSyncError):
+            seo.write_yoast_metadata(http, 93, focus_keyword="focus", description="description",
+                                     title="title", canonical_url=None,
+                                     api_base="https://wp.example", timeout=(1, 2))
 
     def test_application_published_state_sql_remains_equivalent(self):
         connection, cursor = context_connection()
@@ -457,16 +463,29 @@ class SeoAndDatabaseTests(unittest.TestCase):
         sql, params = cursor.execute.call_args.args
         self.assertEqual(rows, [ARTICLE_ROW])
         self.assertIn("r.published = 0", sql)
+        self.assertIn("manual_review", sql)
         self.assertIn("c.chosen_for_publish = 1", sql)
         self.assertIn("c.scheduled_for <= UTC_TIMESTAMP()", sql)
         self.assertIn("ORDER BY c.scheduled_for ASC", sql)
         self.assertEqual(params, (7,))
 
 
+    def test_due_count_excludes_manual_reconciliation_rows(self):
+        connection, cursor = context_connection(first=(2,))
+        with (
+            patch.object(publisher.mysql.connector, "connect", return_value=connection),
+            patch.object(publisher, "PIPELINE_FRESH_START_AFTER_UTC_SQL", ""),
+        ):
+            self.assertEqual(publisher._count_due_now(), 2)
+        sql, params = cursor.execute.call_args.args
+        self.assertIn("manual_review", sql)
+        self.assertIn("r.published = 0", sql)
+        self.assertEqual(params, ())
+
 class WordPressPublisherTests(unittest.TestCase):
     def setUp(self):
         self.article = PublicationArticle.from_mapping(ARTICLE_ROW)
-        self.context = PublicationContext(published_at_utc=PUBLISHED_AT)
+        self.context = PublicationContext(published_at_utc=PUBLISHED_AT, creation_is_fresh=True)
 
     def publish_with_mocks(self, *, image=None, post_response=None, events=None):
         post_response = post_response or response(body={"id": 101})
@@ -572,10 +591,12 @@ class WordPressPublisherTests(unittest.TestCase):
 
     def test_failed_post_returns_before_usage_or_yoast(self):
         result, mocks, _connection, events = self.publish_with_mocks(
-            post_response=response(status=500, text="failed"),
+            post_response=response(status=500, text="Synthetic private server error token=secret"),
         )
         self.assertFalse(result.success)
-        self.assertEqual(result.error, "failed")
+        self.assertEqual(result.error, "post_create_http_status:500")
+        self.assertNotIn("secret", result.error)
+        self.assertNotIn("private server error", result.error)
         mocks[4].assert_not_called()
         mocks[5].assert_not_called()
         self.assertEqual(events, [])
@@ -594,9 +615,9 @@ class WordPressPublisherTests(unittest.TestCase):
         self.assertEqual(events, ["usage", "yoast"])
 
     def test_yoast_receives_current_article_values(self):
-        _result, mocks, wp_connection, _events = self.publish_with_mocks()
+        _result, mocks, _wp_connection, _events = self.publish_with_mocks()
         mocks[5].assert_called_once_with(
-            wp_connection,
+            publisher.session,
             101,
             focus_keyword=ARTICLE_ROW["seo_focus"],
             description=ARTICLE_ROW["seo_meta"],

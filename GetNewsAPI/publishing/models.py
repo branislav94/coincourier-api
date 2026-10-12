@@ -18,10 +18,12 @@ class PublicationArticle:
     seo_description: str = ""
     canonical_url: str | None = None
     schema_jsonld: str | None = None
+    seo_title: str | None = None
+    excerpt: str | None = None
 
     @classmethod
     def from_mapping(cls, article: Mapping[str, Any]) -> "PublicationArticle":
-        """Map the current rich-article row without adding new semantics."""
+        """Map native article fields independently from optional SEO fields."""
         return cls(
             title=article["title"],
             html_content=article.get("full_text"),
@@ -32,6 +34,8 @@ class PublicationArticle:
             seo_description=article.get("seo_meta", ""),
             canonical_url=article.get("seo_canonical"),
             schema_jsonld=article.get("schema_jsonld"),
+            seo_title=article.get('seo_title'),
+            excerpt=article.get('excerpt'),
         )
 
 
@@ -50,6 +54,9 @@ class PublicationContext:
     source_url: str | None = None
     existing_external_id: int | None = None
     persist_external_state: Callable[[int, str | None], None] | None = None
+    existing_external_url: str | None = None
+    creation_is_fresh: bool = False
+    persist_creation_intent: Callable[[], None] | None = None
 
 
 @dataclass(frozen=True)
@@ -61,3 +68,22 @@ class PublicationResult:
     created: bool = False
     reconciled: bool = False
     error: str | None = None
+
+
+def is_fresh_publication_state(row: Mapping[str, Any]) -> bool:
+    '''Require explicit new-row provenance; historical defaults are ambiguous.'''
+    required = (
+        'published', 'publish_status', 'publish_attempt_count', 'wp_post_id',
+        'wp_post_url', 'wp_post_created_at', 'publish_claim_token',
+    )
+    if any(name not in row for name in required):
+        return False
+    return (
+        row['published'] == 0
+        and row['publish_status'] == 'fresh'
+        and type(row['publish_attempt_count']) is int
+        and row['publish_attempt_count'] == 0
+        and all(row[name] is None for name in (
+            'wp_post_id', 'wp_post_url', 'wp_post_created_at', 'publish_claim_token',
+        ))
+    )
