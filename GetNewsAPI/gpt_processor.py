@@ -2139,17 +2139,21 @@ def _process_news_with_durable_claims(
     """Run claimed work after the claim transaction has been committed."""
     repository = RawNewsRepository()
     result = {"attempted": 0, "succeeded": 0, "failed": 0}
+    attempted_raw_ids: set[int] = set()
 
     for _ in range(max(0, batch_size)):
         claim = repository.claim_next(
             timeout_minutes=PROCESS_CLAIM_TIMEOUT_MINUTES,
             lookahead_minutes=(PROCESS_LOOKAHEAD_MINUTES if use_lookahead_filter else None),
             fresh_start_after=PIPELINE_FRESH_START_AFTER_UTC_SQL,
+            exclude_raw_article_ids=tuple(sorted(attempted_raw_ids)),
         )
         if claim is None:
             break
 
         raw_id = int(claim.article["id"])
+        # A retryable failure must wait for a later invocation, leaving this batch to other rows.
+        attempted_raw_ids.add(raw_id)
         result["attempted"] += 1
         logging.info(
             "[PROCESS-CLAIM] raw_article_id=%s attempt=%s claim=%s decision=%s",

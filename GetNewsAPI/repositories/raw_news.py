@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
-from typing import Any, Callable
+from typing import Any, Callable, Collection
 
 import mysql.connector
 
@@ -32,13 +32,17 @@ class RawNewsRepository:
         timeout_minutes: int,
         lookahead_minutes: int | None,
         fresh_start_after: str | None,
+        exclude_raw_article_ids: Collection[int] = (),
     ) -> ProcessingClaim | None:
+        """Claim an eligible row, keeping caller exclusions fixed across deadlock retries."""
+        excluded_ids = tuple(sorted(set(exclude_raw_article_ids)))
         for attempt_index in range(2):
             try:
                 return self._claim_next_once(
                     timeout_minutes=timeout_minutes,
                     lookahead_minutes=lookahead_minutes,
                     fresh_start_after=fresh_start_after,
+                    exclude_raw_article_ids=excluded_ids,
                 )
             except mysql.connector.Error as error:
                 if not is_claim_deadlock(error):
@@ -53,6 +57,7 @@ class RawNewsRepository:
         timeout_minutes: int,
         lookahead_minutes: int | None,
         fresh_start_after: str | None,
+        exclude_raw_article_ids: Collection[int] = (),
     ) -> ProcessingClaim | None:
         token = new_claim_token()
         clauses = [
@@ -77,6 +82,10 @@ class RawNewsRepository:
                 ]
             )
             params.append(lookahead_minutes)
+        if exclude_raw_article_ids:
+            placeholders = ", ".join("%s" for _ in exclude_raw_article_ids)
+            clauses.append(f"id NOT IN ({placeholders})")
+            params.extend(exclude_raw_article_ids)
 
         conn = self._connect()
         cursor = None

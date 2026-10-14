@@ -69,7 +69,11 @@ class FakeCursor:
         if normalized.startswith("select * from cryptonewsapi"):
             row = self.database.raw
             state = row.get("processing_status")
-            eligible = not row.get("processed") and (
+            excluded_ids = ()
+            if "and id not in (" in normalized:
+                placeholders = normalized.split("and id not in (", 1)[1].split(")", 1)[0]
+                excluded_ids = params[-placeholders.count("%s"):]
+            eligible = row["id"] not in excluded_ids and not row.get("processed") and (
                 state in (None, "pending", "retryable")
                 or (state == "claimed" and row.get("processing_claimed_at") == "expired")
             )
@@ -293,6 +297,130 @@ class ScriptedClaimDatabase(FakeClaimDatabase):
 
 
 class ProcessingRepositoryTests(unittest.TestCase):
+    def test_excluded_raw_row_remains_unclaimed(self):
+        database = FakeClaimDatabase()
+        repository = RawNewsRepository(connect=database.connect)
+
+        claim = repository.claim_next(
+            timeout_minutes=30,
+            lookahead_minutes=None,
+            fresh_start_after=None,
+            exclude_raw_article_ids={1, 2},
+        )
+
+        self.assertIsNone(claim)
+        self.assertEqual(database.raw["processing_attempt_count"], 0)
+        self.assertEqual(database.raw["processing_status"], "pending")
+        queries = [event for event in database.events if isinstance(event, tuple)]
+        self.assertEqual(len(queries), 1)
+        self.assertIn("and id not in (%s, %s)", queries[0][1])
+        self.assertEqual(queries[0][2], (30, 1, 2))
+        self.assertIn("commit", database.events)
+        self.assertIn("connection-close", database.events)
+
+    def test_failed_row_is_excluded_until_a_later_invocation(self):
+        database = FakeClaimDatabase()
+        repository = RawNewsRepository(connect=database.connect)
+        kwargs = {
+            "timeout_minutes": 30,
+            "lookahead_minutes": None,
+            "fresh_start_after": None,
+        }
+        first = repository.claim_next(**kwargs)
+        assert first is not None
+        self.assertTrue(repository.fail(1, first.token, "ArticleValidationError: processing failed"))
+
+        self.assertIsNone(repository.claim_next(**kwargs, exclude_raw_article_ids={1}))
+        self.assertEqual(database.raw["processed"], 0)
+        self.assertEqual(database.raw["processing_status"], "retryable")
+        self.assertEqual(database.raw["processing_attempt_count"], 1)
+        self.assertIsNone(database.raw["processing_claim_token"])
+
+        later = repository.claim_next(**kwargs)
+        assert later is not None
+        self.assertEqual(later.article["id"], 1)
+        self.assertEqual(later.attempt, 2)
+        self.assertNotEqual(later.token, first.token)
+        self.assertFalse(repository.complete(1, first.token))
+        self.assertFalse(repository.fail(1, first.token, "stale owner"))
+        self.assertEqual(database.raw["processing_claim_token"], later.token)
+        self.assertEqual(database.raw["processing_status"], "claimed")
+        self.assertTrue(repository.complete(1, later.token))
+
+    def test_exclusions_follow_optional_filter_parameters_and_keep_selection_order(self):
+        cutoff = "2026-10-14 00:00:00"
+        excluded_ids = (18160, 9223372036854775807)
+        for fresh_cutoff, lookahead in ((None, None), (cutoff, None), (None, 15), (cutoff, 15)):
+            with self.subTest(fresh_cutoff=fresh_cutoff, lookahead=lookahead):
+                database = FakeClaimDatabase()
+                claim = RawNewsRepository(connect=database.connect).claim_next(
+                    timeout_minutes=30,
+                    lookahead_minutes=lookahead,
+                    fresh_start_after=fresh_cutoff,
+                    exclude_raw_article_ids=excluded_ids,
+                )
+                self.assertIsNotNone(claim)
+                select = next(event for event in database.events if isinstance(event, tuple))
+                sql, params = select[1:]
+                expected_params = [30]
+                if fresh_cutoff:
+                    expected_params.append(fresh_cutoff)
+                    self.assertIn("insertdate >= %s", sql)
+                else:
+                    self.assertNotIn("insertdate >=", sql)
+                if lookahead is not None:
+                    expected_params.append(lookahead)
+                    self.assertIn("scheduled_for is not null", sql)
+                    self.assertIn("scheduled_for <= timestampadd(minute, %s, utc_timestamp())", sql)
+                else:
+                    self.assertNotIn("scheduled_for <=", sql)
+                self.assertEqual(params, (*expected_params, *excluded_ids))
+                self.assertIn("and id not in (%s, %s)", sql)
+                self.assertIn("processed = 0 and chosen_for_publish = 1", sql)
+                self.assertIn("order by scheduled_for asc, selected_at asc, id asc limit 1 for update", sql)
+                self.assertNotIn(cutoff, sql)
+                for raw_id in excluded_ids:
+                    self.assertNotIn(str(raw_id), sql)
+
+    def test_empty_exclusions_preserve_original_claim_query(self):
+        database = FakeClaimDatabase()
+        claim = RawNewsRepository(connect=database.connect).claim_next(
+            timeout_minutes=30,
+            lookahead_minutes=None,
+            fresh_start_after=None,
+        )
+        self.assertIsNotNone(claim)
+        select = next(event for event in database.events if isinstance(event, tuple))
+        self.assertNotIn("not in", select[1])
+        self.assertEqual(select[2], (30,))
+
+    def test_deadlock_retry_keeps_original_exclusions_and_optional_filters(self):
+        database = ScriptedClaimDatabase([ClaimContentionPolicyTests.deadlock()])
+        excluded_ids = [22, 9, 22]
+
+        def connect():
+            # Caller mutations after entry must not change retry selection.
+            excluded_ids.append(1)
+            return database.connect()
+
+        claim = RawNewsRepository(connect=connect).claim_next(
+            timeout_minutes=30,
+            lookahead_minutes=15,
+            fresh_start_after="2026-10-14 00:00:00",
+            exclude_raw_article_ids=excluded_ids,
+        )
+
+        self.assertIsNotNone(claim)
+        self.assertEqual(claim.article["id"], 1)
+        self.assertEqual(len(database.connections), 2)
+        first, second = database.connections
+        self.assertEqual(first.executions[0], second.executions[0])
+        self.assertEqual(first.executions[0][1], (30, "2026-10-14 00:00:00", 15, 9, 22))
+        self.assertEqual(first.rollbacks, 1)
+        self.assertTrue(first.closed)
+        self.assertEqual(second.commits, 1)
+        self.assertTrue(second.closed)
+
     def test_two_processors_cannot_claim_same_raw_row(self):
         database = FakeClaimDatabase()
         repository = RawNewsRepository(connect=database.connect)
