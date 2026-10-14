@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import json
 from dataclasses import dataclass
-from typing import Any, Callable, Mapping
+from typing import Any, Callable, Collection, Mapping
 
 import mysql.connector
 
@@ -35,12 +35,16 @@ class PublicationRepository:
         *,
         timeout_minutes: int,
         fresh_start_after: str | None,
+        exclude_rich_article_ids: Collection[int] = (),
     ) -> PublicationClaim | None:
+        """Claim the next eligible row, retaining caller exclusions across a deadlock retry."""
+        excluded_ids = tuple(sorted(set(exclude_rich_article_ids)))
         for attempt_index in range(2):
             try:
                 return self._claim_next_once(
                     timeout_minutes=timeout_minutes,
                     fresh_start_after=fresh_start_after,
+                    exclude_rich_article_ids=excluded_ids,
                 )
             except mysql.connector.Error as error:
                 if not is_claim_deadlock(error):
@@ -54,13 +58,19 @@ class PublicationRepository:
         *,
         timeout_minutes: int,
         fresh_start_after: str | None,
+        exclude_rich_article_ids: Collection[int] = (),
     ) -> PublicationClaim | None:
         token = new_claim_token()
         fresh_clause = ""
+        exclude_clause = ""
         params: list[Any] = [timeout_minutes]
         if fresh_start_after:
             fresh_clause = " AND c.insertDate >= %s"
             params.append(fresh_start_after)
+        if exclude_rich_article_ids:
+            placeholders = ", ".join("%s" for _ in exclude_rich_article_ids)
+            exclude_clause = f" AND r.id NOT IN ({placeholders})"
+            params.extend(exclude_rich_article_ids)
 
         conn = self._connect()
         cursor = None
@@ -84,6 +94,7 @@ class PublicationRepository:
                         AND r.publish_claimed_at < TIMESTAMPADD(MINUTE, -%s, UTC_TIMESTAMP()))
                   )
                   {fresh_clause}
+                  {exclude_clause}
                 ORDER BY c.scheduled_for ASC, r.id ASC
                 LIMIT 1
                 FOR UPDATE

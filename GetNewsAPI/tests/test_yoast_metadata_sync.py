@@ -86,6 +86,125 @@ class FakeWordPress:
         return FakeResponse(self._reply(int(url.rstrip('/').rsplit('/', 1)[1])))
 
 
+class YoastMetadataReadbackTests(unittest.TestCase):
+    '''Limit description tolerance to the exact space representation observed in production.'''
+
+    PRODUCTION_EXPECTED = (
+        'The recent  Strive bitcoin buy  stands out as one of the largest single acquisitions '
+        'in recent months. Strive Inc. purchased 3,311 BTC for roughly 280'
+    )
+    PRODUCTION_ACTUAL = (
+        'The recent Strive bitcoin buy stands out as one of the largest single acquisitions '
+        'in recent months. Strive Inc. purchased 3,311 BTC for roughly 280'
+    )
+
+    def setUp(self) -> None:
+        '''Use the confirmed production values without any database or HTTP connection.'''
+        self.expected = {
+            '_yoast_wpseo_focuskw': 'strive bitcoin buy',
+            '_yoast_wpseo_title': 'Strive Bitcoin Buy Dwarfs Strategy Purchase',
+            '_yoast_wpseo_metadesc': self.PRODUCTION_EXPECTED,
+        }
+
+    def _verify(self, metadata: dict[str, Any]) -> None:
+        '''Exercise the same independent readback verifier used by the REST writer.'''
+        publisher.wordpress_seo._verify_response(
+            FakeResponse({'id': 5303, 'meta': metadata}), 5303, self.expected, 'readback',
+        )
+
+    def test_exact_match_succeeds_without_canonical_comparison(self) -> None:
+        '''Exact values remain the first successful comparison path for every field.'''
+        with patch.object(publisher.wordpress_seo.re, 'sub',
+                          side_effect=AssertionError('Exact equality must pass immediately')):
+            self._verify(dict(self.expected))
+
+    def test_production_space_readback_succeeds_without_changing_intended_post(self) -> None:
+        '''Accept the 150-to-148-character production pair and retain all original write values.'''
+        self.assertEqual(len(self.PRODUCTION_EXPECTED), 150)
+        self.assertEqual(len(self.PRODUCTION_ACTUAL), 148)
+        actual = {**self.expected, '_yoast_wpseo_metadesc': self.PRODUCTION_ACTUAL}
+        http = FakeWordPress()
+        with patch.object(http, 'get', return_value=FakeResponse({'id': 5303, 'meta': actual})):
+            publisher.wordpress_seo.write_yoast_metadata(
+                http, 5303, focus_keyword=self.expected['_yoast_wpseo_focuskw'],
+                description=self.PRODUCTION_EXPECTED, title=self.expected['_yoast_wpseo_title'],
+                api_base='https://wordpress.example.invalid', timeout=(10.0, 60.0),
+            )
+        self.assertEqual(http.updates[0]['json'], {'meta': self.expected})
+        self.assertEqual(http.stored_meta, self.expected)
+        self.assertEqual(self.expected['_yoast_wpseo_metadesc'], self.PRODUCTION_EXPECTED)
+        self.assertFalse(http.creates)
+
+    def test_material_description_differences_still_fail(self) -> None:
+        '''Space tolerance cannot mask truncation, numbers, words, ordering or punctuation.'''
+        actual = self.PRODUCTION_ACTUAL
+        variants = {
+            'changed_number': actual.replace('3,311', '3,312'),
+            'truncated': actual[:-4],
+            'missing_word': actual.replace('single acquisitions', 'acquisitions'),
+            'additional_word': actual.replace('bitcoin buy', 'bitcoin market buy'),
+            'reordered_words': actual.replace('largest single', 'single largest'),
+            'changed_punctuation': actual.replace('months.', 'months!'),
+            'changed_meaning': actual.replace('purchased', 'sold'),
+            'material_content': 'A different report about Strive bitcoin purchases.',
+        }
+        for difference, description in variants.items():
+            with self.subTest(difference=difference):
+                with self.assertRaisesRegex(
+                    publisher.wordpress_seo.MetadataSyncError,
+                    'metadata_readback_value_mismatch:_yoast_wpseo_metadesc',
+                ):
+                    self._verify({**self.expected, '_yoast_wpseo_metadesc': description})
+
+    def test_unproven_whitespace_and_text_representations_still_fail(self) -> None:
+        '''Do not trim boundaries, collapse other whitespace, normalize Unicode or decode entities.'''
+        variants = {
+            'tab': ('A  report', 'A\treport'),
+            'linefeed': ('A  report', 'A\nreport'),
+            'carriage_return': ('A  report', 'A\rreport'),
+            'nbsp': ('A  report', 'A\u00a0report'),
+            'em_space': ('A  report', 'A\u2003report'),
+            'thin_space': ('A  report', 'A\u2009report'),
+            'zero_width_space': ('A  report', 'A\u200breport'),
+            'leading_trim': (' A  report', 'A report'),
+            'trailing_trim': ('A  report ', 'A report'),
+            'leading_addition': ('A  report', ' A report'),
+            'trailing_addition': ('A  report', 'A report '),
+            'unicode_nfc': ('Caf\u00e9  report', 'Cafe\u0301 report'),
+            'html_entity': ('A  &amp; report', 'A & report'),
+        }
+        for difference, (expected, actual) in variants.items():
+            with self.subTest(difference=difference):
+                self.expected['_yoast_wpseo_metadesc'] = expected
+                with self.assertRaisesRegex(
+                    publisher.wordpress_seo.MetadataSyncError,
+                    'metadata_readback_value_mismatch:_yoast_wpseo_metadesc',
+                ):
+                    self._verify({**self.expected, '_yoast_wpseo_metadesc': actual})
+
+    def test_non_string_description_readback_still_fails(self) -> None:
+        '''The comparison fallback never coerces missing or non-string values.'''
+        for actual in (None, 0, True, [], {}):
+            with self.subTest(actual=actual):
+                with self.assertRaisesRegex(
+                    publisher.wordpress_seo.MetadataSyncError,
+                    'metadata_readback_value_mismatch:_yoast_wpseo_metadesc',
+                ):
+                    self._verify({**self.expected, '_yoast_wpseo_metadesc': actual})
+
+    def test_title_and_focus_keep_exact_comparison(self) -> None:
+        '''Only metadesc may use the observed repeated-space representation fallback.'''
+        for key in ('_yoast_wpseo_title', '_yoast_wpseo_focuskw'):
+            with self.subTest(field=key):
+                actual = {**self.expected, '_yoast_wpseo_metadesc': self.PRODUCTION_ACTUAL,
+                          key: self.expected[key].replace(' ', '  ', 1)}
+                with self.assertRaisesRegex(
+                    publisher.wordpress_seo.MetadataSyncError,
+                    f'metadata_readback_value_mismatch:{key}',
+                ):
+                    self._verify(actual)
+
+
 class YoastMetadataPublicationTests(unittest.TestCase):
     '''Verify publication mapping, round trips and partial success independently of SQL.'''
 
