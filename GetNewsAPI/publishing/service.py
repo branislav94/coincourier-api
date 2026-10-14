@@ -60,13 +60,17 @@ class PublishingService:
 
     def publish_due(self, limit: int) -> dict[str, int]:
         result = {"attempted": 0, "succeeded": 0, "failed": 0}
+        attempted_rich_ids: set[int] = set()
         for _ in range(max(0, limit)):
             claim = self.repository.claim_next(
                 timeout_minutes=self.claim_timeout_minutes,
                 fresh_start_after=self.fresh_start_after,
+                exclude_rich_article_ids=tuple(sorted(attempted_rich_ids)),
             )
             if claim is None:
                 break
+            # A failed claim can become retryable immediately; reserve it for a later invocation.
+            attempted_rich_ids.add(int(claim.article["id"]))
             result["attempted"] += 1
             if self._publish_claim(claim):
                 result["succeeded"] += 1

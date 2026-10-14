@@ -112,7 +112,11 @@ class FakeCursor:
         elif normalized.startswith("select r.*, c.id as durable_raw_article_id"):
             row = self.database.rich
             state = row.get("publish_status")
-            eligible = not row.get("published") and (
+            excluded_ids = ()
+            if "and r.id not in (" in normalized:
+                placeholders = normalized.split("and r.id not in (", 1)[1].split(")", 1)[0]
+                excluded_ids = params[-placeholders.count("%s"):]
+            eligible = row["id"] not in excluded_ids and not row.get("published") and (
                 state in (None, "fresh", "pending", "retryable")
                 or (
                     state in ("claimed", "post_created")
@@ -233,6 +237,7 @@ class ScriptedClaimCursor:
         return self.delegate.rowcount
 
     def execute(self, sql, params=()):
+        self.connection.executions.append((sql, params))
         if self.connection.error is not None:
             error = self.connection.error
             self.connection.error = None
@@ -256,6 +261,7 @@ class ScriptedClaimConnection:
         self.rollbacks = 0
         self.cursor_closed = False
         self.closed = False
+        self.executions = []
 
     def start_transaction(self):
         self.transaction_starts += 1
@@ -593,6 +599,89 @@ class ProcessingWiringTests(unittest.TestCase):
 
 
 class PublishingRepositoryTests(unittest.TestCase):
+    def test_excluded_rich_row_remains_unclaimed(self):
+        database = FakeClaimDatabase()
+        repository = PublicationRepository(connect=database.connect)
+
+        claim = repository.claim_next(
+            timeout_minutes=30,
+            fresh_start_after=None,
+            exclude_rich_article_ids={8, 9},
+        )
+
+        self.assertIsNone(claim)
+        self.assertEqual(database.rich["publish_attempt_count"], 0)
+        self.assertEqual(database.rich["publish_status"], "fresh")
+        queries = [event for event in database.events if isinstance(event, tuple)]
+        self.assertEqual(len(queries), 1)
+        self.assertIn("and r.id not in (%s, %s)", queries[0][1])
+        self.assertEqual(queries[0][2], (30, 8, 9))
+        self.assertIn("commit", database.events)
+        self.assertIn("connection-close", database.events)
+
+    def test_exclusions_are_parameters_after_fresh_cutoff_and_preserve_due_selection(self):
+        database = FakeClaimDatabase()
+        cutoff = "2026-10-14 00:00:00"
+        excluded_ids = (445, 9223372036854775807)
+
+        claim = PublicationRepository(connect=database.connect).claim_next(
+            timeout_minutes=30,
+            fresh_start_after=cutoff,
+            exclude_rich_article_ids=excluded_ids,
+        )
+
+        self.assertIsNotNone(claim)
+        select = next(event for event in database.events if isinstance(event, tuple))
+        sql, params = select[1:]
+        self.assertEqual(params, (30, cutoff, *excluded_ids))
+        self.assertIn("c.insertdate >= %s", sql)
+        self.assertIn("and r.id not in (%s, %s)", sql)
+        self.assertIn("c.chosen_for_publish = 1", sql)
+        self.assertIn("c.scheduled_for <= utc_timestamp()", sql)
+        self.assertIn("order by c.scheduled_for asc, r.id asc limit 1 for update", sql)
+        self.assertNotIn(cutoff, sql)
+        for rich_id in excluded_ids:
+            self.assertNotIn(str(rich_id), sql)
+
+    def test_empty_exclusions_preserve_original_claim_query(self):
+        database = FakeClaimDatabase()
+
+        claim = PublicationRepository(connect=database.connect).claim_next(
+            timeout_minutes=30,
+            fresh_start_after=None,
+        )
+
+        self.assertIsNotNone(claim)
+        select = next(event for event in database.events if isinstance(event, tuple))
+        self.assertNotIn("not in", select[1])
+        self.assertEqual(select[2], (30,))
+
+    def test_deadlock_retry_keeps_original_exclusions_and_fresh_cutoff(self):
+        database = ScriptedClaimDatabase([ClaimContentionPolicyTests.deadlock()])
+        excluded_ids = [22, 9, 22]
+
+        def connect():
+            # A caller-owned collection changing during a retry cannot alter its SQL filter.
+            excluded_ids.append(8)
+            return database.connect()
+
+        claim = PublicationRepository(connect=connect).claim_next(
+            timeout_minutes=30,
+            fresh_start_after="2026-10-14 00:00:00",
+            exclude_rich_article_ids=excluded_ids,
+        )
+
+        self.assertIsNotNone(claim)
+        self.assertEqual(claim.article["id"], 8)
+        self.assertEqual(len(database.connections), 2)
+        first, second = database.connections
+        self.assertEqual(first.executions[0], second.executions[0])
+        self.assertEqual(first.executions[0][1], (30, "2026-10-14 00:00:00", 9, 22))
+        self.assertEqual(first.rollbacks, 1)
+        self.assertTrue(first.closed)
+        self.assertEqual(second.commits, 1)
+        self.assertTrue(second.closed)
+
     def test_two_publishers_cannot_claim_same_rich_row(self):
         database = FakeClaimDatabase()
         repository = PublicationRepository(connect=database.connect)
@@ -652,8 +741,8 @@ class ServiceRepository:
         self.events = []
         self.complete_result = True
 
-    def claim_next(self, **_kwargs):
-        if self.claimed:
+    def claim_next(self, *, exclude_rich_article_ids=(), **_kwargs):
+        if self.claimed or self.row["id"] in exclude_rich_article_ids:
             return None
         self.claimed = True
         return PublicationClaim(self.token, dict(self.row), 1)
@@ -743,7 +832,162 @@ class ServicePublisher:
         self.events.append("media-wp-meta")
 
 
+class BatchServiceRepository(ServiceRepository):
+    """Model immediately retryable failures and ordered selection across several rows."""
+
+    def __init__(self):
+        super().__init__()
+        self.rows = {
+            rich_id: {
+                **ARTICLE,
+                "id": rich_id,
+                "raw_article_id": rich_id + 1000,
+                "news_url": f"https://news.example/{rich_id}",
+                "publication_key": f"coincourier:{rich_id}:{rich_id + 1000}",
+                "wp_post_id": 5303 + index,
+                "wp_post_url": f"https://wp.example/{5303 + index}",
+            }
+            for index, rich_id in enumerate((445, 446, 447))
+        }
+        self.claim_exclusions = []
+        self.lost_identity_ids = set()
+
+    def claim_next(self, *, exclude_rich_article_ids=(), **_kwargs):
+        self.claim_exclusions.append(tuple(exclude_rich_article_ids))
+        for rich_id, row in self.rows.items():
+            if (
+                rich_id not in exclude_rich_article_ids
+                and not row["published"]
+                and row["publish_status"] in ("fresh", "pending", "retryable")
+            ):
+                self.row = row
+                snapshot = dict(row)
+                attempt = row["publish_attempt_count"] + 1
+                self.token = f"claim-{rich_id}-{attempt}"
+                row.update(
+                    publish_status="claimed",
+                    publish_claim_token=self.token,
+                    publish_attempt_count=attempt,
+                )
+                return PublicationClaim(self.token, snapshot, attempt)
+        return None
+
+    def save_identity(self, rich_id, token, raw_id, key, **kwargs):
+        if rich_id in self.lost_identity_ids:
+            self.row.update(publish_status="retryable", publish_claim_token=None)
+            return False
+        return super().save_identity(rich_id, token, raw_id, key, **kwargs)
+
+    def complete(self, rich_id, token):
+        if self.row["id"] != rich_id or self.row["publish_claim_token"] != token:
+            return False
+        self.row.update(published=1, publish_status="published", publish_claim_token=None)
+        return super().complete(rich_id, token)
+
+    def fail(self, rich_id, token, error):
+        if self.row["id"] != rich_id or self.row["publish_claim_token"] != token:
+            self.events.append("fail-rejected")
+            return False
+        self.row.update(publish_status="retryable", publish_claim_token=None)
+        return super().fail(rich_id, token, error)
+
+
+class BatchServicePublisher(ServicePublisher):
+    def __init__(self):
+        super().__init__()
+        self.failing_ids = {445}
+        self.reconciled_ids = []
+
+    def reconcile(self, article, context):
+        rich_id = context.rich_article_id
+        self.reconciled_ids.append(rich_id)
+        return PublicationResult(
+            success=rich_id not in self.failing_ids,
+            external_id=context.existing_external_id,
+            reconciled=True,
+            error="yoast_metadata:response_mismatch" if rich_id in self.failing_ids else None,
+        )
+
+
 class PublishingServiceTests(unittest.TestCase):
+    def test_failed_earliest_row_leaves_batch_slots_for_next_due_rows(self):
+        repository = BatchServiceRepository()
+        adapter = BatchServicePublisher()
+        image_preparer = Mock()
+        retained_identity = {
+            key: repository.rows[445][key]
+            for key in ("publication_key", "wp_post_id", "wp_post_url")
+        }
+
+        result = PublishingService(repository, adapter, image_preparer).publish_due(3)
+
+        self.assertEqual(result, {"attempted": 3, "succeeded": 2, "failed": 1})
+        self.assertEqual(adapter.reconciled_ids, [445, 446, 447])
+        self.assertEqual(repository.claim_exclusions, [(), (445,), (445, 446)])
+        failed = repository.rows[445]
+        self.assertEqual(failed["published"], 0)
+        self.assertEqual(failed["publish_status"], "retryable")
+        self.assertIsNone(failed["publish_claim_token"])
+        self.assertEqual({key: failed[key] for key in retained_identity}, retained_identity)
+        self.assertTrue(all(row["publish_attempt_count"] == 1 for row in repository.rows.values()))
+        self.assertTrue(all(repository.rows[rich_id]["published"] == 1 for rich_id in (446, 447)))
+        image_preparer.assert_not_called()
+        self.assertEqual(adapter.published_images, [])
+
+    def test_next_invocation_retries_failed_row_with_retained_external_identity(self):
+        repository = BatchServiceRepository()
+        adapter = BatchServicePublisher()
+        service = PublishingService(repository, adapter, Mock())
+        service.publish_due(3)
+        adapter.failing_ids.clear()
+
+        result = service.publish_due(3)
+
+        self.assertEqual(result, {"attempted": 1, "succeeded": 1, "failed": 0})
+        self.assertEqual(adapter.reconciled_ids, [445, 446, 447, 445])
+        self.assertEqual(repository.claim_exclusions[3:], [(), (445,)])
+        self.assertEqual(repository.rows[445]["publish_attempt_count"], 2)
+        self.assertEqual(repository.rows[445]["wp_post_id"], 5303)
+        self.assertEqual(repository.rows[445]["published"], 1)
+        self.assertEqual(adapter.published_images, [])
+
+    def test_limit_counts_attempts_including_failures(self):
+        repository = BatchServiceRepository()
+        adapter = BatchServicePublisher()
+
+        result = PublishingService(repository, adapter, Mock()).publish_due(2)
+
+        self.assertEqual(result, {"attempted": 2, "succeeded": 1, "failed": 1})
+        self.assertEqual(adapter.reconciled_ids, [445, 446])
+        self.assertEqual(repository.rows[447]["publish_attempt_count"], 0)
+        self.assertEqual(repository.rows[447]["publish_status"], "fresh")
+
+    def test_nonpositive_limit_does_not_claim_any_row(self):
+        for limit in (0, -1):
+            with self.subTest(limit=limit):
+                repository = BatchServiceRepository()
+
+                result = PublishingService(repository, BatchServicePublisher(), Mock()).publish_due(limit)
+
+                self.assertEqual(result, {"attempted": 0, "succeeded": 0, "failed": 0})
+                self.assertEqual(repository.claim_exclusions, [])
+
+    def test_claim_is_excluded_before_identity_ownership_failure(self):
+        repository = BatchServiceRepository()
+        repository.lost_identity_ids.add(445)
+        adapter = BatchServicePublisher()
+
+        with self.assertLogs("publishing.service", level="ERROR"):
+            result = PublishingService(repository, adapter, Mock()).publish_due(3)
+
+        self.assertEqual(result, {"attempted": 3, "succeeded": 2, "failed": 1})
+        self.assertEqual(repository.claim_exclusions, [(), (445,), (445, 446)])
+        self.assertEqual(adapter.reconciled_ids, [446, 447])
+        self.assertEqual(repository.rows[445]["publish_attempt_count"], 1)
+        self.assertEqual(repository.rows[445]["publish_status"], "retryable")
+        self.assertEqual(repository.rows[445]["wp_post_id"], 5303)
+        self.assertIn("fail-rejected", repository.events)
+
     def test_transient_claim_deadlock_does_not_end_publish_batch(self):
         database = ScriptedClaimDatabase([ClaimContentionPolicyTests.deadlock()])
         claim_repository = PublicationRepository(connect=database.connect)

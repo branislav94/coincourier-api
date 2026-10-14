@@ -4,6 +4,7 @@ from __future__ import annotations
 
 from typing import Any
 import logging
+import re
 
 import requests
 
@@ -81,8 +82,16 @@ def _verify_response(
     for key, value in expected.items():
         if key not in metadata:
             raise MetadataSyncError(f'metadata_{stage}_missing_field:{key}')
-        if not isinstance(metadata[key], str) or metadata[key] != value:
+        actual = metadata[key]
+        if not isinstance(actual, str):
             raise MetadataSyncError(f'metadata_{stage}_value_mismatch:{key}')
+        if actual == value:
+            continue
+        # Production metadesc readback collapses ordinary U+0020 space runs.
+        # Compare only that representation; preserve the intended REST write.
+        if key == '_yoast_wpseo_metadesc' and re.sub(r' {2,}', ' ', actual) == re.sub(r' {2,}', ' ', value):
+            continue
+        raise MetadataSyncError(f'metadata_{stage}_value_mismatch:{key}')
 
 
 def write_yoast_metadata(
