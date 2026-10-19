@@ -87,7 +87,7 @@ class FakeWordPress:
 
 
 class YoastMetadataReadbackTests(unittest.TestCase):
-    '''Limit description tolerance to the exact space representation observed in production.'''
+    '''Accept only the expected description's WordPress text-field whitespace form.'''
 
     PRODUCTION_EXPECTED = (
         'The recent  Strive bitcoin buy  stands out as one of the largest single acquisitions '
@@ -116,7 +116,10 @@ class YoastMetadataReadbackTests(unittest.TestCase):
         '''Exact values remain the first successful comparison path for every field.'''
         with patch.object(publisher.wordpress_seo.re, 'sub',
                           side_effect=AssertionError('Exact equality must pass immediately')):
-            self._verify(dict(self.expected))
+            for description in (self.PRODUCTION_EXPECTED, ' \tExact\r\n text\x00\x0b '):
+                with self.subTest(description=description):
+                    self.expected['_yoast_wpseo_metadesc'] = description
+                    self._verify(dict(self.expected))
 
     def test_production_space_readback_succeeds_without_changing_intended_post(self) -> None:
         '''Accept the 150-to-148-character production pair and retain all original write values.'''
@@ -134,6 +137,44 @@ class YoastMetadataReadbackTests(unittest.TestCase):
         self.assertEqual(http.stored_meta, self.expected)
         self.assertEqual(self.expected['_yoast_wpseo_metadesc'], self.PRODUCTION_EXPECTED)
         self.assertFalse(http.creates)
+
+    def test_confirmed_production_whitespace_excerpts_succeed_without_mutation(self) -> None:
+        '''Use the supplied excerpts for rows 490/552/607, not invented full descriptions.'''
+        excerpts = {
+            'rich_490_wp_5441_suffix': ('... The specific — bitcoin ', '... The specific — bitcoin'),
+            'rich_552_wp_5624_excerpt': (
+                'Ripple Prime  has launched ... October 15, 2026. \n The products',
+                'Ripple Prime has launched ... October 15, 2026. The products',
+            ),
+            'rich_607_wp_5789_suffix': ('... ParaFi Investor Day. ', '... ParaFi Investor Day.'),
+        }
+        for case, (expected, actual) in excerpts.items():
+            with self.subTest(case=case):
+                self.expected['_yoast_wpseo_metadesc'] = expected
+                before = dict(self.expected)
+                http = FakeWordPress()
+                readback = {**before, '_yoast_wpseo_metadesc': actual}
+                with patch.object(http, 'get', return_value=FakeResponse({'id': 5303, 'meta': readback})):
+                    publisher.wordpress_seo.write_yoast_metadata(
+                        http, 5303, focus_keyword=before['_yoast_wpseo_focuskw'],
+                        description=expected, title=before['_yoast_wpseo_title'],
+                        api_base='https://wordpress.example.invalid', timeout=(10.0, 60.0),
+                    )
+                self.assertEqual(http.updates[0]['json'], {'meta': before})
+                self.assertEqual(http.stored_meta, before)
+                self.assertEqual(self.expected, before)
+
+    def test_expected_ascii_text_field_runs_and_trim_succeed(self) -> None:
+        '''Collapse CR/LF/TAB/SPACE runs and use PHP's default trim character set only.'''
+        descriptions = ['A  report', 'A\treport', 'A\nreport', 'A\rreport',
+                        'A \r\n\t  report']
+        descriptions.extend(character + 'A report' + character
+                            for character in (' ', '\t', '\n', '\r', '\x00', '\x0b'))
+        descriptions.append(' \t\n\r\x00\x0bA \r\n\t  report\x0b\x00\r\n\t ')
+        for description in descriptions:
+            with self.subTest(expected=description):
+                self.expected['_yoast_wpseo_metadesc'] = description
+                self._verify({**self.expected, '_yoast_wpseo_metadesc': 'A report'})
 
     def test_material_description_differences_still_fail(self) -> None:
         '''Space tolerance cannot mask truncation, numbers, words, ordering or punctuation.'''
@@ -156,20 +197,30 @@ class YoastMetadataReadbackTests(unittest.TestCase):
                 ):
                     self._verify({**self.expected, '_yoast_wpseo_metadesc': description})
 
-    def test_unproven_whitespace_and_text_representations_still_fail(self) -> None:
-        '''Do not trim boundaries, collapse other whitespace, normalize Unicode or decode entities.'''
+    def test_actual_whitespace_and_unproven_text_representations_still_fail(self) -> None:
+        '''Never normalize actual readback, other whitespace, Unicode or HTML entities.'''
         variants = {
-            'tab': ('A  report', 'A\treport'),
-            'linefeed': ('A  report', 'A\nreport'),
-            'carriage_return': ('A  report', 'A\rreport'),
+            'actual_repeated_space': ('A report', 'A  report'),
+            'actual_longer_space_run': ('A  report', 'A   report'),
+            'actual_tab': ('A  report', 'A\treport'),
+            'actual_linefeed': ('A  report', 'A\nreport'),
+            'actual_carriage_return': ('A  report', 'A\rreport'),
             'nbsp': ('A  report', 'A\u00a0report'),
+            'expected_nbsp': ('A\u00a0report', 'A report'),
+            'expected_nbsp_boundary': ('\u00a0A report\u00a0', 'A report'),
             'em_space': ('A  report', 'A\u2003report'),
+            'expected_em_space': ('A\u2003report', 'A report'),
+            'expected_em_space_boundary': ('\u2003A report\u2003', 'A report'),
             'thin_space': ('A  report', 'A\u2009report'),
             'zero_width_space': ('A  report', 'A\u200breport'),
-            'leading_trim': (' A  report', 'A report'),
-            'trailing_trim': ('A  report ', 'A report'),
+            'expected_formfeed': ('A\x0creport', 'A report'),
+            'expected_formfeed_boundary': ('\x0cA report\x0c', 'A report'),
+            'expected_interior_vertical_tab': ('A\x0breport', 'A report'),
+            'expected_interior_nul': ('A\x00report', 'A report'),
             'leading_addition': ('A  report', ' A report'),
             'trailing_addition': ('A  report', 'A report '),
+            'actual_vertical_tab_boundary': ('A report', '\x0bA report\x0b'),
+            'actual_nul_boundary': ('A report', '\x00A report\x00'),
             'unicode_nfc': ('Caf\u00e9  report', 'Cafe\u0301 report'),
             'html_entity': ('A  &amp; report', 'A & report'),
         }
@@ -193,16 +244,23 @@ class YoastMetadataReadbackTests(unittest.TestCase):
                     self._verify({**self.expected, '_yoast_wpseo_metadesc': actual})
 
     def test_title_and_focus_keep_exact_comparison(self) -> None:
-        '''Only metadesc may use the observed repeated-space representation fallback.'''
+        '''Title/focus whitespace differences remain failures in either direction.'''
+        variants = [('A  report', 'A report'), ('A\treport', 'A report'),
+                    ('A\nreport', 'A report'), ('A\rreport', 'A report'),
+                    (' A report', 'A report'), ('A report ', 'A report'),
+                    ('\x00A report\x0b', 'A report'), ('A\u00a0report', 'A report')]
         for key in ('_yoast_wpseo_title', '_yoast_wpseo_focuskw'):
-            with self.subTest(field=key):
-                actual = {**self.expected, '_yoast_wpseo_metadesc': self.PRODUCTION_ACTUAL,
-                          key: self.expected[key].replace(' ', '  ', 1)}
-                with self.assertRaisesRegex(
-                    publisher.wordpress_seo.MetadataSyncError,
-                    f'metadata_readback_value_mismatch:{key}',
-                ):
-                    self._verify(actual)
+            for expected, readback in variants:
+                for expected, readback in ((expected, readback), (readback, expected)):
+                    with self.subTest(field=key, expected=expected, actual=readback):
+                        self.expected[key] = expected
+                        actual = {**self.expected, '_yoast_wpseo_metadesc': self.PRODUCTION_ACTUAL,
+                                  key: readback}
+                        with self.assertRaisesRegex(
+                            publisher.wordpress_seo.MetadataSyncError,
+                            f'metadata_readback_value_mismatch:{key}',
+                        ):
+                            self._verify(actual)
 
 
 class YoastMetadataPublicationTests(unittest.TestCase):
@@ -1047,6 +1105,49 @@ def run_restart_attempt(app_path: str, wp_path: str, phase: str) -> dict[str, An
 
 class DurableMetadataProcessRestartTests(unittest.TestCase):
     '''Reopen committed application and WordPress fake state in fresh interpreter processes.'''
+
+    def test_sanitized_readback_keeps_application_seo_meta_and_post_payload_unchanged(self) -> None:
+        '''A successful local service run must not save the comparison form into seo_meta.'''
+        from publishing.service import PublishingService
+        from repositories.publication import PublicationRepository
+
+        description = '\tA  report\r\n with details. \x0b'
+        sanitized_readback = 'A report with details.'
+        with tempfile.TemporaryDirectory(prefix='yoast-whitespace-fixture-') as directory:
+            path = str(Path(directory) / 'app.sqlite')
+            create_restart_database(path)
+            with closing(sqlite3.connect(path)) as connection:
+                connection.execute('UPDATE rich_crpytonews SET seo_meta = ? WHERE id = 11', (description,))
+                connection.commit()
+            repository = PublicationRepository(connect=lambda: SQLitePublicationConnection(path))
+            adapter = publisher.WordPressPublisher()
+            http = FakeWordPress()
+            original_get = http.get
+
+            def sanitized_get(url: str, **kwargs: Any) -> FakeResponse:
+                response = original_get(url, **kwargs)
+                response.body['meta']['_yoast_wpseo_metadesc'] = sanitized_readback
+                return response
+
+            with (
+                patch.object(publisher, 'session', http),
+                patch.object(http, 'get', side_effect=sanitized_get),
+                patch.object(publisher, 'WP_API_URL', 'https://wordpress.example.invalid'),
+                patch.object(publisher, 'ensure_category', return_value=12),
+                patch.object(publisher, 'ensure_term', return_value=13),
+                patch.object(adapter, 'find_external_media', return_value=None),
+                patch.object(publisher.mysql.connector, 'connect',
+                             side_effect=AssertionError('WordPress SQL must not be called')),
+            ):
+                result = PublishingService(repository, adapter, MagicMock(return_value=(None, {})),
+                                           fresh_start_after=None).publish_due(1)
+            with closing(sqlite3.connect(path)) as connection:
+                row = connection.execute(
+                    'SELECT seo_meta, published, publish_status FROM rich_crpytonews WHERE id = 11',
+                ).fetchone()
+        self.assertEqual(result, {'attempted': 1, 'succeeded': 1, 'failed': 0})
+        self.assertEqual(row, (description, 1, 'published'))
+        self.assertEqual(http.updates[0]['json']['meta']['_yoast_wpseo_metadesc'], description)
 
     def restart_attempts(self, first_phase: str) -> tuple[dict[str, Any], dict[str, Any]]:
         '''Run actual production objects with independent process-local fixtures.'''
