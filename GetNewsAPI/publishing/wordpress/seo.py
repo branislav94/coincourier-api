@@ -87,9 +87,11 @@ def _verify_response(
             raise MetadataSyncError(f'metadata_{stage}_value_mismatch:{key}')
         if actual == value:
             continue
-        # Production metadesc readback collapses ordinary U+0020 space runs.
-        # Compare only that representation; preserve the intended REST write.
-        if key == '_yoast_wpseo_metadesc' and re.sub(r' {2,}', ' ', actual) == re.sub(r' {2,}', ' ', value):
+        # Match WordPress text-field whitespace handling on the expected value.
+        # PHP trim() also removes boundary NUL/vertical tab; keep readback strict.
+        if key == '_yoast_wpseo_metadesc' and actual == re.sub(
+            r'[\r\n\t ]+', ' ', value,
+        ).strip(' \n\r\t\v\x00'):
             continue
         raise MetadataSyncError(f'metadata_{stage}_value_mismatch:{key}')
 
