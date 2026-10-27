@@ -203,6 +203,7 @@ class CompatibilityTests(unittest.TestCase):
             "Alt",
             caption="Credit",
             description=None,
+            required_attribution=False,
             http_session=publisher.session,
             api_url=publisher.WP_API_URL,
         )
@@ -333,6 +334,58 @@ class WordPressClientTests(unittest.TestCase):
             timeout=client.WP_HTTP_TIMEOUT,
         )
         http_response.raise_for_status.assert_called_once_with()
+
+    def test_required_media_credit_preserves_complete_long_attribution(self):
+        credit = "Required notice. " * 90 + "Creator; https://source.example; CC BY 4.0; https://creativecommons.org/licenses/by/4.0/"
+        http = Mock()
+        saved = media.set_media_details(
+            72, "Alt", caption=credit, description=credit,
+            required_attribution=True, http_session=http,
+        )
+        self.assertTrue(saved)
+        self.assertGreater(len(credit), 1000)
+        payload = http.post.call_args.kwargs["json"]
+        self.assertEqual(payload["caption"], credit)
+        self.assertEqual(payload["description"], credit)
+
+    def test_required_media_metadata_failure_raises_sanitized_error(self):
+        http = Mock()
+        http.post.return_value.raise_for_status.side_effect = requests.HTTPError(
+            "sensitive-token complete-request-headers"
+        )
+        with self.assertLogs(media.logger, level="WARNING") as logs:
+            with self.assertRaises(media.MediaMetadataError) as caught:
+                media.set_media_details(
+                    72, "Alt", caption="Credit", description="Credit",
+                    required_attribution=True, http_session=http,
+                )
+        self.assertEqual(caught.exception.reason, "metadata_update_failed")
+        self.assertIn("media_id=72", " ".join(logs.output))
+        self.assertNotIn("sensitive-token", " ".join(logs.output))
+        self.assertNotIn("sensitive-token", str(caught.exception))
+
+    def test_optional_media_metadata_failure_returns_false(self):
+        http = Mock()
+        http.post.side_effect = requests.ConnectionError("unavailable")
+        with self.assertLogs(media.logger, level="WARNING"):
+            saved = media.set_media_details(72, "Alt", http_session=http)
+        self.assertFalse(saved)
+
+    def test_invalid_required_credit_rejects_before_request_without_truncation(self):
+        for credit, reason in (
+            ("", "attribution_missing"),
+            ("x" * (media.MAX_REQUIRED_ATTRIBUTION_CHARS + 1), "attribution_too_large"),
+        ):
+            with self.subTest(reason=reason):
+                http = Mock()
+                with self.assertLogs(media.logger, level="WARNING"):
+                    with self.assertRaises(media.MediaMetadataError) as caught:
+                        media.set_media_details(
+                            72, "Alt", caption=credit, description=credit,
+                            required_attribution=True, http_session=http,
+                        )
+                self.assertEqual(caught.exception.reason, reason)
+                http.post.assert_not_called()
 
 
 class TaxonomyTests(unittest.TestCase):
@@ -682,6 +735,111 @@ class AdvisoryLockTests(unittest.TestCase):
 
 
 class AttributionFlowTests(unittest.TestCase):
+    @staticmethod
+    def upload_selection(metadata, *, metadata_error=None, from_generation=False):
+        selected = (b"prepared", "image.jpg", dict(metadata))
+        details_response = Mock()
+        details_response.raise_for_status.side_effect = metadata_error
+        with (
+            patch.object(publisher, "IMAGE_SEARCH_ENGINE", "v2"),
+            patch.object(publisher, "IMAGE_SOURCE_MODE", "hybrid"),
+            patch.object(publisher, "IMAGE_SOURCE_PRIORITY", "stock_first"),
+            patch.object(publisher, "USE_SOURCE_IMAGES", False),
+            patch.object(
+                publisher, "_search_stock_image_content",
+                return_value=(None, True) if from_generation else (selected, False),
+            ),
+            patch.object(publisher, "_generated_image_content", return_value=selected) as generated,
+            patch.object(publisher, "upload_media", return_value=88) as upload,
+            patch.object(publisher.session, "post", return_value=details_response) as post,
+        ):
+            result = publisher.upload_image(
+                None, ARTICLE_ROW["title"], ARTICLE_ROW["hashtags"], article=ARTICLE_ROW,
+            )
+        return result, upload, post, generated
+
+    def test_long_cc_by_credit_and_change_notice_survive_upload(self):
+        original = "Provider required notice. " * 70 + (
+            "Creator: Example Artist. Source: https://source.example/file. "
+            "CC BY 4.0 (https://creativecommons.org/licenses/by/4.0/)"
+        )
+        (media_id, metadata), _upload, post, generated = self.upload_selection({
+            "provider": "openverse", "license_name": "cc-by",
+            "credit_text": original, "attribution_text": original,
+        })
+        published = original + "\nChanges: cropped and resized for publication."
+        self.assertEqual(media_id, 88)
+        self.assertEqual(post.call_args.kwargs["json"]["caption"], published)
+        self.assertEqual(post.call_args.kwargs["json"]["description"], published)
+        self.assertEqual(metadata["provider_attribution_text"], original)
+        self.assertEqual(metadata["attribution_text"], published)
+        self.assertEqual(metadata["credit_text"], published)
+        generated.assert_not_called()
+
+    def test_generated_image_does_not_receive_a_cc_change_notice(self):
+        (media_id, metadata), _upload, post, generated = self.upload_selection({
+            "provider": "grok-image", "credit_text": "", "license_name": "cc-by",
+        }, from_generation=True)
+        self.assertEqual(media_id, 88)
+        self.assertNotIn("provider_attribution_text", metadata)
+        self.assertNotIn("caption", post.call_args.kwargs["json"])
+        self.assertNotIn("description", post.call_args.kwargs["json"])
+        generated.assert_called_once()
+
+    def test_pexels_pixabay_credit_behavior_remains_compatible(self):
+        for provider in ("pexels", "pixabay"):
+            with self.subTest(provider=provider):
+                (media_id, metadata), _upload, post, generated = self.upload_selection({
+                    "provider": provider, "credit_text": "Original provider credit",
+                })
+                self.assertEqual(media_id, 88)
+                self.assertEqual(metadata["credit_text"], "Original provider credit")
+                self.assertEqual(post.call_args.kwargs["json"]["caption"], "Original provider credit")
+                generated.assert_not_called()
+
+    def test_required_credit_failure_returns_no_featured_image_and_never_generates(self):
+        with self.assertLogs(level="WARNING") as logs:
+            (media_id, metadata), upload, _post, generated = self.upload_selection({
+                "provider": "openverse", "license_name": "cc-by", "credit_text": "Complete credit",
+            }, metadata_error=requests.HTTPError("secret-token request credentials"))
+        self.assertIsNone(media_id)
+        self.assertEqual(metadata["featured_image_rejected_reason"], "metadata_update_failed")
+        upload.assert_called_once()
+        generated.assert_not_called()
+        self.assertNotIn("secret-token", " ".join(logs.output))
+
+        with (
+            patch.object(publisher, "ensure_category", return_value=21),
+            patch.object(publisher, "ensure_term", return_value=31),
+            patch.object(publisher.session, "post", return_value=response(body={"id": 101})) as post,
+            patch.object(publisher, "write_yoast_metadata"),
+            patch.object(publisher, "record_image_usage") as record,
+            patch("builtins.print"),
+        ):
+            result = publisher.WordPressPublisher().publish(
+                PublicationArticle.from_mapping(ARTICLE_ROW), None,
+                PublicationContext(published_at_utc=PUBLISHED_AT, creation_is_fresh=True),
+            )
+        self.assertTrue(result.success)
+        self.assertNotIn("featured_media", post.call_args.kwargs["json"])
+        record.assert_not_called()
+
+    def test_missing_or_oversized_stock_credit_rejects_before_media_upload(self):
+        for credit, reason in (
+            ("", "attribution_missing"),
+            ("x" * media.MAX_REQUIRED_ATTRIBUTION_CHARS, "attribution_too_large"),
+        ):
+            with self.subTest(reason=reason):
+                with self.assertLogs(publisher.logger, level="WARNING"):
+                    (media_id, metadata), upload, post, generated = self.upload_selection({
+                        "provider": "openverse", "license_name": "cc-by", "credit_text": credit,
+                    })
+                self.assertIsNone(media_id)
+                self.assertEqual(metadata["featured_image_rejected_reason"], reason)
+                upload.assert_not_called()
+                post.assert_not_called()
+                generated.assert_not_called()
+
     def test_openverse_attribution_reaches_wordpress_media_details_payload(self):
         raw = {
             "id": "openverse-phase-one",
@@ -750,6 +908,7 @@ class AttributionFlowTests(unittest.TestCase):
             raw["foreign_landing_url"],
             "CC BY 4.0",
             raw["license_url"],
+            "Changes: cropped and resized for publication.",
         ):
             self.assertIn(expected, payload["description"])
         details_response.raise_for_status.assert_called_once_with()

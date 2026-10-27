@@ -41,6 +41,7 @@ from config import (
 )
 from stock_images import StockImageCandidate, find_stock_image
 from image_search import search_images
+from image_search.license_policy import normalize_license_name
 from image_search.reuse import record_image_usage
 from publishing.models import (
     PublicationArticle,
@@ -184,12 +185,14 @@ def set_media_details(
     *,
     caption: str | None = None,
     description: str | None = None,
-) -> None:
-    wordpress_media.set_media_details(
+    required_attribution: bool = False,
+) -> bool:
+    return wordpress_media.set_media_details(
         media_id,
         alt_text,
         caption=caption,
         description=description,
+        required_attribution=required_attribution,
         http_session=session,
         api_url=WP_API_URL,
     )
@@ -1449,6 +1452,23 @@ def upload_image(
     content, filename, selected_meta = selected
     image_meta.update(selected_meta)
 
+    required_attribution = image_meta.get("provider") in {"pexels", "pixabay", "openverse", "wikimedia"}
+    credit_text = image_meta.get("credit_text") or image_meta.get("attribution_text") or ""
+    if required_attribution:
+        try:
+            wordpress_media.validate_required_attribution(credit_text)
+            image_meta["provider_attribution_text"] = credit_text
+            if normalize_license_name(image_meta.get("license_name")) == "cc-by":
+                credit_text += "\nChanges: cropped and resized for publication."
+            wordpress_media.validate_required_attribution(credit_text)
+        except wordpress_media.MediaMetadataError as exc:
+            image_meta["featured_image_rejected_reason"] = exc.reason
+            logger.warning("[IMG] stock attribution rejected reason=%s", exc.reason)
+            return None, image_meta
+        image_meta["credit_text"] = credit_text
+        image_meta["attribution_text"] = credit_text
+
+    media_id: int | None = None
     try:
         media_id = upload_media(
             content,
@@ -1464,16 +1484,26 @@ def upload_image(
             image_meta.get("score"),
             image_meta.get("openai_fallback_used"),
         )
-        credit_text = image_meta.get("credit_text") or ""
-        set_media_details(
+        metadata_saved = set_media_details(
             media_id,
             article_context.get("seo_focus") or title,
             caption=credit_text or None,
             description=credit_text or None,
+            required_attribution=required_attribution,
         )
+        if required_attribution and not metadata_saved:
+            raise wordpress_media.MediaMetadataError("metadata_update_failed")
         return media_id, image_meta
+    except wordpress_media.MediaMetadataError as exc:
+        image_meta["featured_image_rejected_reason"] = exc.reason
+        logger.warning(
+            "[IMG] stock featured image rejected media_id=%s reason=%s",
+            media_id,
+            exc.reason,
+        )
+        return None, image_meta
     except Exception as exc:
-        print(f"Upload failed for {filename}: {exc}")
+        logger.warning("[IMG] image upload failed media_id=%s error_type=%s", media_id, type(exc).__name__)
         return None, image_meta
 
 
