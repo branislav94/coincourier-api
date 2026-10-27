@@ -6,7 +6,7 @@ from config import IMAGE_SEARCH_PROVIDERS
 
 from .cache import CachedHttpClient
 from .provider import ImageSearchProvider
-from .providers import OpenverseProvider, PexelsProvider, PixabayProvider
+from .providers import OpenverseProvider, PexelsProvider, PixabayProvider, WikimediaProvider
 
 
 logger = logging.getLogger(__name__)
@@ -21,6 +21,7 @@ def build_provider_registry(
         "pexels": lambda: PexelsProvider(client=client or CachedHttpClient()),
         "pixabay": lambda: PixabayProvider(client=client or CachedHttpClient()),
         "openverse": lambda: OpenverseProvider(client=client or CachedHttpClient()),
+        "wikimedia": lambda: WikimediaProvider(client=client or CachedHttpClient()),
     }
     providers: list[ImageSearchProvider] = []
     seen: set[str] = set()

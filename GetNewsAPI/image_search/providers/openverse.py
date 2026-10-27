@@ -13,6 +13,7 @@ from config import (
 )
 
 from ..cache import CachedHttpClient
+from ..commons_identity import commons_identity_conflict, normalize_commons_identity
 from ..models import ImageCandidate
 from ..provider import ImageSearchProvider, ProviderUnavailable
 
@@ -171,6 +172,19 @@ class OpenverseProvider(ImageSearchProvider):
             [title, creator, source, tag_text]
         )
         canonical_source = f"{source}:{foreign_id}" if foreign_id else source_page
+        identity_values = (
+            f"{self.provider_name}:{asset_id}", canonical_source, source_page,
+            str(image_url), str(raw.get("thumbnail") or ""),
+        )
+        if commons_identity_conflict(*identity_values, source=source, foreign_identifier=foreign_id):
+            return None
+        commons_source, identity_aliases = normalize_commons_identity(
+            *identity_values, source=source, foreign_identifier=foreign_id,
+        )
+        if commons_source:
+            canonical_source = commons_source
+        else:
+            identity_aliases = []
         return ImageCandidate(
             provider=self.provider_name,
             asset_id=asset_id,
@@ -178,6 +192,7 @@ class OpenverseProvider(ImageSearchProvider):
             thumbnail_url=str(raw.get("thumbnail") or ""),
             source_page_url=source_page,
             canonical_source=canonical_source,
+            identity_aliases=identity_aliases,
             creator_name=creator,
             creator_url=str(raw.get("creator_url") or ""),
             license_name=license_name,

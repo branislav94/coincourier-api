@@ -24,6 +24,7 @@ from .queries import build_image_queries
 from .registry import build_provider_registry
 from .reuse import (
     PHASH_REUSE_DISTANCE,
+    candidate_identity_values,
     candidate_recent_local_usage,
     candidate_recent_wp_usage,
     downloaded_recent_local_usage,
@@ -100,13 +101,7 @@ def _safe_provider_failure(exc: Exception) -> str:
 
 
 def _candidate_identities(candidate: ImageCandidate) -> set[str]:
-    values = {
-        candidate.asset_key,
-        candidate.canonical_source,
-        candidate.source_page_url,
-        candidate.url_hash,
-    }
-    return {value for value in values if value}
+    return candidate_identity_values(candidate)
 
 
 def _known_dimensions_are_valid(candidate: ImageCandidate) -> tuple[bool, str]:

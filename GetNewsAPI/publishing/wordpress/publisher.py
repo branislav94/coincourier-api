@@ -1265,6 +1265,7 @@ def _stock_image_content_v2(
         "image_url": candidate.usable_url,
         "image_url_hash": candidate.url_hash,
         "canonical_source": candidate.canonical_source,
+        "identity_aliases": list(candidate.identity_aliases),
         "source_page_url": candidate.source_page_url,
         "creator_name": candidate.creator_name,
         "creator_url": candidate.creator_url,
@@ -1314,7 +1315,7 @@ def _generation_allowed_after_search(search_exhausted: bool) -> bool:
         )
         return True
     logger.warning(
-        "[IMG-V2] search was not confirmed exhausted because a provider was unavailable; skipping generated image fallback"
+        "[IMG-V2] stock search did not confirm exhaustion; skipping generated image fallback"
     )
     return False
 
