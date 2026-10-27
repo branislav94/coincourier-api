@@ -1,6 +1,8 @@
 from __future__ import annotations
 
 from copy import deepcopy
+from datetime import datetime, timezone
+from email.utils import format_datetime
 import hashlib
 import html
 import json
@@ -174,6 +176,126 @@ class WikimediaRequestTests(unittest.TestCase):
         provider = WikimediaProvider(client=PayloadClient({"query": {"pages": [raw]}}))
         self.assertEqual(provider.search("bitcoin"), [])
         self.assertEqual(provider.last_search_rejections, {"required_fields": 1})
+
+
+class WikimediaRetryTests(unittest.TestCase):
+    @staticmethod
+    def client(payloads: list[dict], *, headers: list[dict] | None = None, statuses: list[int] | None = None, max_retries: int = 1):
+        responses = []
+        for index, payload in enumerate(payloads):
+            response = Mock(status_code=(statuses[index] if statuses else 200), headers=(headers[index] if headers else {}))
+            response.json.return_value = payload
+            responses.append(response)
+        session, sleeper = Mock(), Mock()
+        session.request.side_effect = responses
+        client = CachedHttpClient(session=session, max_retries=max_retries, sleeper=sleeper)
+        client._read_cache = Mock(return_value=None)
+        client._write_cache = Mock()
+        return client, session, sleeper
+
+    def test_maxlag_retries_then_caches_only_valid_success(self) -> None:
+        success = {"query": {"pages": [page()]}}
+        client, session, sleeper = self.client([
+            {"error": {"code": "maxlag", "lag": 8, "info": "private upstream details"}}, success,
+        ])
+        items = WikimediaProvider(client=client).search("bitcoin")
+        self.assertEqual(items[0].asset_key, "wikimedia:123")
+        self.assertEqual(session.request.call_count, 2)
+        sleeper.assert_called_once_with(8.0)
+        client._write_cache.assert_called_once()
+        self.assertEqual(client._write_cache.call_args.args[1], success)
+
+    def test_ratelimited_retries_with_bounded_fallback(self) -> None:
+        client, session, sleeper = self.client([
+            {"error": {"code": "ratelimited", "info": "private details"}}, {"query": {"pages": []}},
+        ])
+        self.assertEqual(WikimediaProvider(client=client).search("bitcoin"), [])
+        self.assertEqual(session.request.call_count, 2)
+        sleeper.assert_called_once_with(5.0)
+
+    def test_maxlag_delay_has_safe_minimum_and_maximum(self) -> None:
+        for lag, expected in ((0, 5.0), ("invalid", 5.0), (float("nan"), 5.0), (float("inf"), 5.0), (1000, 30.0)):
+            with self.subTest(lag=lag):
+                client, session, sleeper = self.client([
+                    {"error": {"code": "maxlag", "lag": lag}}, {"batchcomplete": True},
+                ])
+                self.assertEqual(WikimediaProvider(client=client).search("bitcoin"), [])
+                self.assertEqual(session.request.call_count, 2)
+                sleeper.assert_called_once_with(expected)
+
+    def test_numeric_retry_after_overrides_api_fallback(self) -> None:
+        for code in ("maxlag", "ratelimited"):
+            with self.subTest(code=code):
+                client, _, sleeper = self.client([
+                    {"error": {"code": code, "lag": 8}}, {"batchcomplete": True},
+                ], headers=[{"Retry-After": "12.5"}, {}])
+                WikimediaProvider(client=client).search("bitcoin")
+                sleeper.assert_called_once_with(12.5)
+
+    def test_http_date_retry_after_uses_server_time(self) -> None:
+        now = 1700000000.0
+        retry_at = format_datetime(datetime.fromtimestamp(now + 17, timezone.utc), usegmt=True)
+        client, _, sleeper = self.client([
+            {"error": {"code": "maxlag", "lag": 8}}, {"batchcomplete": True},
+        ], headers=[{"Retry-After": retry_at}, {}])
+        with patch("image_search.cache.time.time", return_value=now):
+            WikimediaProvider(client=client).search("bitcoin")
+        sleeper.assert_called_once_with(17.0)
+
+    def test_invalid_retry_after_uses_safe_api_fallback(self) -> None:
+        for value in ("invalid", "-5", "nan", "inf"):
+            with self.subTest(value=value):
+                client, _, sleeper = self.client([
+                    {"error": {"code": "maxlag", "lag": 9}}, {"batchcomplete": True},
+                ], headers=[{"Retry-After": value}, {}])
+                WikimediaProvider(client=client).search("bitcoin")
+                sleeper.assert_called_once_with(9.0)
+
+    def test_temporary_api_error_exhaustion_is_bounded_and_sanitized(self) -> None:
+        for code in ("maxlag", "ratelimited"):
+            with self.subTest(code=code):
+                error = {"error": {"code": code, "info": "token=private-secret url=https://private.invalid", "lag": 7}}
+                client, session, sleeper = self.client([error, error, error], max_retries=2)
+                with self.assertRaises(ProviderUnavailable) as caught:
+                    WikimediaProvider(client=client).search("bitcoin")
+                self.assertEqual(session.request.call_count, 3)
+                self.assertEqual(sleeper.call_count, 2)
+                self.assertTrue(caught.exception.retry_exhausted)
+                self.assertEqual(caught.exception.reason, "invalid_response")
+                self.assertNotIn("private", str(caught.exception))
+                client._write_cache.assert_not_called()
+
+    def test_zero_retry_budget_makes_one_request_and_never_sleeps(self) -> None:
+        client, session, sleeper = self.client([{"error": {"code": "maxlag", "lag": 10}}], max_retries=0)
+        with self.assertRaises(ProviderUnavailable) as caught:
+            WikimediaProvider(client=client).search("bitcoin")
+        self.assertTrue(caught.exception.retry_exhausted)
+        self.assertEqual(session.request.call_count, 1)
+        sleeper.assert_not_called()
+        client._write_cache.assert_not_called()
+
+    def test_http_and_api_errors_share_one_retry_budget(self) -> None:
+        client, session, sleeper = self.client([
+            {}, {"error": {"code": "maxlag", "lag": 10}},
+        ], statuses=[503, 200], max_retries=1)
+        with self.assertRaises(ProviderUnavailable) as caught:
+            WikimediaProvider(client=client).search("bitcoin")
+        self.assertTrue(caught.exception.retry_exhausted)
+        self.assertEqual(session.request.call_count, 2)
+        sleeper.assert_called_once_with(0.5)
+        client._write_cache.assert_not_called()
+
+    def test_malformed_or_unknown_error_payload_is_not_retried(self) -> None:
+        for payload in ({}, {"query": {}}, {"error": {"code": "badvalue", "info": "private-token"}}, {"error": "maxlag"}):
+            with self.subTest(payload=payload):
+                client, session, sleeper = self.client([payload], max_retries=5)
+                with self.assertRaises(ProviderUnavailable) as caught:
+                    WikimediaProvider(client=client).search("bitcoin")
+                self.assertEqual(session.request.call_count, 1)
+                self.assertFalse(caught.exception.retry_exhausted)
+                self.assertEqual(str(caught.exception), "provider=wikimedia reason=invalid_response")
+                sleeper.assert_not_called()
+                client._write_cache.assert_not_called()
 
 
 class WikimediaLicenseTests(unittest.TestCase):
@@ -354,21 +476,21 @@ class CommonsIdentityTests(unittest.TestCase):
         }, "bitcoin etf liquidity", 0)
         self.assertIsNone(item)
 
-    def test_same_page_id_is_deduplicated_across_providers(self) -> None:
+    def test_same_page_id_retains_provider_variants_with_the_same_download_url(self) -> None:
         first, second = openverse_candidate(), candidate()
         loader = StaticDownloader(fail_first=True)
         result = search_images(ARTICLE, providers=[StaticProvider("openverse", [first]), StaticProvider("wikimedia", [second])], downloader=loader, local_usage=[], recent_wp_usage=[])
-        self.assertIsNone(result.candidate)
-        self.assertEqual(loader.calls, ["openverse:openverse-uuid"])
-        self.assertEqual(result.rejection_counts.get("duplicate_identity"), 1)
+        self.assertIs(result.candidate, second)
+        self.assertEqual(loader.calls, ["openverse:openverse-uuid", "wikimedia:123"])
+        self.assertFalse(result.rejection_counts.get("duplicate_identity"))
 
     def test_file_url_variants_deduplicate_without_foreign_id(self) -> None:
         first = openverse_candidate(foreign_id="", landing="http://commons.m.wikimedia.org/wiki/File:Bitcoin%20ETF%20liquidity.jpg", original="https://upload.wikimedia.org/wikipedia/commons/thumb/a/ab/Bitcoin_ETF_liquidity.jpg/320px-Bitcoin_ETF_liquidity.jpg")
         loader = StaticDownloader(fail_first=True)
         result = search_images(ARTICLE, providers=[StaticProvider("openverse", [first]), StaticProvider("wikimedia", [candidate()])], downloader=loader, local_usage=[], recent_wp_usage=[])
-        self.assertIsNone(result.candidate)
-        self.assertEqual(len(loader.calls), 1)
-        self.assertEqual(result.rejection_counts.get("duplicate_identity"), 1)
+        self.assertEqual(result.candidate.asset_key if result.candidate else None, "wikimedia:123")
+        self.assertEqual(len(loader.calls), 2)
+        self.assertFalse(result.rejection_counts.get("duplicate_identity"))
 
     def test_repeated_wikimedia_results_across_queries_are_deduplicated(self) -> None:
         provider = WikimediaProvider(client=PayloadClient({"query": {"pages": [page()]}}))

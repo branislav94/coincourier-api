@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import html
 from html.parser import HTMLParser
+import math
 import re
 from typing import Any
 from urllib.parse import quote, urlsplit
@@ -172,6 +173,23 @@ class WikimediaProvider(ImageSearchProvider):
     def _rejected(self, reason: str) -> None:
         self.last_search_rejections[reason] = self.last_search_rejections.get(reason, 0) + 1
 
+    @staticmethod
+    def _payload_retry_delay(data: dict[str, Any]) -> float | None:
+        """Retry only MediaWiki's recognized temporary failures, never raw info."""
+        error = data.get("error")
+        if not isinstance(error, dict):
+            return None
+        code = error.get("code")
+        if code == "ratelimited":
+            return 5.0
+        if code != "maxlag":
+            return None
+        try:
+            lag = float(error.get("lag", 5.0))
+        except (TypeError, ValueError, OverflowError):
+            return 5.0
+        return min(30.0, max(5.0, lag)) if math.isfinite(lag) else 5.0
+
     def search(self, query: str) -> list[ImageCandidate]:
         self.last_search_stats = {"raw": 0, "normalized": 0}
         self.last_search_rejections = {}
@@ -189,6 +207,7 @@ class WikimediaProvider(ImageSearchProvider):
                 "maxlag": 5,
             },
             payload_validator=self._validate_payload,
+            payload_retry_delay=self._payload_retry_delay,
         )
         # Also validate injected/mock clients, without depending on their internals.
         if not self._validate_payload(data):

@@ -667,7 +667,7 @@ class SelectionAndReuseTests(unittest.TestCase):
         higher.final_score = 0.96
         return lower, higher
 
-    def test_identity_dedup_keeps_earlier_provider_despite_later_higher_score(self) -> None:
+    def test_identity_group_prefers_earlier_provider_despite_later_higher_score(self) -> None:
         lower, higher = self._ranked_duplicate_pair()
         loader = StaticDownloader()
         with patch("image_search.selection.score_candidate", side_effect=lambda item, _article: item):
@@ -683,7 +683,7 @@ class SelectionAndReuseTests(unittest.TestCase):
             )
         self.assertEqual(result.candidate.asset_key if result.candidate else None, "pixabay:lower")
         self.assertEqual(loader.calls, ["pixabay:lower"])
-        self.assertEqual(result.rejection_counts.get("duplicate_identity"), 1)
+        self.assertEqual(result.rejection_counts.get("duplicate_identity", 0), 0)
 
     def test_ranked_identity_dedup_is_independent_of_provider_completion_order(self) -> None:
         winners: list[str | None] = []
@@ -703,7 +703,7 @@ class SelectionAndReuseTests(unittest.TestCase):
             winners.append(result.candidate.asset_key if result.candidate else None)
         self.assertEqual(winners, ["pixabay:lower", "pixabay:lower"])
 
-    def test_transitive_identity_bridge_rejects_entire_duplicate_group(self) -> None:
+    def test_transitive_identity_group_selects_preferred_variant_once(self) -> None:
         winners: list[str | None] = []
         for delays in ((0.03, 0.0, 0.01), (0.0, 0.02, 0.03)):
             first = candidate("openverse", "component-winner", canonical_source="shared-source")
@@ -733,7 +733,7 @@ class SelectionAndReuseTests(unittest.TestCase):
                 )
             winners.append(result.candidate.asset_key if result.candidate else None)
             self.assertEqual(loader.calls, ["openverse:component-winner"])
-            self.assertEqual(result.rejection_counts.get("duplicate_identity"), 2)
+            self.assertEqual(result.rejection_counts.get("duplicate_identity", 0), 0)
         self.assertEqual(
             winners,
             ["openverse:component-winner", "openverse:component-winner"],
@@ -841,7 +841,7 @@ class SelectionAndReuseTests(unittest.TestCase):
         )
         self.assertIsNotNone(result.candidate)
         self.assertEqual(len(loader.calls), 1)
-        self.assertEqual(result.rejection_counts.get("duplicate_identity"), 1)
+        self.assertEqual(result.rejection_counts.get("duplicate_identity", 0), 0)
 
     def test_sha256_duplicate_detection(self) -> None:
         image = downloaded(b"same bytes")
@@ -1257,6 +1257,189 @@ class PublisherRoutingTests(unittest.TestCase):
         self.assertTrue(exhausted)
         v1.assert_called_once_with(ARTICLE)
         v2.assert_not_called()
+
+
+class IdentityTransportFallbackTests(unittest.TestCase):
+    def setUp(self) -> None:
+        scorer = patch("image_search.selection.score_candidate", side_effect=lambda item, _article: item)
+        scorer.start()
+        self.addCleanup(scorer.stop)
+
+    @staticmethod
+    def variants(*, same_url: bool = False) -> tuple[ImageCandidate, ImageCandidate]:
+        first = candidate("openverse", "indexed", canonical_source="wikimedia:123")
+        alternate = candidate(
+            "wikimedia", "123", canonical_source="wikimedia:123",
+            image_url=first.usable_url if same_url else "https://images.example/wikimedia/original.jpg",
+        )
+        first.final_score, alternate.final_score = .95, .99
+        return first, alternate
+
+    @staticmethod
+    def search(first, alternate, loader, *, other=None, **kwargs):
+        return search_images(
+            ARTICLE,
+            providers=[StaticProvider("openverse", [first] + ([other] if other else [])),
+                       StaticProvider("wikimedia", [alternate])],
+            downloader=loader, local_usage=kwargs.pop("local_usage", []),
+            recent_wp_usage=kwargs.pop("recent_wp_usage", []), **kwargs,
+        )
+
+    def test_preferred_variant_succeeds_without_downloading_alternate(self) -> None:
+        first, alternate = self.variants()
+        loader = Mock(download=Mock(return_value=downloaded(b"shared")))
+        result = self.search(first, alternate, loader)
+        self.assertIs(result.candidate, first)
+        self.assertEqual([call.args[0] for call in loader.download.call_args_list], [first])
+
+    def test_404_recovers_alternate_including_identical_provider_urls(self) -> None:
+        for same_url in (False, True):
+            with self.subTest(same_url=same_url):
+                first, alternate = self.variants(same_url=same_url)
+                loader = Mock(download=Mock(side_effect=[ImageDownloadError("http_404"), downloaded(b"shared")]))
+                result = self.search(first, alternate, loader)
+                self.assertIs(result.candidate, alternate)
+                self.assertEqual([call.args[0] for call in loader.download.call_args_list], [first, alternate])
+                self.assertEqual(result.candidate.provider, "wikimedia")
+                self.assertEqual(result.candidate.usable_url, alternate.usable_url)
+                self.assertEqual(result.candidate.attribution_text, alternate.attribution_text)
+                self.assertEqual(result.candidate.license_url, alternate.license_url)
+                self.assertEqual(result.provider_stats["openverse"]["download_attempted"], 1)
+                self.assertEqual(result.provider_stats["wikimedia"]["download_attempted"], 1)
+
+    def test_conversion_failure_does_not_poison_identical_content_alternate(self) -> None:
+        for failure in (False, ValueError("conversion unavailable")):
+            with self.subTest(failure=type(failure).__name__):
+                first, alternate = self.variants()
+                image = downloaded(b"identical bytes")
+                loader = Mock(download=Mock(return_value=image))
+                validator = Mock(side_effect=[failure, True])
+                result = self.search(first, alternate, loader, post_download_validator=validator)
+                self.assertIs(result.candidate, alternate)
+                self.assertEqual(loader.download.call_count, 2)
+                self.assertEqual(validator.call_count, 2)
+                self.assertEqual(result.rejection_counts.get("conversion_failed"), 1)
+                self.assertNotIn("duplicate_content", result.rejection_counts)
+
+    def test_all_group_variants_fail_before_next_identity_is_tried(self) -> None:
+        first, alternate = self.variants()
+        other = candidate("openverse", "other", canonical_source="wikimedia:456")
+        other.final_score = .9
+        loader = Mock(download=Mock(side_effect=[
+            ImageDownloadError("http_404"), ImageDownloadError("invalid_image"), downloaded(b"other"),
+        ]))
+        result = self.search(first, alternate, loader, other=other)
+        self.assertIs(result.candidate, other)
+        self.assertEqual([call.args[0] for call in loader.download.call_args_list], [first, alternate, other])
+
+    def test_budget_ends_before_untried_same_asset_alternate(self) -> None:
+        first, alternate = self.variants(same_url=True)
+        loader = Mock(download=Mock(side_effect=ImageDownloadError("http_404")))
+        result = self.search(first, alternate, loader, global_candidate_limit=1)
+        self.assertEqual(loader.download.call_count, 1)
+        self.assertTrue(result.search_budget_exhausted)
+        self.assertFalse(result.all_available_providers_exhausted)
+        self.assertFalse(result.generation_allowed)
+
+    def test_later_variant_history_alias_blocks_whole_group_before_download(self) -> None:
+        for history_kind in ("local_usage", "recent_wp_usage"):
+            with self.subTest(history_kind=history_kind):
+                first, alternate = self.variants()
+                alternate.identity_aliases.append("https://source.example/legacy-only-alternate")
+                entry = {"asset_key": alternate.identity_aliases[-1]} if history_kind == "local_usage" else {
+                    "post_excerpt": alternate.identity_aliases[-1],
+                }
+                loader = Mock()
+                result = self.search(first, alternate, loader, **{history_kind: [entry]})
+                loader.download.assert_not_called()
+                self.assertTrue(result.all_available_providers_exhausted)
+                reason = "local_history_identity_reuse" if history_kind == "local_usage" else "wordpress_history_reuse"
+                self.assertEqual(result.rejection_counts[reason], 2)
+
+    def test_ineligible_linkage_member_still_carries_history(self) -> None:
+        first, alternate = self.variants()
+        alternate.final_score = .1
+        alternate.identity_aliases.append("legacy:used-only-alternate")
+        loader = Mock()
+        result = self.search(first, alternate, loader, local_usage=[{"asset_key": "legacy:used-only-alternate"}])
+        loader.download.assert_not_called()
+        self.assertEqual(result.rejection_counts["score_below_threshold"], 1)
+        self.assertEqual(result.rejection_counts["local_history_identity_reuse"], 1)
+
+    def test_ineligible_earlier_member_does_not_promote_later_provider_group(self) -> None:
+        first, alternate = self.variants()
+        first.license_name = "cc-by-sa"
+        other = candidate("openverse", "usable", canonical_source="wikimedia:456")
+        other.final_score = .8
+        loader = StaticDownloader()
+        result = self.search(first, alternate, loader, other=other)
+        self.assertIs(result.candidate, other)
+        self.assertEqual(loader.calls, [other.asset_key])
+
+    def test_downloaded_history_hash_blocks_all_remaining_group_variants(self) -> None:
+        image = downloaded(b"already used")
+        for entry, reason in (
+            ({"content_sha256": image.content_sha256}, "local_history_sha_reuse"),
+            ({"perceptual_hash": image.perceptual_hash}, "local_history_dhash_reuse"),
+        ):
+            with self.subTest(reason=reason):
+                first, alternate = self.variants()
+                loader = Mock(download=Mock(return_value=image))
+                result = self.search(first, alternate, loader, local_usage=[entry], global_candidate_limit=1)
+                self.assertEqual(loader.download.call_count, 1)
+                self.assertEqual(result.rejection_counts[reason], 2)
+                self.assertFalse(result.search_budget_exhausted)
+                self.assertTrue(result.all_available_providers_exhausted)
+
+    def test_transitive_history_identity_blocks_every_linked_variant(self) -> None:
+        first, alternate = self.variants()
+        other = candidate("openverse", "bridge-end", canonical_source="wikimedia:456")
+        other.final_score = .9
+        alternate.identity_aliases.append(other.canonical_source)
+        loader = Mock()
+        result = self.search(first, alternate, loader, other=other, local_usage=[{"asset_key": other.asset_key}])
+        loader.download.assert_not_called()
+        self.assertEqual(result.rejection_counts["local_history_identity_reuse"], 3)
+
+    def test_conversion_failure_still_protects_against_cross_group_content_duplicates(self) -> None:
+        first, alternate = self.variants()
+        other = candidate("openverse", "different-identity", canonical_source="wikimedia:456")
+        other.final_score = .9
+        image = downloaded(b"same visual content")
+        loader = Mock(download=Mock(side_effect=[image, ImageDownloadError("http_404"), image]))
+        validator = Mock(return_value=False)
+        result = self.search(first, alternate, loader, other=other, post_download_validator=validator)
+        self.assertIsNone(result.candidate)
+        self.assertEqual(loader.download.call_count, 3)
+        validator.assert_called_once_with(first, image)
+        self.assertEqual(result.rejection_counts["duplicate_content"], 1)
+
+    def test_successful_alternate_variant_prevents_generated_fallback(self) -> None:
+        first, alternate = self.variants()
+        loader = Mock(download=Mock(side_effect=[ImageDownloadError("http_404"), downloaded(b"shared")]))
+        converted = (b"prepared-jpeg", {"width": 1600, "height": 900})
+        with (
+            patch.multiple(publish_to_wp, IMAGE_SEARCH_ENGINE="v2", IMAGE_SOURCE_MODE="hybrid",
+                           IMAGE_SOURCE_PRIORITY="stock_first", USE_SOURCE_IMAGES=False,
+                           IMAGE_GENERATION_ONLY_AFTER_SEARCH_EXHAUSTED=True, IMAGE_GENERATION_ON_PROVIDER_ERROR=False),
+            patch("image_search.selection.build_provider_registry", return_value=[
+                StaticProvider("openverse", [first]), StaticProvider("wikimedia", [alternate]),
+            ]),
+            patch("image_search.selection.load_image_usage", return_value=[]),
+            patch("image_search.selection.load_recent_wp_image_usage", return_value=[]),
+            patch("image_search.selection.ImageDownloader", return_value=loader),
+            patch.object(publish_to_wp, "_cover_bytes_to_1536x1024", return_value=converted),
+            patch.object(publish_to_wp, "upload_media", return_value=77),
+            patch.object(publish_to_wp, "set_media_details", return_value=True),
+            patch.object(publish_to_wp, "_generated_image_content") as generate,
+        ):
+            media_id, metadata = publish_to_wp.upload_image(None, ARTICLE["title"], "bitcoin", article=ARTICLE)
+        self.assertEqual(media_id, 77)
+        self.assertEqual(metadata["provider"], "wikimedia")
+        self.assertEqual(metadata["image_url"], alternate.usable_url)
+        self.assertEqual(metadata["provider_attribution_text"], alternate.attribution_text)
+        self.assertEqual(loader.download.call_count, 2)
+        generate.assert_not_called()
 
 
 if __name__ == "__main__":

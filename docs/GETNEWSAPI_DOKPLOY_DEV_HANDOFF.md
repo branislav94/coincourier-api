@@ -13,6 +13,13 @@ for independently approved mutations, migrations, recovery, and monitoring.
 Code merge alone does not activate V2. Keep the current accepted DEV settings
 until the separate stock-provider trial is approved. Source defaults remain V1
 and the three-provider list; direct Wikimedia requires explicit inclusion.
+
+Code deployment nevertheless changes the shared Pexels/Pixabay attribution
+failure behavior under `IMAGE_SEARCH_ENGINE=v1`: if required media metadata
+cannot be saved, the image is rejected as featured media and the post may still
+publish without one. That failure does not invoke Grok. A V1 search rollback
+retains this shared attribution safeguard.
+
 For the later DEV trial, use these runtime values:
 
 ```dotenv

@@ -54,6 +54,13 @@ defaults remain `IMAGE_SEARCH_ENGINE=v1` and
 when explicitly listed. No runtime environment, Compose topology, scheduler,
 model, database schema, threshold, or reuse policy is changed by the code merge.
 
+Deploying this code does change shared Pexels/Pixabay attribution handling even
+when `IMAGE_SEARCH_ENGINE=v1` remains active. A required media-metadata update
+failure now rejects the uploaded stock image as featured media; the post may
+still publish without a featured image, and the failure does not invoke Grok.
+Switching back to V1 rolls back search selection, but retains this shared
+attribution safeguard.
+
 After local mocked tests pass and a DEV trial is approved, the DEV operator must
 set these explicit runtime values in the existing DEV resource:
 
@@ -81,9 +88,12 @@ Openverse credentials remain optional; Wikimedia needs no credentials.
 without lowering any threshold during the trial. Runtime processes must restart
 after an environment change because configuration is captured at import time.
 
-V2 may fetch providers concurrently, but evaluates candidates in configured
-provider order and ranks within each provider. A usable earlier-provider image
-wins. Provider failures and untried candidates remaining after the global
+V2 may fetch providers concurrently. Identity groups are ordered by their first
+eligible variant in configured provider order and within-provider rank. After a
+download or conversion failure, alternate deliveries of that asset are tried
+before the next identity group. Each provider/URL attempt consumes the shared
+budget, and a selected alternate retains its own source, license and attribution.
+Provider failures and untried candidates remaining after the global
 download-attempt budget prevent confirmed exhaustion. With the values above,
 generation remains blocked in those cases. Only confirmed stock exhaustion
 permits Grok, followed by the existing optional OpenAI fallback. Required credit

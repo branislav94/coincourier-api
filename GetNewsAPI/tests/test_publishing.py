@@ -797,6 +797,71 @@ class AttributionFlowTests(unittest.TestCase):
                 self.assertEqual(post.call_args.kwargs["json"]["caption"], "Original provider credit")
                 generated.assert_not_called()
 
+    def test_v1_stock_metadata_failure_rejects_pexels_and_pixabay_without_grok(self):
+        for provider in ("pexels", "pixabay"):
+            with self.subTest(provider=provider):
+                candidate = publisher.StockImageCandidate(
+                    provider=provider,
+                    image_url=f"https://images.example/{provider}.jpg",
+                    query="bitcoin cryptocurrency",
+                    score=0.99,
+                    threshold=0.72 if provider == "pexels" else 0.78,
+                    width=1600,
+                    height=900,
+                    credit_name="Example Photographer",
+                    credit_url=f"https://{provider}.example/photo/123",
+                    provider_asset_id="123",
+                )
+                details_response = Mock()
+                details_response.raise_for_status.side_effect = requests.HTTPError("metadata unavailable")
+                with (
+                    patch.object(publisher, "IMAGE_SEARCH_ENGINE", "v1"),
+                    patch.object(publisher, "IMAGE_SOURCE_MODE", "hybrid"),
+                    patch.object(publisher, "IMAGE_SOURCE_PRIORITY", "stock_first"),
+                    patch.object(publisher, "USE_SOURCE_IMAGES", False),
+                    patch.object(publisher, "find_stock_image", return_value=candidate) as find,
+                    patch.object(
+                        publisher, "_download_external_hero_image",
+                        return_value=(b"prepared", {"width": 1600, "height": 900}),
+                    ) as download,
+                    patch.object(publisher, "_stock_image_content_v2") as v2,
+                    patch.object(publisher, "_generated_image_content") as generated,
+                    patch.object(publisher, "_grok_image_content") as grok,
+                    patch.object(publisher, "upload_media", return_value=88) as upload,
+                    patch.object(publisher.session, "post", return_value=details_response) as details,
+                    self.assertLogs(level="WARNING"),
+                ):
+                    media_id, metadata = publisher.upload_image(
+                        None, ARTICLE_ROW["title"], ARTICLE_ROW["hashtags"], article=ARTICLE_ROW,
+                    )
+
+                find.assert_called_once_with(ARTICLE_ROW, providers=("pexels", "pixabay"))
+                download.assert_called_once_with(candidate.image_url, provider)
+                upload.assert_called_once()
+                self.assertEqual(details.call_args.kwargs["json"]["caption"], candidate.credit_text)
+                self.assertIsNone(media_id)
+                self.assertEqual(metadata["provider"], provider)
+                self.assertEqual(metadata["featured_image_rejected_reason"], "metadata_update_failed")
+                v2.assert_not_called()
+                generated.assert_not_called()
+                grok.assert_not_called()
+
+                with (
+                    patch.object(publisher, "ensure_category", return_value=21),
+                    patch.object(publisher, "ensure_term", return_value=31),
+                    patch.object(publisher.session, "post", return_value=response(body={"id": 101})) as post,
+                    patch.object(publisher, "write_yoast_metadata"),
+                    patch.object(publisher, "record_image_usage") as record,
+                    patch("builtins.print"),
+                ):
+                    result = publisher.WordPressPublisher().publish(
+                        PublicationArticle.from_mapping(ARTICLE_ROW), None,
+                        PublicationContext(published_at_utc=PUBLISHED_AT, creation_is_fresh=True),
+                    )
+                self.assertTrue(result.success)
+                self.assertNotIn("featured_media", post.call_args.kwargs["json"])
+                record.assert_not_called()
+
     def test_required_credit_failure_returns_no_featured_image_and_never_generates(self):
         with self.assertLogs(level="WARNING") as logs:
             (media_id, metadata), upload, _post, generated = self.upload_selection({

@@ -5,6 +5,7 @@ import logging
 from collections import Counter
 from concurrent.futures import ThreadPoolExecutor, as_completed
 import re
+from dataclasses import dataclass
 from typing import Callable, Iterable
 
 from config import (
@@ -124,13 +125,18 @@ def _download_matches_seen(downloaded: DownloadedImage, seen: list[DownloadedIma
     return False
 
 
-def _deduplicate_ranked_candidates(
+@dataclass
+class _IdentityGroup:
+    variants: list[ImageCandidate]
+    members: list[ImageCandidate]
+
+
+def _group_ranked_candidates(
     candidates: list[ImageCandidate],
-    rejection_counts: Counter[str],
-    provider_stats: dict[str, dict],
-    correlation: str,
-) -> list[ImageCandidate]:
-    parents = list(range(len(candidates)))
+    linkage_candidates: list[ImageCandidate],
+) -> list[_IdentityGroup]:
+    """Keep delivery variants and transitive aliases, ordered by eligible rank."""
+    parents = list(range(len(linkage_candidates)))
 
     def find(index: int) -> int:
         while parents[index] != index:
@@ -146,23 +152,24 @@ def _deduplicate_ranked_candidates(
         parents[max(left_root, right_root)] = min(left_root, right_root)
 
     identity_owner: dict[str, int] = {}
-    for index, candidate in enumerate(candidates):
+    for index, candidate in enumerate(linkage_candidates):
         for identity in sorted(_candidate_identities(candidate)):
             owner = identity_owner.setdefault(identity, index)
             union(index, owner)
 
-    component_winner: dict[int, int] = {}
-    for index in range(len(candidates)):
-        root = find(index)
-        component_winner[root] = min(component_winner.get(root, index), index)
+    members: dict[int, list[ImageCandidate]] = {}
+    indices: dict[int, int] = {}
+    for index, candidate in enumerate(linkage_candidates):
+        members.setdefault(find(index), []).append(candidate)
+        indices[id(candidate)] = index
 
-    retained: list[ImageCandidate] = []
-    for index, candidate in enumerate(candidates):
-        if component_winner[find(index)] != index:
-            _reject(candidate, "duplicate_identity", rejection_counts, provider_stats, correlation)
-            continue
-        retained.append(candidate)
-    return retained
+    groups: dict[int, _IdentityGroup] = {}
+    for candidate in candidates:
+        root = find(indices[id(candidate)])
+        # Ineligible linkage members carry aliases/history, never precedence.
+        group = groups.setdefault(root, _IdentityGroup([], members[root]))
+        group.variants.append(candidate)
+    return list(groups.values())
 
 
 def search_images(
@@ -251,26 +258,47 @@ def search_images(
                     dimensions_valid, dimensions_reason = _known_dimensions_are_valid(candidate)
                     if not dimensions_valid:
                         reason = dimensions_reason
-                    elif candidate_recent_local_usage(candidate, local_entries):
-                        reason = "local_history_identity_reuse"
-                    elif candidate_recent_wp_usage(candidate, wp_entries):
-                        reason = "wordpress_history_reuse"
             if reason:
                 _reject(candidate, reason, rejection_counts, provider_stats, correlation)
                 continue
-            provider_stats[provider_name]["eligible"] += 1
             accepted.append(candidate)
         # Provider precedence is stronger than any cross-provider score difference.
         ordered.extend(rank_candidates(accepted))
 
-    ranked = _deduplicate_ranked_candidates(ordered, rejection_counts, provider_stats, correlation)
+    groups = _group_ranked_candidates(
+        ordered, [candidate for name in provider_names for candidate in collected.get(name, [])],
+    )
+    attempt_plan: list[tuple[int, ImageCandidate]] = []
+    for group_index, group in enumerate(groups):
+        reason = ""
+        if any(candidate_recent_local_usage(member, local_entries) for member in group.members):
+            reason = "local_history_identity_reuse"
+        elif any(candidate_recent_wp_usage(member, wp_entries) for member in group.members):
+            reason = "wordpress_history_reuse"
+        seen_transports: set[tuple[str, str]] = set()
+        for candidate in group.variants:
+            if reason:
+                _reject(candidate, reason, rejection_counts, provider_stats, correlation)
+                continue
+            provider_stats[candidate.provider]["eligible"] += 1
+            transport = (candidate.provider, candidate.usable_url)
+            if transport in seen_transports:
+                _reject(candidate, "duplicate_identity", rejection_counts, provider_stats, correlation)
+                continue
+            seen_transports.add(transport)
+            attempt_plan.append((group_index, candidate))
+
     image_downloader = downloader or ImageDownloader()
-    seen_downloads: list[DownloadedImage] = []
+    seen_downloads: list[tuple[int, DownloadedImage]] = []
+    blocked_groups: dict[int, str] = {}
     selected: ImageCandidate | None = None
     selected_download: DownloadedImage | None = None
     budget_exhausted = False
     attempts = 0
-    for candidate in ranked:
+    for group_index, candidate in attempt_plan:
+        if group_index in blocked_groups:
+            _reject(candidate, blocked_groups[group_index], rejection_counts, provider_stats, correlation)
+            continue
         if attempts >= max(0, global_candidate_limit):
             budget_exhausted = True
             break
@@ -302,10 +330,12 @@ def search_images(
                 else "local_history_dhash_reuse"
             )
             _reject(candidate, reason, rejection_counts, provider_stats, correlation)
-            seen_downloads.append(downloaded)
+            blocked_groups[group_index] = reason
+            seen_downloads.append((group_index, downloaded))
             continue
-        if _download_matches_seen(downloaded, seen_downloads):
+        if _download_matches_seen(downloaded, [prior for owner, prior in seen_downloads if owner != group_index]):
             _reject(candidate, "duplicate_content", rejection_counts, provider_stats, correlation)
+            blocked_groups[group_index] = "duplicate_content"
             continue
         if post_download_validator is not None:
             try:
@@ -314,7 +344,10 @@ def search_images(
                 download_accepted = False
             if not download_accepted:
                 _reject(candidate, "conversion_failed", rejection_counts, provider_stats, correlation)
-                seen_downloads.append(downloaded)
+                # A conversion failure may be specific to this delivery. Keep
+                # cross-group content deduplication without poisoning its own
+                # alternate URL, even if that alternate delivers identical bytes.
+                seen_downloads.append((group_index, downloaded))
                 continue
         logger.info(
             "[IMG-V2] selected provider=%s asset_key=%s final_score=%.4f license=%s",
