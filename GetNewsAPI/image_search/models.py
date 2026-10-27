@@ -91,3 +91,7 @@ class ImageSearchResult:
     provider_failures: dict[str, str] = field(default_factory=dict)
     rejection_counts: dict[str, int] = field(default_factory=dict)
     all_available_providers_exhausted: bool = False
+    search_budget_exhausted: bool = False
+    provider_stats: dict[str, dict[str, Any]] = field(default_factory=dict)
+    article_correlation_id: str = ""
+    generation_allowed: bool = False

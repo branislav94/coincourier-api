@@ -46,12 +46,9 @@ class PexelsProvider(ImageSearchProvider):
             PEXELS_SEARCH_URL,
             headers={"Authorization": str(self.api_key)},
             params={"query": query, "orientation": PEXELS_ORIENTATION, "per_page": self.per_page},
+            payload_validator=lambda payload: self.valid_result_list(payload, "photos"),
         )
-        return [
-            candidate
-            for rank, raw in enumerate(data.get("photos") or [])
-            if (candidate := self.normalize_candidate(raw, query, rank)) is not None
-        ]
+        return self.normalize_results(data["photos"], query)
 
     def normalize_candidate(self, raw: dict[str, Any], query: str, provider_rank: int) -> ImageCandidate | None:
         source = raw.get("src") or {}

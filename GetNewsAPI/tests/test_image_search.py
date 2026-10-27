@@ -22,7 +22,7 @@ if str(PROJECT_DIR) not in sys.path:
 import publish_to_wp
 import stock_images
 from image_search.cache import CachedHttpClient
-from image_search.downloader import ImageDownloader, inspect_image_bytes, perceptual_hash_distance
+from image_search.downloader import ImageDownloadError, ImageDownloader, inspect_image_bytes, perceptual_hash_distance
 from image_search.license_policy import ImageLicensePolicy
 from image_search.models import DownloadedImage, ImageCandidate
 from image_search.provider import ImageSearchProvider, ProviderUnavailable
@@ -30,6 +30,7 @@ from image_search.providers.openverse import OpenverseProvider
 from image_search.providers.pexels import PexelsProvider
 from image_search.providers.pixabay import PixabayProvider
 from image_search.queries import build_image_queries
+from image_search.registry import build_provider_registry
 from image_search.reuse import (
     candidate_recent_local_usage,
     candidate_recent_wp_usage,
@@ -170,8 +171,10 @@ class FakeJsonSession:
     def __init__(self, responses: list[FakeJsonResponse]) -> None:
         self.responses = responses
         self.calls = 0
+        self.requests: list[dict] = []
 
     def request(self, _method: str, _url: str, **_kwargs) -> FakeJsonResponse:
+        self.requests.append({"method": _method, "url": _url, **_kwargs})
         response = self.responses[self.calls]
         self.calls += 1
         return response
@@ -438,7 +441,7 @@ class ParityAndPolicyTests(unittest.TestCase):
             recent_wp_usage=[],
         )
         self.assertEqual(result.candidate.asset_id if result.candidate else None, "accepted")
-        self.assertEqual(result.rejection_counts.get("threshold"), 1)
+        self.assertEqual(result.rejection_counts.get("score_below_threshold"), 1)
 
     def test_global_ranking_normalizes_against_provider_threshold(self) -> None:
         pexels = candidate("pexels", "p", threshold=0.72)
@@ -447,6 +450,198 @@ class ParityAndPolicyTests(unittest.TestCase):
         pixabay.final_score = 0.88
         ranked = rank_candidates([pixabay, pexels])
         self.assertEqual(ranked[0].asset_key, "pexels:p")
+
+
+class SearchSemanticsTests(unittest.TestCase):
+    def setUp(self) -> None:
+        scorer = patch("image_search.selection.score_candidate", side_effect=lambda item, _article: item)
+        scorer.start()
+        self.addCleanup(scorer.stop)
+
+    @staticmethod
+    def item(provider: str, asset_id: str, score: float) -> ImageCandidate:
+        item = candidate(provider, asset_id)
+        item.final_score = score
+        licenses = {
+            "pexels": ("pexels-license", "https://www.pexels.com/license/"),
+            "pixabay": ("pixabay-content-license", "https://pixabay.com/service/license-summary/"),
+        }
+        if provider in licenses:
+            item.license_name, item.license_url = licenses[provider]
+        return item
+
+    def search(self, providers, **kwargs) -> object:
+        return search_images(
+            ARTICLE, providers=providers, local_usage=[], recent_wp_usage=[], **kwargs,
+        )
+
+    def test_registry_preserves_configured_order_and_ignores_duplicates_unknown_disabled(self) -> None:
+        with (
+            patch("image_search.registry.PexelsProvider", return_value=StaticProvider("pexels", [])),
+            patch("image_search.registry.PixabayProvider", return_value=StaticProvider("pixabay", [])),
+            patch("image_search.registry.OpenverseProvider", return_value=Mock(enabled=False)),
+        ):
+            providers = build_provider_registry(("pixabay", "pexels", "pixabay", "unknown", "openverse"))
+        self.assertEqual([provider.provider_name for provider in providers], ["pixabay", "pexels"])
+
+    def test_earlier_usable_provider_wins_despite_later_score_and_completion_order(self) -> None:
+        for delays in ((0.03, 0.0), (0.0, 0.03)):
+            with self.subTest(delays=delays):
+                first = self.item("pexels", "first", 0.78)
+                later = self.item("openverse", "later", 0.99)
+                loader = StaticDownloader()
+                result = self.search([
+                    DelayedStaticProvider("pexels", [first], delays[0]),
+                    DelayedStaticProvider("openverse", [later], delays[1]),
+                ], downloader=loader)
+                self.assertIs(result.candidate, first)
+                self.assertEqual(loader.calls, [first.asset_key])
+
+    def test_candidate_ranking_is_deterministic_within_provider(self) -> None:
+        low = self.item("openverse", "low", 0.80)
+        high = self.item("openverse", "high", 0.95)
+        tied = self.item("openverse", "a-tied", 0.95)
+        result = self.search([StaticProvider("openverse", [low, high, tied])], downloader=StaticDownloader())
+        self.assertIs(result.candidate, tied)
+
+    def test_later_provider_used_after_all_earlier_candidates_fail(self) -> None:
+        first = self.item("pexels", "first", 0.90)
+        second = self.item("pexels", "second", 0.85)
+        later = self.item("openverse", "later", 0.95)
+        loader = Mock()
+        loader.download.side_effect = [ImageDownloadError("http_404"), ImageDownloadError("invalid_image"), downloaded(b"later")]
+        result = self.search([
+            StaticProvider("pexels", [second, first]), StaticProvider("openverse", [later]),
+        ], downloader=loader)
+        self.assertIs(result.candidate, later)
+        self.assertEqual([call.args[0].asset_key for call in loader.download.call_args_list], [first.asset_key, second.asset_key, later.asset_key])
+
+    def test_download_budget_with_untried_candidates_is_not_exhaustion(self) -> None:
+        items = [self.item("openverse", str(index), .95 - index * .01) for index in range(2)]
+        loader = StaticDownloader()
+        result = self.search(
+            [StaticProvider("openverse", items)], downloader=loader,
+            post_download_validator=lambda *_args: False, global_candidate_limit=1,
+        )
+        self.assertIsNone(result.candidate)
+        self.assertEqual(len(loader.calls), 1)
+        self.assertTrue(result.search_budget_exhausted)
+        self.assertFalse(result.all_available_providers_exhausted)
+        self.assertFalse(result.generation_allowed)
+
+    def test_true_exhaustion_when_attempt_budget_evaluates_all_candidates(self) -> None:
+        item = self.item("openverse", "only", .95)
+        result = self.search(
+            [StaticProvider("openverse", [item])], downloader=StaticDownloader(),
+            post_download_validator=lambda *_args: False, global_candidate_limit=1,
+        )
+        self.assertFalse(result.search_budget_exhausted)
+        self.assertTrue(result.all_available_providers_exhausted)
+        self.assertTrue(result.generation_allowed)
+
+    def test_zero_budget_with_eligible_candidate_blocks_generation(self) -> None:
+        loader = StaticDownloader()
+        result = self.search(
+            [StaticProvider("openverse", [self.item("openverse", "only", .95)])],
+            downloader=loader, global_candidate_limit=0,
+        )
+        self.assertEqual(loader.calls, [])
+        self.assertTrue(result.search_budget_exhausted)
+        self.assertFalse(result.all_available_providers_exhausted)
+
+    def test_no_enabled_providers_is_not_confirmed_exhaustion(self) -> None:
+        result = self.search([], downloader=StaticDownloader())
+        self.assertFalse(result.all_available_providers_exhausted)
+        self.assertFalse(result.generation_allowed)
+        self.assertIn("registry", result.provider_failures)
+
+    def test_empty_valid_search_is_confirmed_exhaustion_with_terminal_summary(self) -> None:
+        with self.assertLogs("image_search.selection", level="INFO") as captured:
+            result = self.search([StaticProvider("openverse", [])], downloader=StaticDownloader())
+        self.assertTrue(result.all_available_providers_exhausted)
+        terminal = [line for line in captured.output if " terminal " in line]
+        self.assertEqual(len(terminal), 1)
+        self.assertIn("reason=all_providers_exhausted", terminal[0])
+        self.assertIn(f"article={result.article_correlation_id}", terminal[0])
+        self.assertEqual(result.provider_stats["openverse"]["raw"], 0)
+        self.assertIn("provider_no_results", " ".join(captured.output))
+
+    def test_search_failure_without_stock_success_blocks_generation(self) -> None:
+        result = self.search([
+            StaticProvider("pexels", [], fail=True), StaticProvider("openverse", []),
+        ], downloader=StaticDownloader())
+        self.assertFalse(result.all_available_providers_exhausted)
+        self.assertFalse(result.generation_allowed)
+        self.assertIn("pexels", result.provider_failures)
+
+    def test_reuse_reasons_distinguish_identity_sha_dhash_and_wordpress(self) -> None:
+        for expected in (
+            "local_history_identity_reuse", "local_history_sha_reuse",
+            "local_history_dhash_reuse", "wordpress_history_reuse",
+        ):
+            with self.subTest(reason=expected):
+                item = self.item("openverse", "used", .95)
+                image = downloaded(b"used image")
+                local, wp = [], []
+                if expected == "local_history_identity_reuse":
+                    local = [{"asset_key": item.asset_key}]
+                elif expected == "local_history_sha_reuse":
+                    local = [{"content_sha256": image.content_sha256}]
+                elif expected == "local_history_dhash_reuse":
+                    local = [{"perceptual_hash": image.perceptual_hash}]
+                else:
+                    wp = [{"post_excerpt": item.source_page_url}]
+                with self.assertLogs("image_search.selection", level="INFO") as captured:
+                    result = search_images(
+                        ARTICLE, providers=[StaticProvider("openverse", [item])],
+                        downloader=StaticDownloader({item.asset_key: image}),
+                        local_usage=local, recent_wp_usage=wp,
+                    )
+                self.assertEqual(result.rejection_counts.get(expected), 1)
+                self.assertEqual(result.provider_stats["openverse"]["rejected_by_reason"][expected], 1)
+                self.assertIn("all_high_scoring_candidates_recently_used", " ".join(captured.output))
+
+
+class PayloadValidationTests(unittest.TestCase):
+    @staticmethod
+    def provider(payload: dict) -> tuple[OpenverseProvider, FakeJsonSession, CachedHttpClient]:
+        session = FakeJsonSession([FakeJsonResponse(200, payload)])
+        client = CachedHttpClient(session=session, cache_hours=0, max_retries=0)
+        provider = OpenverseProvider(client=client, client_id=None, client_secret=None, enabled=True)
+        return provider, session, client
+
+    def test_legitimate_empty_openverse_response_is_valid_anonymous_search(self) -> None:
+        provider, session, _client = self.provider({"results": []})
+        self.assertEqual(provider.search("bitcoin"), [])
+        self.assertEqual(session.calls, 1)
+        self.assertEqual(session.requests[0]["method"], "GET")
+        self.assertEqual(session.requests[0]["headers"], {})
+        self.assertEqual(provider.last_search_stats, {"raw": 0, "normalized": 0})
+
+    def test_malformed_openverse_payload_and_http_200_error_fail_without_caching(self) -> None:
+        for payload in ({}, {"results": None}, {"results": {}}, {"results": [None]}, {"error": {"detail": "private"}, "results": []}):
+            with self.subTest(payload=payload):
+                provider, _session, client = self.provider(payload)
+                with patch.object(client, "_write_cache") as write:
+                    with self.assertRaises(ProviderUnavailable) as raised:
+                        provider.search("bitcoin")
+                write.assert_not_called()
+                self.assertEqual(raised.exception.reason, "invalid_response")
+                self.assertNotIn("private", str(raised.exception))
+
+    def test_invalid_cached_payload_is_not_returned_as_empty_search(self) -> None:
+        provider, session, client = self.provider({"results": []})
+        with (
+            patch.object(client, "_read_cache", return_value={"error": "old cached failure"}),
+            patch.object(client, "_write_cache") as write,
+        ):
+            self.assertEqual(provider.search("bitcoin"), [])
+        self.assertEqual(session.calls, 1)
+        self.assertEqual(write.call_args.args[1], {"results": []})
+
+    def test_shared_http_client_remains_compatible_without_validator(self) -> None:
+        _provider, _session, client = self.provider({"legacy": True})
+        self.assertEqual(client.get_json("legacy", "query", "https://example.invalid"), {"legacy": True})
 
 
 class SelectionAndReuseTests(unittest.TestCase):
@@ -472,7 +667,7 @@ class SelectionAndReuseTests(unittest.TestCase):
         higher.final_score = 0.96
         return lower, higher
 
-    def test_ranked_identity_dedup_keeps_highest_when_lower_finishes_first(self) -> None:
+    def test_identity_dedup_keeps_earlier_provider_despite_later_higher_score(self) -> None:
         lower, higher = self._ranked_duplicate_pair()
         loader = StaticDownloader()
         with patch("image_search.selection.score_candidate", side_effect=lambda item, _article: item):
@@ -486,9 +681,9 @@ class SelectionAndReuseTests(unittest.TestCase):
                 local_usage=[],
                 recent_wp_usage=[],
             )
-        self.assertEqual(result.candidate.asset_key if result.candidate else None, "openverse:higher")
-        self.assertEqual(loader.calls, ["openverse:higher"])
-        self.assertEqual(result.rejection_counts.get("duplicate"), 1)
+        self.assertEqual(result.candidate.asset_key if result.candidate else None, "pixabay:lower")
+        self.assertEqual(loader.calls, ["pixabay:lower"])
+        self.assertEqual(result.rejection_counts.get("duplicate_identity"), 1)
 
     def test_ranked_identity_dedup_is_independent_of_provider_completion_order(self) -> None:
         winners: list[str | None] = []
@@ -506,7 +701,7 @@ class SelectionAndReuseTests(unittest.TestCase):
                     recent_wp_usage=[],
                 )
             winners.append(result.candidate.asset_key if result.candidate else None)
-        self.assertEqual(winners, ["openverse:higher", "openverse:higher"])
+        self.assertEqual(winners, ["pixabay:lower", "pixabay:lower"])
 
     def test_transitive_identity_bridge_rejects_entire_duplicate_group(self) -> None:
         winners: list[str | None] = []
@@ -538,7 +733,7 @@ class SelectionAndReuseTests(unittest.TestCase):
                 )
             winners.append(result.candidate.asset_key if result.candidate else None)
             self.assertEqual(loader.calls, ["openverse:component-winner"])
-            self.assertEqual(result.rejection_counts.get("duplicate"), 2)
+            self.assertEqual(result.rejection_counts.get("duplicate_identity"), 2)
         self.assertEqual(
             winners,
             ["openverse:component-winner", "openverse:component-winner"],
@@ -577,7 +772,7 @@ class SelectionAndReuseTests(unittest.TestCase):
         self.assertEqual(result.candidate.asset_key if result.candidate else None, "openverse:available")
         self.assertEqual(session.calls, 2)
         self.assertEqual(result.provider_failures, {})
-        self.assertEqual(result.rejection_counts.get("http_404"), 1)
+        self.assertEqual(result.rejection_counts.get("download_failed"), 1)
 
     def test_timeout_is_provider_unavailable_and_not_confirmed_exhaustion(self) -> None:
         item = candidate("openverse", "timeout")
@@ -646,7 +841,7 @@ class SelectionAndReuseTests(unittest.TestCase):
         )
         self.assertIsNotNone(result.candidate)
         self.assertEqual(len(loader.calls), 1)
-        self.assertEqual(result.rejection_counts.get("duplicate"), 1)
+        self.assertEqual(result.rejection_counts.get("duplicate_identity"), 1)
 
     def test_sha256_duplicate_detection(self) -> None:
         image = downloaded(b"same bytes")
@@ -822,6 +1017,26 @@ class PublisherRoutingTests(unittest.TestCase):
             media_id, meta = publish_to_wp.upload_image(None, "Title", "bitcoin", article=ARTICLE)
         self.assertEqual(media_id, 77)
         self.assertEqual(meta["provider"], "openverse")
+        generated.assert_not_called()
+
+    def test_candidate_budget_exhaustion_blocks_generated_fallback(self) -> None:
+        first, second = candidate("openverse", "budget-first"), candidate("openverse", "budget-second")
+        search_result = search_images(
+            ARTICLE, providers=[StaticProvider("openverse", [first, second])],
+            downloader=StaticDownloader(), local_usage=[], recent_wp_usage=[],
+            global_candidate_limit=1, post_download_validator=lambda *_args: False,
+        )
+        self.assertTrue(search_result.search_budget_exhausted)
+        self.assertFalse(search_result.all_available_providers_exhausted)
+        with (
+            patch.object(
+                publish_to_wp, "_search_stock_image_content",
+                return_value=(None, search_result.all_available_providers_exhausted),
+            ),
+            patch.object(publish_to_wp, "_generated_image_content") as generated,
+        ):
+            media_id, _meta = publish_to_wp.upload_image(None, "Title", "bitcoin", article=ARTICLE)
+        self.assertIsNone(media_id)
         generated.assert_not_called()
 
     def test_generated_fallback_reached_only_after_valid_exhaustion(self) -> None:

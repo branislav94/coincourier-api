@@ -44,6 +44,27 @@ class ImageSearchProvider(ABC):
     enabled: bool
     candidate_threshold: float
 
+    @staticmethod
+    def valid_result_list(payload: dict, field: str) -> bool:
+        return (
+            "error" not in payload
+            and "errors" not in payload
+            and isinstance(payload.get(field), list)
+            and all(isinstance(item, dict) for item in payload[field])
+        )
+
+    def normalize_results(self, items: list[dict], query: str) -> list[ImageCandidate]:
+        candidates = [
+            candidate
+            for rank, raw in enumerate(items)
+            if (candidate := self.normalize_candidate(raw, query, rank)) is not None
+        ]
+        self.last_search_stats = {"raw": len(items), "normalized": len(candidates)}
+        self.last_search_rejections = (
+            {"required_fields": len(items) - len(candidates)} if len(items) > len(candidates) else {}
+        )
+        return candidates
+
     @abstractmethod
     def search(self, query: str) -> list[ImageCandidate]:
         """Return normalized candidates for one query."""

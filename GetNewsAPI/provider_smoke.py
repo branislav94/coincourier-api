@@ -144,6 +144,9 @@ def main() -> None:
     print(f"image-search-providers={','.join(IMAGE_SEARCH_PROVIDERS)}")
     print(f"image-license-allowlist={','.join(IMAGE_LICENSE_ALLOWLIST)}")
     print(f"image-global-candidate-limit={IMAGE_GLOBAL_CANDIDATE_LIMIT}")
+    if IMAGE_SEARCH_ENGINE == "v2":
+        print("image-search-selection=configured-provider-precedence; ranking-within-provider")
+        print("image-candidate-limit=download-attempt-budget; untried-candidates-block-exhaustion")
     print(
         "image-generation-only-after-search-exhausted="
         f"{_bool_text(IMAGE_GENERATION_ONLY_AFTER_SEARCH_EXHAUSTED)}"

@@ -5,7 +5,7 @@ import json
 import logging
 import time
 from pathlib import Path
-from typing import Any
+from typing import Any, Callable
 
 import requests
 
@@ -144,15 +144,31 @@ class CachedHttpClient:
         *,
         headers: dict[str, str] | None = None,
         params: dict[str, Any] | None = None,
+        payload_validator: Callable[[dict[str, Any]], bool] | None = None,
     ) -> dict[str, Any]:
         params = params or {}
         path = self._cache_path(provider, query, params)
         cached = self._read_cache(path)
-        if cached is not None:
+        if cached is not None and self._valid_payload(cached, payload_validator):
             return cached
         data = self._request_json("GET", provider, url, headers=headers, params=params)
+        if not self._valid_payload(data, payload_validator):
+            raise ProviderUnavailable(provider, "invalid_response")
         self._write_cache(path, data)
         return data
+
+    @staticmethod
+    def _valid_payload(
+        data: dict[str, Any],
+        validator: Callable[[dict[str, Any]], bool] | None,
+    ) -> bool:
+        if validator is None:
+            return True
+        try:
+            return bool(validator(data))
+        except Exception:
+            # Provider response bodies and validator exceptions may contain secrets.
+            return False
 
     def post_json(
         self,

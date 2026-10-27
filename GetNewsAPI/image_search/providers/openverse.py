@@ -122,12 +122,9 @@ class OpenverseProvider(ImageSearchProvider):
                 "license": "cc0,pdm,by",
                 "mature": "false",
             },
+            payload_validator=lambda payload: self.valid_result_list(payload, "results"),
         )
-        return [
-            candidate
-            for rank, raw in enumerate(data.get("results") or [])
-            if (candidate := self.normalize_candidate(raw, query, rank)) is not None
-        ]
+        return self.normalize_results(data["results"], query)
 
     def normalize_candidate(self, raw: dict[str, Any], query: str, provider_rank: int) -> ImageCandidate | None:
         image_url = raw.get("url") or raw.get("thumbnail")
