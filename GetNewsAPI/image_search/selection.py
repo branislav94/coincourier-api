@@ -37,6 +37,7 @@ from .reuse import (
     load_recent_wp_image_usage,
 )
 from .scoring import rank_candidates, score_candidate
+from .context import context_rejection_reason
 
 
 logger = logging.getLogger(__name__)
@@ -243,6 +244,10 @@ def search_images(
         accepted: list[ImageCandidate] = []
         for candidate in collected.get(provider_name, []):
             score_candidate(candidate, article)
+            context_reason = context_rejection_reason(candidate, article)
+            if context_reason:
+                _reject(candidate, context_reason, rejection_counts, provider_stats, correlation)
+                continue
             reason = ""
             if candidate.final_score < candidate.provider_threshold:
                 reason = "score_below_threshold"
@@ -277,6 +282,7 @@ def search_images(
         [candidate for name in provider_names for candidate in collected.get(name, [])],
         provider_precedence=provider_names, downloader=image_downloader, license_policy=policy,
         local_usage=local_entries, recent_wp_usage=wp_entries, article_correlation_id=correlation,
+        article_context=article,
     )
     attempt_plan: list[tuple[int, ImageCandidate]] = []
     for group_index, group in enumerate(groups):
