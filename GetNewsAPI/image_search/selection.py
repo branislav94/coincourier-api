@@ -19,7 +19,11 @@ from config import (
 
 from .downloader import ImageDownloadError, ImageDownloader, perceptual_hash_distance
 from .license_policy import ImageLicensePolicy
-from .models import DownloadedImage, ImageCandidate, ImageSearchResult
+from .models import DownloadedImage, ImageCandidate, ImageSearchResult, RescueValidationResult
+from .emergency import (
+    create_rescue_context, emergency_summary, hard_fail_group, hard_fail_transport,
+    mark_soft_rejection, remember_download, validation_outcome,
+)
 from .provider import ImageSearchProvider, ProviderUnavailable
 from .queries import build_image_queries
 from .registry import build_provider_registry
@@ -180,7 +184,7 @@ def search_images(
     local_usage: list[dict] | None = None,
     recent_wp_usage: list[dict] | None = None,
     license_policy: ImageLicensePolicy | None = None,
-    post_download_validator: Callable[[ImageCandidate, DownloadedImage], bool] | None = None,
+    post_download_validator: Callable[[ImageCandidate, DownloadedImage], bool | RescueValidationResult] | None = None,
     global_candidate_limit: int = IMAGE_GLOBAL_CANDIDATE_LIMIT,
 ) -> ImageSearchResult:
     provider_list = list(providers) if providers is not None else build_provider_registry()
@@ -268,6 +272,12 @@ def search_images(
     groups = _group_ranked_candidates(
         ordered, [candidate for name in provider_names for candidate in collected.get(name, [])],
     )
+    image_downloader = downloader or ImageDownloader()
+    rescue_context = create_rescue_context(
+        [candidate for name in provider_names for candidate in collected.get(name, [])],
+        provider_precedence=provider_names, downloader=image_downloader, license_policy=policy,
+        local_usage=local_entries, recent_wp_usage=wp_entries, article_correlation_id=correlation,
+    )
     attempt_plan: list[tuple[int, ImageCandidate]] = []
     for group_index, group in enumerate(groups):
         reason = ""
@@ -288,7 +298,6 @@ def search_images(
             seen_transports.add(transport)
             attempt_plan.append((group_index, candidate))
 
-    image_downloader = downloader or ImageDownloader()
     seen_downloads: list[tuple[int, DownloadedImage]] = []
     blocked_groups: dict[int, str] = {}
     selected: ImageCandidate | None = None
@@ -298,6 +307,9 @@ def search_images(
     for group_index, candidate in attempt_plan:
         if group_index in blocked_groups:
             _reject(candidate, blocked_groups[group_index], rejection_counts, provider_stats, correlation)
+            mark_soft_rejection(rescue_context, candidate, blocked_groups[group_index], group=True)
+            if blocked_groups[group_index] == "duplicate_content":
+                hard_fail_group(rescue_context, candidate, "duplicate_content")
             continue
         if attempts >= max(0, global_candidate_limit):
             budget_exhausted = True
@@ -307,6 +319,7 @@ def search_images(
         try:
             downloaded = image_downloader.download(candidate)
         except ImageDownloadError as exc:
+            hard_fail_transport(rescue_context, candidate, "download_failed")
             reason = {
                 "dimensions": "dimensions_rejected", "orientation": "orientation_rejected",
             }.get(exc.reason, "download_failed")
@@ -322,6 +335,7 @@ def search_images(
                     exc.reason,
                 )
             continue
+        remember_download(rescue_context, candidate, downloaded)
         prior_usage = downloaded_recent_local_usage(downloaded, local_entries)
         if prior_usage:
             reason = (
@@ -330,24 +344,28 @@ def search_images(
                 else "local_history_dhash_reuse"
             )
             _reject(candidate, reason, rejection_counts, provider_stats, correlation)
+            mark_soft_rejection(rescue_context, candidate, reason, group=True)
             blocked_groups[group_index] = reason
             seen_downloads.append((group_index, downloaded))
             continue
         if _download_matches_seen(downloaded, [prior for owner, prior in seen_downloads if owner != group_index]):
             _reject(candidate, "duplicate_content", rejection_counts, provider_stats, correlation)
+            hard_fail_group(rescue_context, candidate, "duplicate_content")
             blocked_groups[group_index] = "duplicate_content"
             continue
         if post_download_validator is not None:
             try:
-                download_accepted = post_download_validator(candidate, downloaded)
+                download_accepted, validation_reason = validation_outcome(post_download_validator(candidate, downloaded))
             except Exception:
-                download_accepted = False
+                download_accepted, validation_reason = False, "conversion_failed"
             if not download_accepted:
-                _reject(candidate, "conversion_failed", rejection_counts, provider_stats, correlation)
+                _reject(candidate, validation_reason, rejection_counts, provider_stats, correlation)
+                hard_fail_transport(rescue_context, candidate, validation_reason)
                 # A conversion failure may be specific to this delivery. Keep
                 # cross-group content deduplication without poisoning its own
                 # alternate URL, even if that alternate delivers identical bytes.
-                seen_downloads.append((group_index, downloaded))
+                if validation_reason == "conversion_failed":
+                    seen_downloads.append((group_index, downloaded))
                 continue
         logger.info(
             "[IMG-V2] selected provider=%s asset_key=%s final_score=%.4f license=%s",
@@ -400,4 +418,6 @@ def search_images(
         provider_stats=provider_stats,
         article_correlation_id=correlation,
         generation_allowed=generation_allowed,
+        rescue_context=rescue_context,
+        emergency_summary=emergency_summary(rescue_context),
     )

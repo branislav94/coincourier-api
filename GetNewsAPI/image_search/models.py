@@ -84,6 +84,41 @@ class DownloadedImage:
     perceptual_hash: str
 
 
+@dataclass(frozen=True)
+class RescueValidationResult:
+    accepted: bool
+    reason: str = ""
+
+
+@dataclass
+class StockRescueCandidate:
+    candidate: ImageCandidate
+    soft_reasons: tuple[str, ...] = ()
+    hard_reason: str = ""
+    downloaded: DownloadedImage | None = None
+    group_index: int = 0
+
+
+@dataclass
+class StockRescueContext:
+    entries: list[StockRescueCandidate] = field(default_factory=list)
+    provider_precedence: tuple[str, ...] = ()
+    downloader: Any = None
+    license_policy: Any = None
+    article_correlation_id: str = ""
+    failed_transports: dict[tuple[str, str], str] = field(default_factory=dict)
+    processed_transports: set[tuple[str, str]] = field(default_factory=set)
+    candidate_attempts: int = 0
+    download_attempts: int = 0
+    attempted: bool = False
+    completed: bool = False
+    selected_provider: str = ""
+    original_rejection_reason: str = ""
+    candidates_available: int = 0
+    local_usage: list[dict[str, Any]] = field(default_factory=list)
+    candidate_groups: dict[int, int] = field(default_factory=dict)
+
+
 @dataclass
 class ImageSearchResult:
     candidate: ImageCandidate | None = None
@@ -96,3 +131,5 @@ class ImageSearchResult:
     provider_stats: dict[str, dict[str, Any]] = field(default_factory=dict)
     article_correlation_id: str = ""
     generation_allowed: bool = False
+    rescue_context: StockRescueContext | None = None
+    emergency_summary: dict[str, Any] = field(default_factory=dict)

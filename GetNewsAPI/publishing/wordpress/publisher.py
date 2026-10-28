@@ -20,6 +20,8 @@ from config import (
     GROK_IMAGE_MODEL,
     GROK_IMAGE_RESOLUTION,
     IMAGE_FALLBACK_PROVIDER,
+    IMAGE_EMERGENCY_STOCK_RESCUE_ENABLED,
+    IMAGE_EMERGENCY_STOCK_RESCUE_LIMIT,
     IMAGE_GENERATION_ONLY_AFTER_SEARCH_EXHAUSTED,
     IMAGE_GENERATION_ON_PROVIDER_ERROR,
     IMAGE_MIN_HEIGHT,
@@ -41,6 +43,8 @@ from config import (
 )
 from stock_images import StockImageCandidate, find_stock_image
 from image_search import search_images
+from image_search.emergency import rescue_images
+from image_search.models import ImageSearchResult, RescueValidationResult
 from image_search.license_policy import normalize_license_name
 from image_search.reuse import record_image_usage
 from publishing.models import (
@@ -1233,10 +1237,13 @@ def _stock_image_content_v1(article: dict[str, Any]) -> tuple[bytes, str, dict[s
 
 def _stock_image_content_v2(
     article: dict[str, Any],
+    *,
+    context: dict[str, Any] | None = None,
+    candidate_validator: Any = None,
 ) -> tuple[tuple[bytes, str, dict[str, Any]] | None, bool]:
     prepared_images: dict[int, tuple[bytes, dict[str, Any]]] = {}
 
-    def prepare_hero(candidate: Any, downloaded: Any) -> bool:
+    def prepare_hero(candidate: Any, downloaded: Any) -> Any:
         converted = _cover_bytes_to_1536x1024(
             downloaded.content,
             min_width=IMAGE_MIN_WIDTH,
@@ -1245,9 +1252,13 @@ def _stock_image_content_v2(
         if not converted:
             return False
         prepared_images[id(candidate)] = converted
+        if candidate_validator is not None:
+            return candidate_validator(candidate, downloaded, converted)
         return True
 
     result = search_images(article, post_download_validator=prepare_hero)
+    if context is not None:
+        context.update(result=result, prepare_hero=prepare_hero)
     candidate = result.candidate
     downloaded = result.downloaded
     if not candidate or not downloaded:
@@ -1257,8 +1268,12 @@ def _stock_image_content_v2(
     if not converted:
         logger.error("[IMG-V2] selected image missing prepared hero asset_key=%s", candidate.asset_key)
         return None, False
+    return _candidate_stock_content(candidate, downloaded, converted), False
+
+
+def _candidate_stock_content(candidate: Any, downloaded: Any, converted: Any) -> tuple[bytes, str, dict[str, Any]]:
     content, dims = converted
-    return (content, f"{candidate.provider}-search-image.jpg", {
+    metadata = {
         "provider": candidate.provider,
         "asset_id": candidate.asset_id,
         "asset_key": candidate.asset_key,
@@ -1285,13 +1300,28 @@ def _stock_image_content_v2(
         "openai_fallback_used": False,
         "width": dims.get("width"),
         "height": dims.get("height"),
-    }), False
+    }
+    if candidate.metadata.get("emergency_stock_rescue"):
+        metadata.update(
+            emergency_stock_rescue=True,
+            emergency_original_rejection_reason=candidate.metadata.get("emergency_original_rejection_reason", ""),
+            original_rejection=candidate.metadata.get("original_rejection", ""),
+            emergency_rescue_tier=candidate.metadata.get("emergency_rescue_tier"),
+            original_score=candidate.final_score,
+            original_threshold=candidate.provider_threshold,
+        )
+    return content, f"{candidate.provider}-search-image.jpg", metadata
 
 
 def _search_stock_image_content(
     article: dict[str, Any],
+    *,
+    context: dict[str, Any] | None = None,
+    candidate_validator: Any = None,
 ) -> tuple[tuple[bytes, str, dict[str, Any]] | None, bool]:
     if IMAGE_SEARCH_ENGINE == "v2":
+        if context is not None or candidate_validator is not None:
+            return _stock_image_content_v2(article, context=context, candidate_validator=candidate_validator)
         return _stock_image_content_v2(article)
     return _stock_image_content_v1(article), True
 
@@ -1318,6 +1348,112 @@ def _generation_allowed_after_search(search_exhausted: bool) -> bool:
         "[IMG-V2] stock search did not confirm exhaustion; skipping generated image fallback"
     )
     return False
+
+
+def _upload_v2_stock_route(
+    url: str | None,
+    title: str,
+    hashtags: str,
+    article: dict[str, Any],
+    image_meta: dict[str, Any],
+    primary_generated_provider: str,
+) -> tuple[int | None, dict[str, Any]]:
+    """Complete strict stock, then safe emergency stock, before generation."""
+    context: dict[str, Any] = {}
+    ready: tuple[int | None, dict[str, Any]] | None = None
+    summary: dict[str, Any] = {
+        "strict_stock_selected": False,
+        "emergency_stock_rescue_attempted": False,
+        "emergency_candidates_available": 0,
+        "emergency_download_attempts": 0,
+        "emergency_selected": False,
+        "emergency_selected_provider": "",
+        "emergency_original_rejection_reason": "",
+        "final_generation_rescue_allowed": False,
+    }
+
+    def finish(value: tuple[int | None, dict[str, Any]]) -> tuple[int | None, dict[str, Any]]:
+        media_id, metadata = value
+        metadata = {**image_meta, **metadata, **summary}
+        if media_id:
+            metadata.pop("featured_image_rejected_reason", None)
+        metadata.update(final_image_source=metadata.get("provider") if media_id else "", final_image_failure=not bool(media_id))
+        result = context.get("result")
+        correlation = getattr(result, "article_correlation_id", "") or hashlib.sha256(
+            str(article.get("id") or article.get("news_url") or title).encode("utf-8")
+        ).hexdigest()[:12]
+        reason = "emergency_stock_selected" if media_id and metadata.get("emergency_stock_rescue") else (
+            "featured_image_selected" if media_id else "final_image_failure"
+        )
+        logger.log(
+            logging.INFO if media_id else logging.ERROR,
+            "[IMG-V2] image_terminal article=%s reason=%s strict_stock_selected=%s "
+            "emergency_stock_rescue_attempted=%s emergency_candidates_available=%s emergency_download_attempts=%s "
+            "emergency_selected=%s emergency_selected_provider=%s emergency_original_rejection_reason=%s "
+            "final_generation_rescue_allowed=%s final_image_source=%s final_image_failure=%s",
+            correlation, reason, metadata["strict_stock_selected"], metadata["emergency_stock_rescue_attempted"],
+            metadata["emergency_candidates_available"], metadata["emergency_download_attempts"],
+            metadata["emergency_selected"], metadata["emergency_selected_provider"], metadata["emergency_original_rejection_reason"],
+            metadata["final_generation_rescue_allowed"], metadata["final_image_source"], metadata["final_image_failure"],
+        )
+        return media_id, metadata
+
+    def persist_candidate(candidate: Any, downloaded: Any, converted: Any) -> RescueValidationResult:
+        nonlocal ready
+        value = _upload_prepared_image(_candidate_stock_content(candidate, downloaded, converted), article, image_meta)
+        if value[0]:
+            ready = value
+            return RescueValidationResult(True)
+        reason = value[1].get("featured_image_rejected_reason") or "media_upload_failed"
+        image_meta["featured_image_rejected_reason"] = reason
+        return RescueValidationResult(False, reason)
+
+    if image_meta["priority"] == "source_first":
+        source = _maybe_source_image_content(url)
+        if source:
+            return finish(_upload_prepared_image(source, article, image_meta))
+
+    selected, exhausted = _search_stock_image_content(
+        article, context=context, candidate_validator=persist_candidate,
+    )
+    if ready:
+        summary["strict_stock_selected"] = True
+        return finish(ready)
+    if selected:
+        # Compatibility for callers replacing the selector seam: real V2
+        # candidates have already passed persistence inside the validator.
+        value = _upload_prepared_image(selected, article, image_meta)
+        if value[0]:
+            summary["strict_stock_selected"] = True
+            return finish(value)
+        image_meta["featured_image_rejected_reason"] = value[1].get("featured_image_rejected_reason") or "media_upload_failed"
+
+    strict_result = context.get("result") or ImageSearchResult(all_available_providers_exhausted=exhausted)
+    rescue_result = rescue_images(
+        strict_result,
+        post_download_validator=context.get("prepare_hero"),
+        enabled=IMAGE_EMERGENCY_STOCK_RESCUE_ENABLED,
+        limit=IMAGE_EMERGENCY_STOCK_RESCUE_LIMIT,
+    )
+    summary.update(rescue_result.emergency_summary)
+    if ready:
+        return finish(ready)
+
+    generation_allowed = _generation_allowed_after_search(exhausted)
+    selected = None
+    if image_meta["mode"] == "stock":
+        if generation_allowed and _openai_fallback_enabled():
+            selected = _generated_image_content("openai", title, hashtags, fallback_used=True)
+    else:
+        if generation_allowed:
+            selected = _generated_image_content(primary_generated_provider, title, hashtags, fallback_used=False)
+        if not selected and USE_SOURCE_IMAGES and image_meta["priority"] == "stock_first":
+            selected = _maybe_source_image_content(url)
+        if not selected and generation_allowed and _openai_fallback_enabled() and primary_generated_provider != "openai":
+            selected = _generated_image_content("openai", title, hashtags, fallback_used=True)
+    if not selected:
+        return finish((None, image_meta))
+    return finish(_upload_prepared_image(selected, article, image_meta))
 
 
 def upload_image(
@@ -1376,6 +1512,9 @@ def upload_image(
         primary_generated_provider,
         fallback_generated_provider,
     )
+
+    if IMAGE_SEARCH_ENGINE == "v2" and mode in {"hybrid", "stock"} and priority not in {"openai_only", "grok_only"}:
+        return _upload_v2_stock_route(url, title, hashtags, article_context, image_meta, primary_generated_provider)
 
     if mode == "openai" or priority == "openai_only":
         selected = _generated_image_content("openai", title, hashtags, fallback_used=False)
@@ -1450,7 +1589,16 @@ def upload_image(
         print("No image available - posting without featured image.")
         return None, image_meta
 
+    return _upload_prepared_image(selected, article_context, image_meta)
+
+
+def _upload_prepared_image(
+    selected: tuple[bytes, str, dict[str, Any]],
+    article_context: dict[str, Any],
+    image_meta: dict[str, Any],
+) -> tuple[int | None, dict[str, Any]]:
     content, filename, selected_meta = selected
+    image_meta = dict(image_meta)
     image_meta.update(selected_meta)
 
     required_attribution = image_meta.get("provider") in {"pexels", "pixabay", "openverse", "wikimedia"}
@@ -1480,14 +1628,14 @@ def upload_image(
             "[IMG] uploaded media_id=%s provider=%s mode=%s query=%r score=%s fallback=%s",
             media_id,
             image_meta.get("provider"),
-            mode,
+            image_meta.get("mode"),
             image_meta.get("query"),
             image_meta.get("score"),
             image_meta.get("openai_fallback_used"),
         )
         metadata_saved = set_media_details(
             media_id,
-            article_context.get("seo_focus") or title,
+            article_context.get("seo_focus") or article_context.get("title") or "",
             caption=credit_text or None,
             description=credit_text or None,
             required_attribution=required_attribution,
@@ -1504,6 +1652,7 @@ def upload_image(
         )
         return None, image_meta
     except Exception as exc:
+        image_meta["featured_image_rejected_reason"] = "media_upload_failed"
         logger.warning("[IMG] image upload failed media_id=%s error_type=%s", media_id, type(exc).__name__)
         return None, image_meta
 
