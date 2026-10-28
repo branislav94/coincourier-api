@@ -22,9 +22,10 @@ from .media import MediaMetadataError, validate_required_attribution
 
 MAX_PUBLIC_TEXT_CHARS = 512
 MAX_NOTICE_CHARS = 240
-_URL = re.compile(r"https?://[^\s<>\"']+", re.I)
+_URL = re.compile(r"(?:https?://|(?<![:/])//|www\.)[^\s<>\"']+", re.I)
 _UNKNOWN = {"", "unknown", "unknown creator", "n/a", "none"}
 _FIELD_LABEL = re.compile(r"\b(?:File|Artist|Credit|Attribution|Source|License|Changes):\s*", re.I)
+_PUBLIC_UNSAFE = re.compile(r"[<>]|\b(?:href|rel)\s*=|\b(?:wikimedia|openverse|pexels|pixabay):|&(?:amp;)*(?:lt|gt);", re.I)
 
 
 def _safe_url(value: str) -> bool:
@@ -88,8 +89,18 @@ class _ReadableText(HTMLParser):
 
 
 def _read(value: object) -> tuple[str, list[tuple[str, str]]]:
+    # Decode before parsing: HTMLParser alone can return encoded tags as literal
+    # '<...>' data, which is unsuitable for a strictly plain-text caption.
+    text = str(value or "")
+    for _ in range(8):
+        decoded = html.unescape(text)
+        if decoded == text:
+            break
+        text = decoded
+    if html.unescape(text) != text:
+        raise MediaMetadataError("attribution_missing")
     parser = _ReadableText()
-    parser.feed(str(value or ""))
+    parser.feed(text)
     parser.close()
     return re.sub(r"\s+", " ", "".join(parser.parts)).strip(), parser.links
 
@@ -108,8 +119,8 @@ def _url_token(value: str) -> tuple[str, str]:
     return url, suffix
 
 
-def _link(url: str, label: str) -> str:
-    return f'<a href="{html.escape(url, quote=True)}" rel="noopener noreferrer">{html.escape(label)}</a>'
+def _plain_caption_valid(value: str) -> bool:
+    return not (_PUBLIC_UNSAFE.search(value) or _URL.search(value) or _FIELD_LABEL.search(value))
 
 
 def _work_title(metadata: dict[str, Any]) -> str:
@@ -130,6 +141,10 @@ def _notice(value: object, *, structural_urls: set[str]) -> tuple[str, list[str]
 
     def consume_url(match: re.Match) -> str:
         url, suffix = _url_token(match.group())
+        if url.startswith("//"):
+            url = "https:" + url
+        elif url.lower().startswith("www."):
+            url = "https://" + url
         if not _safe_url(url):
             raise MediaMetadataError("attribution_missing")
         if url not in structural_urls:
@@ -159,10 +174,13 @@ def _public_domain_caption(metadata: dict[str, Any], source: str, license_url: s
         title = _work_title(metadata)
     except MediaMetadataError:
         title = ""
-    creator = _plain(metadata.get("creator_display_name") or metadata.get("creator_name") or metadata.get("credit_name"))
-    if len(title) > MAX_NOTICE_CHARS or _FIELD_LABEL.search(title):
+    try:
+        creator = _plain(metadata.get("creator_display_name") or metadata.get("creator_name") or metadata.get("credit_name"))
+    except MediaMetadataError:
+        creator = ""
+    if len(title) > MAX_NOTICE_CHARS or not _plain_caption_valid(title):
         title = ""
-    if creator.lower() in _UNKNOWN or len(creator) > MAX_NOTICE_CHARS or _FIELD_LABEL.search(creator):
+    if creator.lower() in _UNKNOWN or len(creator) > MAX_NOTICE_CHARS or not _plain_caption_valid(creator):
         creator = ""
     try:
         creator_urls = _creator_urls(metadata, source, license_url)
@@ -170,31 +188,25 @@ def _public_domain_caption(metadata: dict[str, Any], source: str, license_url: s
         creator_urls = []
     provider = "Wikimedia Commons" if urlsplit(source).hostname in {"commons.wikimedia.org", "commons.m.wikimedia.org"} else "Openverse"
 
-    def base(*, link_creator: bool = True) -> str:
-        party = _link(creator_urls[0], creator) if link_creator and creator and len(creator_urls) == 1 else html.escape(creator)
-        parts = ["Photo: " + party if creator else "Photo"]
+    def base() -> str:
+        parts = ["Photo: " + creator if creator else "Photo"]
         if title:
-            parts.extend((_link(source, f"“{title}”"), provider))
+            parts.extend((f"“{title}”", provider))
         else:
-            parts.append(_link(source, provider))
-        parts.append(_link(license_url, label))
+            parts.append(provider)
+        parts.append(label)
         if modified:
             parts.append("Cropped")
         return " · ".join(parts)
 
     caption = base()
-    if len(_read(caption)[0]) > MAX_PUBLIC_TEXT_CHARS:
+    if len(caption) > MAX_PUBLIC_TEXT_CHARS:
         title = ""
         caption = base()
-    if len(_read(caption)[0]) > MAX_PUBLIC_TEXT_CHARS:
+    if len(caption) > MAX_PUBLIC_TEXT_CHARS:
         creator = ""
         caption = base()
-    try:
-        validate_required_attribution(caption)
-    except MediaMetadataError:
-        # A long optional creator URI must not consume the required link budget.
-        caption = base(link_creator=False)
-        validate_required_attribution(caption)
+    validate_required_attribution(caption)
     for value in (metadata.get("credit"), metadata.get("attribution_notice")):
         try:
             notice, links = _notice(value, structural_urls={source, license_url, *creator_urls})
@@ -202,10 +214,10 @@ def _public_domain_caption(metadata: dict[str, Any], source: str, license_url: s
             continue
         if not notice or notice.lower() in {"own work", creator.lower(), title.lower()} or len(notice) > MAX_NOTICE_CHARS:
             continue
-        if len(links) > 4:
+        if links or not _plain_caption_valid(notice):
             continue
-        proposed = caption + " · " + " · ".join((html.escape(notice), *(_link(url, "Credit details") for url in links)))
-        if len(_read(proposed)[0]) <= MAX_PUBLIC_TEXT_CHARS:
+        proposed = caption + " · " + notice
+        if len(proposed) <= MAX_PUBLIC_TEXT_CHARS:
             try:
                 validate_required_attribution(proposed)
             except MediaMetadataError:
@@ -214,10 +226,25 @@ def _public_domain_caption(metadata: dict[str, Any], source: str, license_url: s
     return caption
 
 
+def _full_description(full_audit: str, source: str, license_url: str, label: str, creator_urls: list[str]) -> str:
+    """Retain standard URIs in the full public description, never the caption."""
+    description = html.unescape(full_audit)
+    present_urls = {_url_token(match.group())[0] for match in _URL.finditer(description)}
+    for prefix, url in (("Source", source), ("License", license_url), *(("Creator URI", value) for value in creator_urls)):
+        if url and url not in present_urls:
+            value = f"{label} ({url})" if prefix == "License" else url
+            description += f"\n{prefix}: {value}"
+            present_urls.add(url)
+    validate_required_attribution(description)
+    description = html.escape(description, quote=False)
+    validate_required_attribution(description)
+    return description
+
+
 def build_public_attribution(
     metadata: dict[str, Any], full_audit: str, *, modified: bool = True,
 ) -> tuple[str, str]:
-    """Return safe inline caption HTML and complete encoded description text.
+    """Return a strictly plain caption and complete encoded description text.
 
     ``full_audit`` stays byte-for-byte intact in publication metadata. Description
     HTML escapes its once-decoded text so existing escaped Commons credits are
@@ -243,24 +270,36 @@ def build_public_attribution(
     if parsed is None:
         raise MediaMetadataError("attribution_missing")
     exact_label = f"CC BY {parsed[1]}" if name == "cc-by" else f"{label} {parsed[1]}"
+    try:
+        creator_urls = _creator_urls(metadata, source, license_url)
+    except MediaMetadataError:
+        if name == "cc-by":
+            raise
+        creator_urls = []
+    description = _full_description(full_audit, source, license_url, exact_label, creator_urls)
     if name in {"cc0", "pdm"}:
-        return _public_domain_caption(metadata, source, license_url, exact_label, modified), html.escape(html.unescape(full_audit), quote=False)
+        return _public_domain_caption(metadata, source, license_url, exact_label, modified), description
     title = _work_title(metadata)
     creator = _plain(metadata.get("creator_display_name") or metadata.get("creator_name") or metadata.get("credit_name"))
     if creator.lower() in _UNKNOWN:
         creator = ""
-    creator_urls = _creator_urls(metadata, source, license_url)
     structural_urls = {source, license_url, *creator_urls}
     notices: list[str] = []
-    extra_links: list[str] = []
     for value in (metadata.get("credit"), metadata.get("attribution_notice")):
         notice, links = _notice(value, structural_urls=structural_urls)
+        if links:
+            # Custom credit URIs cannot be silently removed or replaced with an
+            # unusable anchor in a plain-text public credit. Try another asset.
+            raise MediaMetadataError("attribution_missing")
         if notice and notice.lower() not in {"own work", creator.lower(), title.lower()}:
+            if notice not in _notice(full_audit, structural_urls=structural_urls)[0]:
+                raise MediaMetadataError("attribution_missing")
             notices.append(notice)
-        extra_links.extend(links)
     if metadata.get("attribution_authoritative"):
         original = metadata.get("provider_attribution_text") or full_audit
         core, links = _notice(original, structural_urls=structural_urls)
+        if links:
+            raise MediaMetadataError("attribution_missing")
         core = re.sub(r"\b(?:is\s+)?licensed(?:\s+under)?\b", "", core, flags=re.I)
         core = re.sub(re.escape(exact_label) + r"\b", "", core, flags=re.I)
         core = re.sub(r"\s+", " ", core).strip(" .;·")
@@ -275,31 +314,21 @@ def build_public_attribution(
                 if not explicit_credit:
                     raise MediaMetadataError("attribution_missing")
                 creator = core
-        extra_links.extend(links)
     if name == "cc-by" and not creator:
         raise MediaMetadataError("attribution_missing")
     if any(len(notice) > MAX_NOTICE_CHARS for notice in notices) or len(creator) > MAX_NOTICE_CHARS:
         raise MediaMetadataError("attribution_too_large")
-    creator_label = _link(creator_urls[0], creator) if creator and len(creator_urls) == 1 else html.escape(creator)
-    if len(creator_urls) > 1:
-        extra_links.extend(creator_urls)
-    parts = ["Photo: " + creator_label] if creator else ["Photo"]
+    parts = ["Photo: " + creator] if creator else ["Photo"]
     if title:
-        parts.append(_link(source, f"“{title}”"))
+        parts.append(f"“{title}”")
     provider_label = "Wikimedia Commons" if urlsplit(source).hostname in {"commons.wikimedia.org", "commons.m.wikimedia.org"} else "Openverse"
-    parts.append(html.escape(provider_label) if title else _link(source, provider_label))
-    parts.append(_link(license_url, exact_label))
+    parts.append(provider_label)
+    parts.append(exact_label)
     if modified:
         parts.append("Cropped")
-    parts.extend(html.escape(notice) for notice in dict.fromkeys(notices))
-    unique_links = list(dict.fromkeys(extra_links))
-    if len(unique_links) > 4:
-        raise MediaMetadataError("attribution_too_large")
-    parts.extend(_link(url, "Credit details") for url in unique_links)
+    parts.extend(dict.fromkeys(notices))
     caption = " · ".join(parts)
-    visible, _links = _read(caption)
-    if len(visible) > MAX_PUBLIC_TEXT_CHARS or _FIELD_LABEL.search(visible):
+    if len(caption) > MAX_PUBLIC_TEXT_CHARS or not _plain_caption_valid(caption):
         raise MediaMetadataError("attribution_too_large")
     validate_required_attribution(caption)
-    description = html.escape(html.unescape(full_audit), quote=False)
     return caption, description

@@ -765,6 +765,8 @@ class WikimediaReuseAndFallbackTests(unittest.TestCase):
         self.assertEqual(meta["provider"], "wikimedia")
         generate.assert_not_called()
         self.assertIn("Cropped", metadata.call_args.kwargs["caption"])
+        for forbidden in ("<", ">", "href=", "rel=", "https://", "http://"):
+            self.assertNotIn(forbidden, metadata.call_args.kwargs["caption"])
         self.assertIn("Changes:", metadata.call_args.kwargs["description"])
         self.assertNotEqual(metadata.call_args.kwargs["caption"], metadata.call_args.kwargs["description"])
 
