@@ -27,6 +27,10 @@ from image_search.providers.openverse import OpenverseProvider
 
 OFFICIAL_API_BASE_URL = "https://api.openverse.org/v1/"
 OFFICIAL_TOKEN_URL = "https://api.openverse.org/v1/auth_tokens/token/"
+IDENTIFICATION_HEADERS = {
+    "User-Agent": "CoinCourierGetNewsAPI/1.0 (+https://github.com/branislav94/coincourier-api)",
+    "Accept": "application/json",
+}
 
 
 class _SafeArgumentParser(argparse.ArgumentParser):
@@ -37,11 +41,16 @@ class _SafeArgumentParser(argparse.ArgumentParser):
 
 
 class _DiagnosticSession:
-    def __init__(self, session: Any) -> None:
+    def __init__(self, session: Any, *, identify: bool = False) -> None:
         self.session = session
+        self.identification_headers = dict(IDENTIFICATION_HEADERS) if identify else {}
         self.last: dict[str, Any] = {}
 
     def request(self, *args: Any, **kwargs: Any) -> Any:
+        if self.identification_headers:
+            # One truthful, opt-in API-client variant. Copy per request so the
+            # shared session and any Bearer header remain otherwise unchanged.
+            kwargs["headers"] = {**(kwargs.get("headers") or {}), **self.identification_headers}
         response = self.session.request(*args, **kwargs)
         self.last = {
             "http_status": int(response.status_code),
@@ -50,10 +59,12 @@ class _DiagnosticSession:
         return response
 
 
-def run_probes(*, path: str, mode: str, query: str = "bitcoin", session: Any = None) -> list[dict[str, Any]]:
+def run_probes(
+    *, path: str, mode: str, query: str = "bitcoin", session: Any = None, identify: bool = False,
+) -> list[dict[str, Any]]:
     """Return allowlisted diagnostics only; injected sessions support offline tests."""
     http_session = session if session is not None else requests.Session()
-    transport = _DiagnosticSession(http_session)
+    transport = _DiagnosticSession(http_session, identify=identify)
     records: list[dict[str, Any]] = []
     paths = ("direct", "configured") if path == "both" else (path,)
     operations = ("oauth", "anonymous", "bearer") if mode == "all" else (mode,)
@@ -61,6 +72,8 @@ def run_probes(*, path: str, mode: str, query: str = "bitcoin", session: Any = N
         for selected_path in paths:
             for operation in operations:
                 record: dict[str, Any] = {"provider": "openverse", "path": selected_path, "operation": operation}
+                if identify:
+                    record["request_identification"] = "product"
                 transport.last = {}
                 if operation == "oauth" and not OPENVERSE_CLIENT_ID and not OPENVERSE_CLIENT_SECRET:
                     records.append({**record, "outcome": "skipped", "reason": "missing_credentials"})
@@ -114,10 +127,14 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--path", choices=("direct", "configured", "both"), default="direct")
     parser.add_argument("--mode", choices=("anonymous", "oauth", "bearer", "all"), default="anonymous")
     parser.add_argument("--query", default="bitcoin")
+    parser.add_argument(
+        "--identify", action="store_true",
+        help="Use one truthful product User-Agent and Accept: application/json diagnostic variant.",
+    )
     args = parser.parse_args(argv)
     if not args.query.strip() or len(args.query) > 200:
         parser.error("query must contain between 1 and 200 characters")
-    records = run_probes(path=args.path, mode=args.mode, query=args.query)
+    records = run_probes(path=args.path, mode=args.mode, query=args.query, identify=args.identify)
     for record in records:
         print(json.dumps(record, sort_keys=True))
     if any(record["outcome"] == "failed" for record in records):

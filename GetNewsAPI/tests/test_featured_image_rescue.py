@@ -80,9 +80,11 @@ class FixtureDownloader:
 
 class FeaturedStockRescueTests(unittest.TestCase):
     @contextmanager
-    def route(self, providers, *, downloader=None, local_usage=None, metadata_outcomes=None, engine="v2"):
+    def route(self, providers, *, downloader=None, local_usage=None, metadata_outcomes=None, engine="v2",
+              require=False, generation_results=None, rescue_limit=10, rescue_enabled=True,
+              fallback_enabled=True, mode="hybrid", priority="stock_first"):
         loader = downloader or FixtureDownloader()
-        results = []
+        results, events = [], []
 
         def score(candidate, _article):
             candidate.final_score = candidate.metadata["fixture_score"]
@@ -92,15 +94,31 @@ class FeaturedStockRescueTests(unittest.TestCase):
             result = selection.search_images(article, providers=providers, downloader=loader,
                                              local_usage=local_usage or [], recent_wp_usage=[], **kwargs)
             results.append(result)
+            events.append(("strict_completed", result.candidate is not None))
             return result
+
+        def rescue(*args, **kwargs):
+            result = emergency.rescue_images(*args, **kwargs)
+            events.append(("rescue_completed", result.emergency_summary.get("emergency_completed", False)))
+            return result
+
+        def generate(provider, *_args, **_kwargs):
+            events.append(("generated", provider))
+            result = (generation_results or {}).get(provider)
+            if isinstance(result, Exception):
+                raise result
+            if result is None:
+                return None
+            content, filename, metadata = result
+            return content, filename, {**metadata, "openai_fallback_used": bool(_kwargs.get("fallback_used"))}
 
         with ExitStack() as stack:
             for name, value in {
-                "IMAGE_SEARCH_ENGINE": engine, "IMAGE_SOURCE_MODE": "hybrid", "IMAGE_SOURCE_PRIORITY": "stock_first",
+                "IMAGE_SEARCH_ENGINE": engine, "IMAGE_SOURCE_MODE": mode, "IMAGE_SOURCE_PRIORITY": priority,
                 "USE_SOURCE_IMAGES": False, "PRIMARY_IMAGE_PROVIDER": "grok", "IMAGE_FALLBACK_PROVIDER": "openai",
-                "OPENAI_IMAGE_FALLBACK": True, "IMAGE_GENERATION_ONLY_AFTER_SEARCH_EXHAUSTED": True,
-                "IMAGE_GENERATION_ON_PROVIDER_ERROR": False, "IMAGE_EMERGENCY_STOCK_RESCUE_ENABLED": True,
-                "IMAGE_EMERGENCY_STOCK_RESCUE_LIMIT": 10,
+                "OPENAI_IMAGE_FALLBACK": fallback_enabled, "IMAGE_GENERATION_ONLY_AFTER_SEARCH_EXHAUSTED": True,
+                "IMAGE_GENERATION_ON_PROVIDER_ERROR": False, "IMAGE_EMERGENCY_STOCK_RESCUE_ENABLED": rescue_enabled,
+                "IMAGE_EMERGENCY_STOCK_RESCUE_LIMIT": rescue_limit, "IMAGE_REQUIRE_FEATURED_IMAGE": require,
             }.items():
                 stack.enter_context(patch.object(publisher, name, value))
             stack.enter_context(patch.object(selection, "score_candidate", side_effect=score))
@@ -108,10 +126,10 @@ class FeaturedStockRescueTests(unittest.TestCase):
             cover = stack.enter_context(patch.object(publisher, "_cover_bytes_to_1536x1024", return_value=(b"hero", {"width": 1536, "height": 1024})))
             upload = stack.enter_context(patch.object(publisher, "upload_media", side_effect=iter(range(701, 751))))
             metadata = stack.enter_context(patch.object(publisher, "set_media_details", return_value=True, side_effect=metadata_outcomes))
-            generate = stack.enter_context(patch.object(publisher, "_generated_image_content", return_value=None))
-            rescue = stack.enter_context(patch.object(publisher, "rescue_images", wraps=emergency.rescue_images))
+            generate = stack.enter_context(patch.object(publisher, "_generated_image_content", side_effect=generate))
+            rescue = stack.enter_context(patch.object(publisher, "rescue_images", side_effect=rescue))
             yield SimpleNamespace(loader=loader, results=results, cover=cover, upload=upload,
-                                  metadata=metadata, generate=generate, rescue=rescue)
+                                  metadata=metadata, generate=generate, rescue=rescue, events=events)
 
     def upload(self):
         return publisher.upload_image(None, ARTICLE["title"], ARTICLE["hashtags"], article=ARTICLE)
@@ -232,13 +250,153 @@ class FeaturedStockRescueTests(unittest.TestCase):
 
     def test_v1_rollback_stays_on_existing_image_route(self) -> None:
         selected = (b"v1", "pexels.jpg", {"provider": "pexels", "credit_text": "Complete existing Pexels credit"})
-        with self.route([], engine="v1") as route, patch.object(publisher, "_stock_image_content_v1", return_value=selected) as v1:
+        with self.route([], engine="v1", require=True) as route, patch.object(publisher, "_stock_image_content_v1", return_value=selected) as v1:
             media_id, metadata = self.upload()
         self.assertEqual(media_id, 701)
         self.assertEqual(metadata["provider"], "pexels")
         v1.assert_called_once()
         route.rescue.assert_not_called()
         route.generate.assert_not_called()
+
+    @staticmethod
+    def generated(provider: str):
+        return b"generated", f"{provider}.jpg", {"provider": "grok-image" if provider == "grok" else "openai", "credit_text": ""}
+
+    def test_required_grok_rescue_waits_for_completed_emergency_after_edge_failure(self) -> None:
+        unsafe = stock("pexels", "161", 0.60)
+        unsafe.license_name = "unknown"
+        providers = [FixtureProvider("pexels", [unsafe]), FixtureProvider("pixabay"),
+                     FixtureProvider("openverse", failure=True), FixtureProvider("wikimedia")]
+        with self.route(providers, require=True, generation_results={"grok": self.generated("grok")}) as route:
+            media_id, metadata = self.upload()
+        self.assertEqual(media_id, 701)
+        self.assertFalse(route.results[0].generation_allowed)
+        self.assertFalse(route.results[0].all_available_providers_exhausted)
+        self.assertEqual(metadata["emergency_candidates_available"], 0)
+        self.assertTrue(metadata["emergency_completed"])
+        self.assertTrue(metadata["final_generation_rescue_allowed"])
+        self.assertEqual(metadata["final_image_source"], "grok-image")
+        self.assertFalse(metadata["final_image_failure"])
+        self.assertEqual(route.loader.calls, [])
+        self.assertLess(route.events.index(("rescue_completed", True)), route.events.index(("generated", "grok")))
+        self.assertEqual([call.args[0] for call in route.generate.call_args_list], ["grok"])
+        route.upload.assert_called_once()
+
+    def test_required_stock_mode_grok_failure_uses_openai_even_normal_fallback_disabled(self) -> None:
+        with self.route([FixtureProvider("openverse", failure=True)], require=True, mode="stock", fallback_enabled=False,
+                        generation_results={"openai": self.generated("openai")}) as route:
+            media_id, metadata = self.upload()
+        self.assertEqual(media_id, 701)
+        self.assertEqual([call.args[0] for call in route.generate.call_args_list], ["grok", "openai"])
+        self.assertEqual(metadata["final_image_source"], "openai")
+        self.assertTrue(metadata["final_generation_rescue_allowed"])
+        self.assertTrue(metadata["openai_fallback_used"])
+        self.assertFalse(metadata["final_image_failure"])
+        self.assertLess(route.events.index(("rescue_completed", True)), route.events.index(("generated", "grok")))
+
+    def test_both_required_generators_failing_report_genuine_final_image_failure(self) -> None:
+        with self.route([FixtureProvider("openverse", failure=True)], require=True, fallback_enabled=False) as route, self.assertLogs(level="INFO") as logs:
+            media_id, metadata = self.upload()
+        self.assertIsNone(media_id)
+        self.assertEqual([call.args[0] for call in route.generate.call_args_list], ["grok", "openai"])
+        self.assertTrue(metadata["final_generation_rescue_allowed"])
+        self.assertTrue(metadata["final_image_failure"])
+        self.assertEqual(metadata["final_image_source"], "")
+        self.assertIn("reason=final_image_failure", " ".join(logs.output))
+        route.upload.assert_not_called()
+
+    def test_disabled_or_zero_budget_emergency_completes_before_required_generation(self) -> None:
+        for enabled, limit in ((True, 0), (False, 10)):
+            with self.subTest(enabled=enabled, limit=limit):
+                item = stock("pexels", "171", 0.69)
+                with self.route([FixtureProvider("pexels", [item]), FixtureProvider("openverse", failure=True)],
+                                require=True, rescue_enabled=enabled, rescue_limit=limit,
+                                generation_results={"grok": self.generated("grok")}) as route:
+                    media_id, metadata = self.upload()
+                self.assertEqual(media_id, 701)
+                self.assertTrue(metadata["emergency_completed"])
+                self.assertTrue(metadata["final_generation_rescue_allowed"])
+                self.assertEqual(metadata["emergency_download_attempts"], 0)
+                self.assertEqual(route.loader.calls, [])
+                self.assertLess(route.events.index(("rescue_completed", True)), route.events.index(("generated", "grok")))
+
+    def test_all_stock_attribution_failures_finish_rescue_before_final_grok(self) -> None:
+        strict, soft = stock("pexels", "181", 0.90), stock("pexels", "182", 0.69)
+        providers = [FixtureProvider("pexels", [strict, soft]), FixtureProvider("openverse", failure=True)]
+        with self.route(providers, require=True, generation_results={"grok": self.generated("grok")},
+                        metadata_outcomes=[media.MediaMetadataError("metadata_update_failed"), media.MediaMetadataError("metadata_update_failed"), True]) as route:
+            media_id, metadata = self.upload()
+        self.assertEqual(media_id, 703)
+        self.assertEqual(route.upload.call_count, 3)
+        self.assertEqual(route.metadata.call_count, 3)
+        self.assertEqual(route.loader.calls, [(strict.provider, strict.usable_url), (soft.provider, soft.usable_url)])
+        self.assertFalse(metadata["strict_stock_selected"])
+        self.assertFalse(metadata["emergency_selected"])
+        self.assertTrue(metadata["emergency_completed"])
+        self.assertEqual(metadata["final_image_source"], "grok-image")
+        self.assertFalse(metadata["final_image_failure"])
+        self.assertLess(route.events.index(("rescue_completed", True)), route.events.index(("generated", "grok")))
+
+    def test_require_flag_false_preserves_provider_error_generation_block(self) -> None:
+        with self.route([FixtureProvider("openverse", failure=True)], require=False,
+                        generation_results={"grok": self.generated("grok")}) as route:
+            media_id, metadata = self.upload()
+        self.assertIsNone(media_id)
+        self.assertTrue(metadata["emergency_completed"])
+        self.assertFalse(metadata["final_generation_rescue_allowed"])
+        self.assertTrue(metadata["final_image_failure"])
+        route.generate.assert_not_called()
+        route.upload.assert_not_called()
+
+    def test_wordpress_upload_failure_is_explicit_without_extra_generation(self) -> None:
+        with self.route([FixtureProvider("openverse", failure=True)], require=True,
+                        generation_results={"grok": self.generated("grok"), "openai": self.generated("openai")}) as route, self.assertLogs(level="INFO") as logs:
+            route.upload.side_effect = RuntimeError("private-upload-secret")
+            media_id, metadata = self.upload()
+        self.assertIsNone(media_id)
+        self.assertTrue(metadata["final_image_failure"])
+        self.assertIn("reason=final_image_failure", " ".join(logs.output))
+        self.assertNotIn("private-upload-secret", " ".join(logs.output))
+        self.assertEqual([call.args[0] for call in route.generate.call_args_list], ["grok"])
+        self.assertEqual(route.upload.call_count, 1)
+
+    def test_generator_exception_is_sanitized_and_openai_fallback_continues(self) -> None:
+        with self.route([FixtureProvider("openverse", failure=True)], require=True,
+                        generation_results={"grok": RuntimeError("private-generator-secret"), "openai": self.generated("openai")}) as route, self.assertLogs(level="INFO") as logs:
+            media_id, metadata = self.upload()
+        self.assertEqual(media_id, 701)
+        self.assertEqual(metadata["final_image_source"], "openai")
+        self.assertFalse(metadata["final_image_failure"])
+        self.assertEqual([call.args[0] for call in route.generate.call_args_list], ["grok", "openai"])
+        self.assertNotIn("private-generator-secret", " ".join(logs.output))
+
+    def test_source_first_failed_upload_continues_to_strict_stock(self) -> None:
+        item = stock("pexels", "191", 0.90)
+        source = b"source", "source.jpg", {"provider": "source", "credit_text": ""}
+        with (
+            self.route([FixtureProvider("pexels", [item])], require=True, priority="source_first") as route,
+            patch.object(publisher, "USE_SOURCE_IMAGES", True),
+            patch.object(publisher, "_maybe_source_image_content", return_value=source),
+        ):
+            route.upload.side_effect = [RuntimeError("source upload failed"), 702]
+            media_id, metadata = self.upload()
+        self.assertEqual(media_id, 702)
+        self.assertEqual(metadata["provider"], "pexels")
+        self.assertTrue(metadata["strict_stock_selected"])
+        self.assertFalse(metadata["final_image_failure"])
+        self.assertEqual(route.upload.call_count, 2)
+        route.rescue.assert_not_called()
+        route.generate.assert_not_called()
+
+    def test_explicit_openai_only_route_is_unchanged_when_required_flag_enabled(self) -> None:
+        with self.route([], require=True, priority="openai_only",
+                        generation_results={"openai": self.generated("openai")}) as route:
+            media_id, metadata = self.upload()
+        self.assertEqual(media_id, 701)
+        self.assertEqual(metadata["provider"], "openai")
+        self.assertEqual(route.results, [])
+        route.rescue.assert_not_called()
+        self.assertEqual([call.args[0] for call in route.generate.call_args_list], ["openai"])
 
 
 if __name__ == "__main__":

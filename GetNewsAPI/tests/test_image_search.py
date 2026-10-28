@@ -992,6 +992,7 @@ class PublisherRoutingTests(unittest.TestCase):
             OPENAI_IMAGE_FALLBACK=True,
             IMAGE_GENERATION_ONLY_AFTER_SEARCH_EXHAUSTED=True,
             IMAGE_GENERATION_ON_PROVIDER_ERROR=False,
+            IMAGE_REQUIRE_FEATURED_IMAGE=False,
         )
         self.routing.start()
         self.session_post_patcher = patch.object(publish_to_wp.session, "post")

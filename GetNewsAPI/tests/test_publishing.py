@@ -742,6 +742,7 @@ class AttributionFlowTests(unittest.TestCase):
         details_response.raise_for_status.side_effect = metadata_error
         with (
             patch.object(publisher, "IMAGE_SEARCH_ENGINE", "v2"),
+            patch.object(publisher, "IMAGE_REQUIRE_FEATURED_IMAGE", False),
             patch.object(publisher, "IMAGE_SOURCE_MODE", "hybrid"),
             patch.object(publisher, "IMAGE_SOURCE_PRIORITY", "stock_first"),
             patch.object(publisher, "USE_SOURCE_IMAGES", False),

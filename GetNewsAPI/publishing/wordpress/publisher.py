@@ -26,6 +26,7 @@ from config import (
     IMAGE_GENERATION_ON_PROVIDER_ERROR,
     IMAGE_MIN_HEIGHT,
     IMAGE_MIN_WIDTH,
+    IMAGE_REQUIRE_FEATURED_IMAGE,
     IMAGE_SEARCH_ENGINE,
     IMAGE_SOURCE_PRIORITY,
     IMAGE_SOURCE_MODE,
@@ -1366,6 +1367,8 @@ def _upload_v2_stock_route(
         "emergency_stock_rescue_attempted": False,
         "emergency_candidates_available": 0,
         "emergency_download_attempts": 0,
+        "emergency_attempts": 0,
+        "emergency_completed": False,
         "emergency_selected": False,
         "emergency_selected_provider": "",
         "emergency_original_rejection_reason": "",
@@ -1389,10 +1392,12 @@ def _upload_v2_stock_route(
             logging.INFO if media_id else logging.ERROR,
             "[IMG-V2] image_terminal article=%s reason=%s strict_stock_selected=%s "
             "emergency_stock_rescue_attempted=%s emergency_candidates_available=%s emergency_download_attempts=%s "
+            "emergency_attempts=%s emergency_completed=%s "
             "emergency_selected=%s emergency_selected_provider=%s emergency_original_rejection_reason=%s "
             "final_generation_rescue_allowed=%s final_image_source=%s final_image_failure=%s",
             correlation, reason, metadata["strict_stock_selected"], metadata["emergency_stock_rescue_attempted"],
             metadata["emergency_candidates_available"], metadata["emergency_download_attempts"],
+            metadata["emergency_attempts"], metadata["emergency_completed"],
             metadata["emergency_selected"], metadata["emergency_selected_provider"], metadata["emergency_original_rejection_reason"],
             metadata["final_generation_rescue_allowed"], metadata["final_image_source"], metadata["final_image_failure"],
         )
@@ -1411,7 +1416,10 @@ def _upload_v2_stock_route(
     if image_meta["priority"] == "source_first":
         source = _maybe_source_image_content(url)
         if source:
-            return finish(_upload_prepared_image(source, article, image_meta))
+            value = _upload_prepared_image(source, article, image_meta)
+            if value[0]:
+                return finish(value)
+            image_meta["featured_image_rejected_reason"] = value[1].get("featured_image_rejected_reason") or "media_upload_failed"
 
     selected, exhausted = _search_stock_image_content(
         article, context=context, candidate_validator=persist_candidate,
@@ -1440,6 +1448,28 @@ def _upload_v2_stock_route(
         return finish(ready)
 
     generation_allowed = _generation_allowed_after_search(exhausted)
+    # This final policy is separate from the normal provider-error gate. It can
+    # activate only after the observed safe-stock pool has completed its budget.
+    final_rescue_allowed = bool(IMAGE_REQUIRE_FEATURED_IMAGE and summary["emergency_completed"])
+    summary["final_generation_rescue_allowed"] = final_rescue_allowed
+    if final_rescue_allowed:
+        logger.warning(
+            "[IMG-V2] final_generation_rescue_allowed=true emergency_completed=true normal_generation_allowed=%s",
+            generation_allowed,
+        )
+        for provider in ("grok", "openai"):
+            try:
+                selected = _generated_image_content(provider, title, hashtags, fallback_used=provider == "openai")
+            except Exception as exc:
+                logger.warning(
+                    "[IMG-V2] final generated rescue failed provider=%s error_type=%s",
+                    provider, type(exc).__name__,
+                )
+                selected = None
+            if selected:
+                return finish(_upload_prepared_image(selected, article, image_meta))
+        return finish((None, image_meta))
+
     selected = None
     if image_meta["mode"] == "stock":
         if generation_allowed and _openai_fallback_enabled():

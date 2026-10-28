@@ -67,8 +67,11 @@ testable from this checkout.
 
 Keep provider order, thresholds, reuse protection and generation policy unchanged.
 An unavailable Openverse remains `provider_failed`, not confirmed exhaustion.
-With `IMAGE_GENERATION_ON_PROVIDER_ERROR=false`, it cannot authorize generation
-when no stock provider succeeds. Restart runtime processes after an approved
+With `IMAGE_GENERATION_ON_PROVIDER_ERROR=false`, it cannot authorize normal
+generation when no stock provider succeeds. The separate
+`IMAGE_REQUIRE_FEATURED_IMAGE=true` policy permits final Grok/OpenAI rescue only
+after the bounded emergency stock phase completes; see
+[featured-image rescue](GETNEWSAPI_FEATURED_IMAGE_RESCUE.md). Restart runtime processes after an approved
 environment change; configuration is read at import time.
 
 ### Explicit safe DEV probes
@@ -83,6 +86,34 @@ python -B openverse_probe.py --path direct --mode anonymous
 python -B openverse_probe.py --path direct --mode bearer
 python -B openverse_probe.py --path configured --mode all
 ```
+
+The [official Openverse API client usage documentation](https://docs.openverse.org/packages/js/api_client/index.html#usage)
+supports ordinary request headers and optional authentication. It does not state
+that a particular User-Agent is required or demonstrate a cure for edge denial.
+Its [terms](https://docs.openverse.org/terms_of_service.html#licensed-uses-and-restrictions)
+do not authorize circumventing access controls. The probe supports one opt-in,
+truthful product-identification variant, applied consistently to OAuth,
+anonymous search and Bearer search:
+
+```sh
+python -B openverse_probe.py --path direct --mode all --identify
+```
+
+That variant sends `User-Agent: CoinCourierGetNewsAPI/1.0 (+https://github.com/branislav94/coincourier-api)`
+and `Accept: application/json`; it never impersonates a browser or changes
+runtime provider headers. Run the baseline and this single variant on the SAME
+DEV egress. If a pre-issued token is available through existing secret handling,
+the Bearer operation uses it only for the intended API request. Never print it.
+After an approved endpoint/proxy is provisioned, use `--path configured` for its
+explicit diagnostic, without automatic failover or rotation.
+
+Neither the identified request nor Bearer-from-blocked-DEV-egress was testable
+from this checkout: there is no DEV execution path or pre-issued DEV token here.
+Offline tests verify headers, routing isolation and sanitized results, not live
+reachability. No claim of an Openverse fix is made, and no runtime identification
+change is included. If the same DEV egress still returns Cloudflare HTML 403,
+application code cannot remove that block; the approved allowlisting/proxy/NAT/
+relay or explicitly approved API route described above is still required.
 
 Do not pass credentials or tokens as command-line arguments. The bearer probe
 is skipped unless `OPENVERSE_ACCESS_TOKEN` is supplied. The explicit OAuth probe

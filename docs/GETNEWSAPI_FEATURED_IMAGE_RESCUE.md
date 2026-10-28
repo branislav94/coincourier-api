@@ -62,3 +62,57 @@ Local fixture verification reproduces Pexels below-threshold safe candidates,
 Pixabay image HTTP 429 failures, Openverse edge denial and no usable Wikimedia
 result. The safe Pexels rescue supplies featured media and prevents generation.
 This is offline evidence, not a new DEV publication or deployment.
+
+## Final generated-image phase
+
+`IMAGE_REQUIRE_FEATURED_IMAGE=true` defaults on. For V2 hybrid/stock routing, once
+the bounded emergency phase completes without featured media, the final chain
+tries Grok and then the existing OpenAI image helper. Both existing image models
+and preparation paths remain unchanged. This final requirement selects that
+chain even when normal optional-generation settings would disable it; explicit
+source/generated-only modes and V1 retain their existing routes.
+
+The strict selector's `generation_allowed` and the meaning of
+`IMAGE_GENERATION_ON_PROVIDER_ERROR=false` are unchanged: a provider failure still
+blocks normal generation. The separate `final_generation_rescue_allowed` flag
+can become true only after emergency completion, including an empty safe pool,
+a configured zero attempt limit, or an explicitly disabled emergency phase.
+Setting `IMAGE_REQUIRE_FEATURED_IMAGE=false` restores the normal generation gate
+after emergency stock. Failed stock metadata never becomes featured media;
+remaining candidates are tried before this final policy is considered.
+
+A V2 stock-route image can still be absent if safe stock fails and both generated
+providers fail/unavailable, or WordPress media upload fails. This produces an
+ERROR `image_terminal reason=final_image_failure`, with `final_image_failure=true`.
+Final source and strict/emergency/final-generation counters accompany success
+and failure. Publishing semantics remain unchanged; this change does not add a
+post-publication veto or alter Yoast handling. V1 rollback retains its existing
+fail-closed metadata behavior, including possible publication without media.
+
+## Next DEV verification
+
+These are operator instructions only; this checkout has not changed runtime
+configuration, deployed code, contacted DEV, or published a post. Add explicitly:
+
+```dotenv
+IMAGE_EMERGENCY_STOCK_RESCUE_ENABLED=true
+IMAGE_EMERGENCY_STOCK_RESCUE_LIMIT=10
+IMAGE_REQUIRE_FEATURED_IMAGE=true
+```
+
+Retain `IMAGE_SEARCH_ENGINE=v2`, provider order
+`pexels,pixabay,openverse,wikimedia`,
+`IMAGE_GENERATION_ONLY_AFTER_SEARCH_EXHAUSTED=true`, and
+`IMAGE_GENERATION_ON_PROVIDER_ERROR=false`, with all current thresholds, models,
+dimensions, license rules and reuse settings. Restart through the existing DEV
+release process after the approved code/config update. Capture the correlated
+strict provider summaries, `[IMG-RESCUE]` outcomes, `[IMG-V2] image_terminal` and
+post's actual `featured_media`, complete credits and usage recording. Generation
+without emergency completion is a failure; generation after completed emergency
+is the intended final policy. A successful safe-stock rescue must make zero
+generated-image calls.
+
+Openverse identification and Bearer checks remain unverified from the same DEV
+egress. Use the opt-in procedure in
+[provider connectivity](GETNEWSAPI_IMAGE_PROVIDER_CONNECTIVITY.md); no runtime
+header change or third Openverse fix commit is justified by offline fixtures.

@@ -47,6 +47,90 @@ class OpenverseProbeTests(unittest.TestCase):
         self.assertEqual(session.request.call_args.kwargs["proxies"]["https"], "http://approved-proxy.example:8080")
         self.assertEqual(record["outcome"], "ok")
 
+    def test_identification_uses_one_truthful_header_pair_for_oauth_and_search(self):
+        session = Mock()
+        session.request.side_effect = [
+            response(payload={"access_token": "returned-secret-token"}), response(), response(),
+        ]
+        records = probe.run_probes(path="direct", mode="all", session=session, identify=True)
+        self.assertEqual(session.request.call_count, 3)
+        expected = probe.IDENTIFICATION_HEADERS
+        self.assertEqual(expected["Accept"], "application/json")
+        self.assertTrue(expected["User-Agent"].startswith("CoinCourierGetNewsAPI/"))
+        self.assertIn("https://github.com/branislav94/coincourier-api", expected["User-Agent"])
+        for browser in ("Mozilla", "Chrome", "Firefox", "Safari"):
+            self.assertNotIn(browser, expected["User-Agent"])
+        for call in session.request.call_args_list:
+            headers = call.kwargs["headers"]
+            self.assertEqual({key: headers[key] for key in expected}, expected)
+            self.assertNotIn("Content-Type", headers)
+            self.assertFalse(call.kwargs["allow_redirects"])
+        oauth, anonymous, bearer = session.request.call_args_list
+        self.assertEqual(oauth.args, ("POST", probe.OFFICIAL_TOKEN_URL))
+        self.assertEqual(anonymous.args, ("GET", probe.OFFICIAL_API_BASE_URL + "images/"))
+        self.assertNotIn("Authorization", oauth.kwargs["headers"])
+        self.assertNotIn("Authorization", anonymous.kwargs["headers"])
+        self.assertEqual(set(oauth.kwargs["headers"]), set(expected))
+        self.assertEqual(set(anonymous.kwargs["headers"]), set(expected))
+        self.assertEqual(set(bearer.kwargs["headers"]), set(expected) | {"Authorization"})
+        self.assertEqual(bearer.kwargs["headers"]["Authorization"], "Bearer temporary-secret-token")
+        self.assertTrue(all(record["request_identification"] == "product" for record in records))
+
+    def test_identification_preserves_custom_route_and_does_not_mutate_session(self):
+        session = Mock()
+        session.headers = {"User-Agent": "existing-client"}
+        session.proxies = {"https": "http://existing-proxy.example"}
+        session.request.return_value = response()
+        records = probe.run_probes(path="both", mode="anonymous", session=session, identify=True)
+        direct, configured = session.request.call_args_list
+        self.assertEqual(direct.args[1], probe.OFFICIAL_API_BASE_URL + "images/")
+        self.assertEqual(direct.kwargs["proxies"], {"http": "", "https": "", "all": ""})
+        self.assertEqual(configured.args[1], "https://relay.example/v1/images/")
+        self.assertEqual(configured.kwargs["proxies"]["https"], "http://approved-proxy.example:8080")
+        self.assertEqual(direct.kwargs["headers"], configured.kwargs["headers"])
+        self.assertEqual(session.headers, {"User-Agent": "existing-client"})
+        self.assertEqual(session.proxies, {"https": "http://existing-proxy.example"})
+        self.assertEqual([record["outcome"] for record in records], ["ok", "ok"])
+
+    def test_identified_bearer_cli_keeps_token_out_of_output_and_cache(self):
+        session = Mock()
+        session.request.return_value = response()
+        with (
+            patch.object(probe.requests, "Session", return_value=session),
+            patch("image_search.cache.Path.write_text") as write,
+            redirect_stdout(io.StringIO()) as output,
+        ):
+            status = probe.main(["--path", "direct", "--mode", "bearer", "--identify"])
+        self.assertEqual(status, 0)
+        self.assertEqual(json.loads(output.getvalue())["request_identification"], "product")
+        headers = session.request.call_args.kwargs["headers"]
+        self.assertEqual(headers["Authorization"], "Bearer temporary-secret-token")
+        self.assertEqual(headers["Accept"], "application/json")
+        for secret in ("temporary-secret-token", "private-client-id", "private-client-secret"):
+            self.assertNotIn(secret, output.getvalue())
+        write.assert_not_called()
+
+    def test_identification_keeps_json_auth_failures_distinct_from_html_edge_denial(self):
+        cases = (
+            (401, "application/json", "authentication_failed"),
+            (403, "application/json", "authentication_failed"),
+            (403, "text/html", "edge_access_denied"),
+        )
+        for status, content_type, expected in cases:
+            with self.subTest(status=status, content_type=content_type):
+                session = Mock()
+                result = response(status, {"detail": "private-response"}, headers={
+                    "Content-Type": content_type, "Server": "cloudflare", "CF-Ray": "private-ray",
+                })
+                result.text = "private-html-body"
+                session.request.return_value = result
+                record = probe.run_probes(path="direct", mode="oauth", session=session, identify=True)[0]
+                self.assertEqual(record["reason"], expected)
+                self.assertEqual(record["http_status"], status)
+                self.assertEqual(record["content_type"], content_type)
+                self.assertNotIn("private", json.dumps(record))
+                result.json.assert_not_called()
+
     def test_oauth_reports_presence_without_returning_or_printing_token(self):
         session = Mock()
         session.request.return_value = response(payload={"access_token": "returned-secret-token"})

@@ -73,6 +73,9 @@ IMAGE_SOURCE_MODE=hybrid
 IMAGE_SOURCE_PRIORITY=stock_first
 IMAGE_GENERATION_ONLY_AFTER_SEARCH_EXHAUSTED=true
 IMAGE_GENERATION_ON_PROVIDER_ERROR=false
+IMAGE_EMERGENCY_STOCK_RESCUE_ENABLED=true
+IMAGE_EMERGENCY_STOCK_RESCUE_LIMIT=10
+IMAGE_REQUIRE_FEATURED_IMAGE=true
 STOCK_IMAGE_REUSE_WINDOW_DAYS=20
 STOCK_IMAGE_REUSE_CHECK_WP_HISTORY=true
 PEXELS_MIN_SCORE=0.72
@@ -94,17 +97,22 @@ download or conversion failure, alternate deliveries of that asset are tried
 before the next identity group. Each provider/URL attempt consumes the shared
 budget, and a selected alternate retains its own source, license and attribution.
 Provider failures and untried candidates remaining after the global
-download-attempt budget prevent confirmed exhaustion. With the values above,
-generation remains blocked in those cases. Only confirmed stock exhaustion
-permits Grok, followed by the existing optional OpenAI fallback. Required credit
-persistence failure rejects featured media without invoking generation; the post
-may still publish without a featured image.
+download-attempt budget prevent confirmed exhaustion and continue to block
+normal generation. After strict stock fails, the separate emergency phase uses
+only observed hard-safe score/reuse candidates within its own budget. If that
+phase completes without featured media, `IMAGE_REQUIRE_FEATURED_IMAGE=true`
+permits final Grok then OpenAI rescue, including after provider failures.
+Required-credit persistence failure rejects that delivery and advances to other
+stock candidates before final generation. See the exact tiers, hard exclusions,
+remaining failure conditions and V1 scope in
+[featured-image rescue](GETNEWSAPI_FEATURED_IMAGE_RESCUE.md).
 
 Capture the reviewed commit/image digest, trial window, article cohort and exact
 non-secret settings. Retain correlated `provider_summary` and `terminal` logs,
 including provider failures, rejection reasons, selected provider/asset,
 `all_available_providers_exhausted`, `search_budget_exhausted`, and
-`generation_allowed`. Join these with final upload/attribution and publication
+`generation_allowed`, plus emergency and final policy fields in `image_terminal`.
+Join these with final upload/attribution and publication
 outcomes; a selector success alone does not prove an image was published.
 
 Require successful publication and `publish_failed=0`. Review final image
@@ -116,7 +124,9 @@ yield merely because a provider was called. Preserve fresh DEV comparison data
 for the same measurement window where available.
 
 Stop the DEV trial on publication failures, missing required credits, unsupported
-licenses, reuse/duplicate regressions, or generation after non-exhaustion. The
+licenses, reuse outside the documented emergency tiers, or generation before
+emergency completion. Final-policy generation after non-exhaustion is expected
+only with `final_generation_rescue_allowed=true`. The
 DEV rollback is `IMAGE_SEARCH_ENGINE=v1` followed by a process restart; retain
 the persistent image-usage history. Do not tune thresholds, reuse windows or
 queries to conceal a failed acceptance result.
