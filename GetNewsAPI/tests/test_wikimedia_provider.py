@@ -8,6 +8,7 @@ import html
 import json
 import unittest
 from unittest.mock import Mock, patch
+from urllib.parse import quote
 
 from image_search.cache import CachedHttpClient
 from image_search.commons_identity import commons_identities, commons_identities_from_text, commons_identity_conflict, normalize_commons_identity
@@ -26,6 +27,7 @@ ARTICLE = {"seo_focus": "Bitcoin ETF liquidity", "title": "Bitcoin ETF trading v
 FILE_TITLE = "Bitcoin ETF liquidity.jpg"
 ORIGINAL = "https://upload.wikimedia.org/wikipedia/commons/a/ab/Bitcoin_ETF_liquidity.jpg"
 FILE_PAGE = "https://commons.wikimedia.org/wiki/File:Bitcoin_ETF_liquidity.jpg"
+TRACKING_QUERY = "?utm_source=commons.wikimedia.org&utm_campaign=api&utm_content=fixture"
 
 
 def page(pageid: int = 123, *, license_name: str = "CC BY 4.0", license_url: str = "https://creativecommons.org/licenses/by/4.0/") -> dict:
@@ -51,6 +53,28 @@ def candidate(pageid: int = 123) -> ImageCandidate:
     item = WikimediaProvider(enabled=False).normalize_candidate(page(pageid), "bitcoin etf liquidity", 0)
     assert item is not None
     return item
+
+
+def live_style_jpeg() -> dict:
+    """Public structural fields observed 2026-10-28; credits/descriptions are fake.
+
+    No complete live response or real creator HTML is stored in the repository.
+    """
+    raw = page(92021811, license_name="CC BY 2.0", license_url="https://creativecommons.org/licenses/by/2.0")
+    raw["title"] = "File:Bitcoin and cryptocurrency (38688311185).jpg"
+    info = raw["imageinfo"][0]
+    filename = quote(raw["title"][5:].replace(" ", "_"), safe="()")
+    info.update(
+        canonicaltitle=raw["title"], mime="image/jpeg", width=2000, height=1300, size=3886027,
+        url=f"https://upload.wikimedia.org/wikipedia/commons/4/4f/{filename}{TRACKING_QUERY}",
+        descriptionurl=f"https://commons.wikimedia.org/wiki/File:{filename}",
+    )
+    info["extmetadata"]["Artist"] = {"value": '<a href="https://creator.example/fixture">Fixture Creator</a>'}
+    info["extmetadata"]["Attribution"] = {"value": "Fixture required notice."}
+    info["extmetadata"]["Credit"] = {"value": "Fixture source credit."}
+    info["extmetadata"]["ObjectName"] = {"value": "Bitcoin and cryptocurrency"}
+    info["extmetadata"]["ImageDescription"] = {"value": "Bitcoin cryptocurrency markets"}
+    return raw
 
 
 def downloaded(seed: bytes = b"wikimedia-image", dhash: str = "0123456789abcdef") -> DownloadedImage:
@@ -175,7 +199,157 @@ class WikimediaRequestTests(unittest.TestCase):
         raw.pop("imageinfo")
         provider = WikimediaProvider(client=PayloadClient({"query": {"pages": [raw]}}))
         self.assertEqual(provider.search("bitcoin"), [])
-        self.assertEqual(provider.last_search_rejections, {"required_fields": 1})
+        self.assertEqual(provider.last_search_rejections, {"missing_imageinfo": 1})
+
+
+class WikimediaLiveCompatibilityTests(unittest.TestCase):
+    def test_live_style_jpeg_tracking_url_reaches_normalization(self) -> None:
+        raw = live_style_jpeg()
+        provider = WikimediaProvider(client=PayloadClient({"query": {"pages": [raw]}}))
+        items = provider.search("bitcoin cryptocurrency")
+        self.assertEqual(provider.last_search_stats, {"raw": 1, "normalized": 1})
+        self.assertEqual(provider.last_search_rejections, {})
+        self.assertEqual(items[0].canonical_source, "wikimedia:92021811")
+        self.assertEqual(items[0].usable_url, raw["imageinfo"][0]["url"])
+        self.assertIn(raw["title"], items[0].identity_aliases)
+        self.assertIn(raw["imageinfo"][0]["descriptionurl"], items[0].identity_aliases)
+        self.assertIn(raw["imageinfo"][0]["descriptionshorturl"], items[0].identity_aliases)
+        self.assertIn("wikimedia:file:Bitcoin and cryptocurrency (38688311185).jpg", items[0].identity_aliases)
+
+    def test_only_observed_tracking_query_keys_are_accepted(self) -> None:
+        for suffix in (
+            "?download=1", "?width=1200", "?utm_medium=unobserved", "?utm_source=ok&download=1",
+            "?download", "?utm_source", "?utm_source=%ZZ", "?utm_source=%FF", "#fragment",
+        ):
+            with self.subTest(suffix=suffix):
+                raw = page()
+                raw["imageinfo"][0]["url"] = ORIGINAL + suffix
+                provider = WikimediaProvider(enabled=False)
+                self.assertIsNone(provider.normalize_candidate(raw, "bitcoin", 0))
+                self.assertEqual(provider.last_search_rejections, {"invalid_original_url": 1})
+        raw = page()
+        raw["imageinfo"][0]["url"] = ORIGINAL.replace("upload.wikimedia.org", "upload.wikimedia.org.evil.example") + TRACKING_QUERY
+        provider = WikimediaProvider(enabled=False)
+        self.assertIsNone(provider.normalize_candidate(raw, "bitcoin", 0))
+        self.assertEqual(provider.last_search_rejections, {"invalid_original_url": 1})
+
+    def test_live_style_raster_shapes_keep_strict_license_mapping(self) -> None:
+        # PNG/WebP structures use observed dimensions/MIME, synthetic file names
+        # and fixture licenses; they do not assert rights in the observed files.
+        for mime, extension, dims, size, label, url in (
+            ("image/png", "png", (1400, 825), 61927, "PDM 1.0", "https://creativecommons.org/publicdomain/mark/1.0/"),
+            ("image/webp", "webp", (4827, 1644), 105024, "CC0", "https://creativecommons.org/publicdomain/zero/1.0/deed.en"),
+        ):
+            with self.subTest(mime=mime):
+                raw = page(123, license_name=label, license_url=url)
+                raw["title"] = f"File:Bitcoin fixture.{extension}"
+                info = raw["imageinfo"][0]
+                info.update(canonicaltitle=raw["title"], mime=mime, width=dims[0], height=dims[1], size=size,
+                            url=f"https://upload.wikimedia.org/wikipedia/commons/a/ab/Bitcoin_fixture.{extension}{TRACKING_QUERY}",
+                            descriptionurl=f"https://commons.wikimedia.org/wiki/File:Bitcoin_fixture.{extension}")
+                item = WikimediaProvider(enabled=False).normalize_candidate(raw, "bitcoin", 0)
+                self.assertIsNotNone(item)
+                assert item is not None
+                self.assertTrue(ImageLicensePolicy(("cc0", "pdm", "cc-by")).validate(item)[0])
+
+    def test_page_and_canonical_title_are_preserved_as_equivalent_aliases(self) -> None:
+        raw = page()
+        raw["imageinfo"][0]["canonicaltitle"] = f"File:{FILE_TITLE.replace(' ', '_')}"
+        item = WikimediaProvider(enabled=False).normalize_candidate(raw, "bitcoin", 0)
+        assert item is not None
+        self.assertIn(raw["title"], item.identity_aliases)
+        self.assertIn(raw["imageinfo"][0]["canonicaltitle"], item.identity_aliases)
+        self.assertEqual(item.canonical_source, "wikimedia:123")
+        self.assertIn("wikimedia:file:Bitcoin ETF liquidity.jpg", item.identity_aliases)
+
+    def test_genuinely_different_canonical_title_is_still_a_conflict(self) -> None:
+        raw = page()
+        raw["imageinfo"][0]["canonicaltitle"] = "File:Different image.jpg"
+        provider = WikimediaProvider(enabled=False)
+        self.assertIsNone(provider.normalize_candidate(raw, "bitcoin", 0))
+        self.assertEqual(provider.last_search_rejections, {"commons_identity_conflict": 1})
+
+    def test_candidate_field_failures_have_distinct_reasons(self) -> None:
+        cases = []
+        for key, value, reason in (("pageid", None, "missing_page_id"), ("ns", 0, "invalid_namespace"), ("title", "Bitcoin", "invalid_file_title")):
+            raw = page()
+            raw[key] = value
+            cases.append((raw, reason))
+        raw = page()
+        raw["imageinfo"] = []
+        cases.append((raw, "missing_imageinfo"))
+        raw = page()
+        raw["imageinfo"][0]["canonicaltitle"] = "Different namespace:Bitcoin"
+        cases.append((raw, "invalid_canonical_title"))
+        raw = page()
+        raw["imageinfo"][0]["url"] = ORIGINAL.replace("liquidity", "liquidity%FF")
+        cases.append((raw, "unrecognized_commons_identity"))
+        raw = page()
+        raw["imageinfo"][0]["descriptionshorturl"] = "https://commons.wikimedia.org/?curid=456"
+        cases.append((raw, "commons_identity_conflict"))
+        for raw, reason in cases:
+            with self.subTest(reason=reason):
+                provider = WikimediaProvider(enabled=False)
+                self.assertIsNone(provider.normalize_candidate(raw, "bitcoin", 0))
+                self.assertEqual(provider.last_search_rejections, {reason: 1})
+
+    def test_provider_summary_exposes_specific_url_rejection(self) -> None:
+        raw = page()
+        raw["imageinfo"][0]["url"] = ORIGINAL + "?download=1"
+        provider = WikimediaProvider(client=PayloadClient({"query": {"pages": [raw]}}))
+        with self.assertLogs("image_search.selection", level="INFO") as captured:
+            result = search_images(ARTICLE, providers=[provider], downloader=StaticDownloader(), local_usage=[], recent_wp_usage=[])
+        self.assertIsNone(result.candidate)
+        self.assertIn("invalid_original_url", " ".join(captured.output))
+        self.assertNotIn("required_fields", " ".join(captured.output))
+
+    def test_live_style_tracking_keeps_cross_provider_and_old_history_identity(self) -> None:
+        raw = live_style_jpeg()
+        direct = WikimediaProvider(enabled=False).normalize_candidate(raw, "bitcoin cryptocurrency", 0)
+        assert direct is not None
+        indexed = openverse_candidate(foreign_id="92021811", landing="https://commons.wikimedia.org/?curid=92021811", original=raw["imageinfo"][0]["url"])
+        self.assertEqual(indexed.canonical_source, direct.canonical_source)
+        old_entry = {"provider": "openverse", "canonical_source": "wikimedia:92021811", "credit_url": "http://commons.wikimedia.org/?curid=92021811"}
+        self.assertIs(candidate_recent_local_usage(direct, [old_entry]), old_entry)
+        old_entry = {"provider": "wikimedia", "source_page_url": raw["imageinfo"][0]["descriptionurl"]}
+        self.assertIs(candidate_recent_local_usage(indexed, [old_entry]), old_entry)
+
+    def test_live_style_long_attribution_stays_complete_and_sanitized(self) -> None:
+        raw = live_style_jpeg()
+        notice = "Fixture required notice. " * 100
+        raw["imageinfo"][0]["extmetadata"]["Attribution"] = {"value": notice + "&lt;img onerror=bad&gt;<script>bad()</script>"}
+        item = WikimediaProvider(enabled=False).normalize_candidate(raw, "bitcoin", 0)
+        assert item is not None
+        self.assertGreater(len(item.attribution_text), 1000)
+        self.assertIn(notice.strip(), html.unescape(item.attribution_text))
+        self.assertNotIn("<img", item.attribution_text)
+        self.assertNotIn("bad()", item.attribution_text)
+
+    def test_live_style_wikimedia_selection_after_empty_providers_prevents_grok(self) -> None:
+        import publishing.wordpress.publisher as publisher
+        article = {"seo_focus": "bitcoin cryptocurrency", "title": "Bitcoin cryptocurrency markets", "category": "Markets", "hashtags": "bitcoin,crypto"}
+        provider = WikimediaProvider(client=PayloadClient({"query": {"pages": [live_style_jpeg()]}}))
+        results = []
+
+        def select(context, **kwargs):
+            result = search_images(context, providers=[StaticProvider("pexels", []), StaticProvider("pixabay", []), StaticProvider("openverse", []), provider],
+                                   downloader=StaticDownloader(), local_usage=[], recent_wp_usage=[], **kwargs)
+            results.append(result)
+            return result
+
+        with (
+            patch.object(publisher, "IMAGE_SOURCE_MODE", "hybrid"), patch.object(publisher, "IMAGE_SOURCE_PRIORITY", "stock_first"),
+            patch.object(publisher, "IMAGE_SEARCH_ENGINE", "v2"), patch.object(publisher, "search_images", side_effect=select),
+            patch.object(publisher, "_cover_bytes_to_1536x1024", return_value=(b"prepared", {"width": 1536, "height": 1024})),
+            patch.object(publisher, "upload_media", return_value=42), patch.object(publisher, "set_media_details", return_value=True),
+            patch.object(publisher, "_generated_image_content") as generate,
+        ):
+            media_id, meta = publisher.upload_image(None, article["title"], "bitcoin", article=article)
+        self.assertEqual(media_id, 42)
+        self.assertEqual(meta["provider"], "wikimedia")
+        self.assertEqual(results[0].candidate.provider, "wikimedia")
+        self.assertGreater(provider.last_search_stats["normalized"], 0)
+        generate.assert_not_called()
 
 
 class WikimediaRetryTests(unittest.TestCase):

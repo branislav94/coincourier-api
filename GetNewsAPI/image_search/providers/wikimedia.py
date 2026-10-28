@@ -5,7 +5,7 @@ from html.parser import HTMLParser
 import math
 import re
 from typing import Any
-from urllib.parse import quote, urlsplit
+from urllib.parse import parse_qsl, quote, urlsplit
 
 from config import IMAGE_SEARCH_RESULTS_PER_QUERY, WIKIMEDIA_ENABLED, WIKIMEDIA_MIN_SCORE, WIKIMEDIA_PER_PAGE
 
@@ -23,6 +23,7 @@ EXTMETADATA_FIELDS = (
     "Copyrighted|NonFree|ObjectName|ImageDescription|Restrictions|DeletionReason"
 )
 SUPPORTED_MIMES = frozenset({"image/jpeg", "image/png", "image/webp"})
+ORIGINAL_TRACKING_PARAMETERS = frozenset({"utm_source", "utm_campaign", "utm_content"})
 _VERSIONS = r"(?:1\.0|2\.0|2\.5|3\.0|4\.0)"
 _CC_BY_LABEL = re.compile(rf"(?:CC BY|Creative Commons Attribution) ({_VERSIONS})(?: International)?", re.I)
 _URL_SUFFIX = r"(?:/(?:deed(?:\.[A-Za-z-]+)?|legalcode(?:\.[A-Za-z-]+)?))?/?"
@@ -89,6 +90,24 @@ def _positive_int(value: object) -> int | None:
         return None
     result = int(str(value))
     return result if result > 0 else None
+
+
+def _valid_original_url(value: str) -> bool:
+    """Accept original Commons files and only the API's observed tracking keys."""
+    try:
+        parts = urlsplit(value)
+        if re.search(r"%(?![0-9A-Fa-f]{2})", parts.query):
+            return False
+        query = parse_qsl(parts.query, keep_blank_values=True, strict_parsing=True, errors="strict")
+        return bool(
+            parts.scheme in {"http", "https"} and parts.hostname == "upload.wikimedia.org"
+            and not parts.username and not parts.password and parts.port in {None, 80, 443}
+            and re.fullmatch(r"/wikipedia/commons/[0-9a-f]/[0-9a-f]{2}/[^/]+", parts.path)
+            and all(key in ORIGINAL_TRACKING_PARAMETERS for key, _ in query)
+            and not parts.fragment
+        )
+    except (ValueError, UnicodeDecodeError):
+        return False
 
 
 def _license_label(value: str) -> tuple[str, str] | None:
@@ -226,14 +245,24 @@ class WikimediaProvider(ImageSearchProvider):
         pageid = _positive_int(raw.get("pageid"))
         title = str(raw.get("title") or "")
         infos = raw.get("imageinfo")
-        if not pageid or raw.get("ns") != 6 or not title.startswith("File:") or not isinstance(infos, list) or not infos or not isinstance(infos[0], dict):
-            self._rejected("required_fields")
+        if not pageid:
+            self._rejected("missing_page_id")
+            return None
+        if raw.get("ns") != 6:
+            self._rejected("invalid_namespace")
+            return None
+        if not title.startswith("File:"):
+            self._rejected("invalid_file_title")
+            return None
+        if not isinstance(infos, list) or not infos or not isinstance(infos[0], dict):
+            self._rejected("missing_imageinfo")
             return None
         info = infos[0]
+        canonical_title = ""
         if info.get("canonicaltitle"):
-            title = str(info["canonicaltitle"])
-            if not title.startswith("File:"):
-                self._rejected("required_fields")
+            canonical_title = str(info["canonicaltitle"])
+            if not canonical_title.startswith("File:"):
+                self._rejected("invalid_canonical_title")
                 return None
         mime = str(info.get("mime") or "").lower()
         if mime not in SUPPORTED_MIMES:
@@ -244,18 +273,11 @@ class WikimediaProvider(ImageSearchProvider):
             self._rejected("invalid_size")
             return None
         image_url = str(info.get("url") or "")
-        try:
-            image_parts = urlsplit(image_url)
-            original_url_valid = (
-                image_parts.scheme in {"http", "https"} and image_parts.hostname == "upload.wikimedia.org"
-                and not image_parts.username and not image_parts.password and image_parts.port in {None, 80, 443}
-                and bool(re.fullmatch(r"/wikipedia/commons/[0-9a-f]/[0-9a-f]{2}/[^/]+", image_parts.path))
-                and not image_parts.query and not image_parts.fragment
-            )
-        except ValueError:
-            original_url_valid = False
-        if not original_url_valid or not commons_identities(image_url):
-            self._rejected("required_fields")
+        if not _valid_original_url(image_url):
+            self._rejected("invalid_original_url")
+            return None
+        if not commons_identities(image_url):
+            self._rejected("unrecognized_commons_identity")
             return None
         metadata = info.get("extmetadata")
         if not isinstance(metadata, dict):
@@ -298,10 +320,11 @@ class WikimediaProvider(ImageSearchProvider):
             self._rejected("dimensions_rejected")
             return None
         identity_values = (
-            f"wikimedia:{pageid}", title, source_page, str(info.get("descriptionshorturl") or ""), image_url,
+            f"wikimedia:{pageid}", title, canonical_title, source_page,
+            str(info.get("descriptionshorturl") or ""), image_url,
         )
         if commons_identity_conflict(*identity_values, source="wikimedia", foreign_identifier=pageid):
-            self._rejected("required_fields")
+            self._rejected("commons_identity_conflict")
             return None
         canonical, aliases = normalize_commons_identity(*identity_values, source="wikimedia", foreign_identifier=pageid)
         label = {"cc-by": "CC BY", "cc0": "CC0", "pdm": "PDM"}[license_name]

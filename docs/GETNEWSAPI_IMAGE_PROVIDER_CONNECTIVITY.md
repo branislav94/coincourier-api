@@ -107,3 +107,79 @@ route/IP information through the normal infrastructure review process.
 
 No DEV environment or production configuration is changed by this document.
 Stop after the requested local verification; deployment remains with DevOps.
+
+## Wikimedia public metadata verification (2026-10-28)
+
+Separate, public read-only Commons probes used the existing MediaWiki contract:
+File-namespace search, ten results, imageinfo URL/size/MIME/canonicaltitle and the
+current filtered extmetadata, with `maxlag=5`. TLS verification remained enabled.
+No complete live payload, creator HTML or image bytes were saved in the repository.
+These probes ran from the checkout environment, not from the DEV container.
+
+The proven false-negative was the original-URL predicate
+`not image_parts.query`. Real raster originals carry the three tracking keys
+`utm_source`, `utm_campaign`, and `utm_content`. All other original URL predicates
+passed on the sampled images. The fix permits only these observed keys on the
+same validated `upload.wikimedia.org/wikipedia/commons/...` original path;
+unknown query keys, transformations, malformed queries and fragments still fail.
+The API-provided original URL is preserved.
+
+| Exact query | Raw | Normalized before | Normalized after | Remaining rejections |
+|---|---:|---:|---:|---|
+| bitcoin cryptocurrency | 10 | 0 | 4 | 6 license rejections |
+| bitcoin inflation | 7 | 0 | 1 | 6 unsupported formats |
+| bitcoin dominance | 3 | 0 | 0 | 2 unsupported formats, 1 BY-SA license rejection |
+
+Sanitized observed structures, with no attribution HTML:
+
+| Field | Accepted JPEG | Rejected PNG |
+|---|---|---|
+| pageid / namespace | 92021811 / 6 | 103634264 / 6 |
+| page title and canonicaltitle | `File:Bitcoin and cryptocurrency (38688311185).jpg` | `File:Bitcoin dominans grafigi.png` |
+| imageinfo present | true | true |
+| MIME | image/jpeg | image/png |
+| width / height | 2000 / 1300 | 1400 / 825 |
+| byte size | 3886027 | 61927 |
+| original hostname | upload.wikimedia.org | upload.wikimedia.org |
+| description hostname | commons.wikimedia.org | commons.wikimedia.org |
+| numeric identity | wikimedia:92021811 | wikimedia:103634264 |
+| file alias | `wikimedia:file:Bitcoin and cryptocurrency (38688311185).jpg` | `wikimedia:file:Bitcoin dominans grafigi.png` |
+| identity conflict | false | false |
+| before | required_fields: nonempty original query | required_fields: nonempty original query |
+| after | normalized, CC BY 2.0 | license_rejected, CC BY-SA 4.0 |
+
+Both samples contained Artist, AttributionRequired, Copyrighted, Credit,
+ImageDescription, LicenseShortName, LicenseUrl, ObjectName, Restrictions and
+UsageTerms in the filtered metadata. Their three URL query keys were the tracking
+keys above. The JPEG's recognized license path was `/licenses/by/2.0/`; the PNG's
+`/licenses/by-sa/4.0/` remains unsupported.
+
+A WebP was also observed: page 156272632, `File:Bitcoin Price.webp`, 4827x1644,
+105024 bytes, the same original/description hosts and tracking keys, with numeric
+and File-title identities. Its URL now passes, but unchanged licensing checks
+still reject it. Its complete metadata-key list and precise licensing predicate
+were not retained, so no more specific licensing conclusion is asserted. The
+inflation JPEG normalizes but remains 869x947 and fails unchanged downstream
+dimensions/orientation safeguards.
+
+No sampled result had conflicting numeric/File identities. The proposed broad
+identity-conflict relaxation was therefore unnecessary and was not implemented.
+The page's valid File title is retained, with a valid equivalent canonical title
+added as an alias; the shared identity helper is unchanged. Contradictory numeric
+IDs, unrelated hosts and genuinely conflicting titles still fail. Filenames are
+not lowercased, and conservative percent/underscore handling is preserved.
+
+Normalizer summaries now distinguish missing_page_id, invalid_namespace,
+invalid_file_title, missing_imageinfo, invalid_canonical_title,
+invalid_original_url, unrecognized_commons_identity and commons_identity_conflict,
+alongside existing licensing/format/size/dimension rejections. No raw payloads
+are logged. Strict licenses, formats, thresholds and attribution safeguards are
+unchanged.
+
+Sanitized structure-based offline fixtures also verify Wikimedia selection after
+earlier providers return no usable result, including zero generated-provider
+calls. This proves selection integration in tests, not a live image download or
+WordPress publication. Next DEV verification needs this code update and process
+restart, with the existing V2 provider list and all policies unchanged; no new
+Wikimedia environment setting is required. Capture the correlated provider and
+publication outcomes before claiming DEV provider acceptance.
