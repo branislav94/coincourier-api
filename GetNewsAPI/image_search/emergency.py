@@ -26,6 +26,7 @@ from .reuse import (
     downloaded_recent_local_usage,
 )
 from .scoring import rank_candidates
+from .context import context_rejection_reason, image_article_context
 
 
 logger = logging.getLogger(__name__)
@@ -38,6 +39,7 @@ VALIDATION_REASONS = frozenset({
     "attribution_too_large", "metadata_update_failed", "media_metadata_failed",
     "media_upload_failed", "license_rejected", "required_fields", "invalid_original_url",
     "unsupported_format", "invalid_size", "dimensions_rejected", "orientation_rejected",
+    "context_mismatch",
 })
 # Same existing fail-closed publication bound; no attribution is truncated.
 MAX_REQUIRED_ATTRIBUTION_CHARS = 16_384
@@ -83,7 +85,10 @@ def _public_http_url(value: str) -> bool:
         return False
 
 
-def _hard_safety_reason(candidate: ImageCandidate, policy: ImageLicensePolicy) -> str:
+def _hard_safety_reason(candidate: ImageCandidate, policy: ImageLicensePolicy, article_context: dict | None = None) -> str:
+    context_reason = context_rejection_reason(candidate, article_context or {})
+    if context_reason:
+        return context_reason
     license_valid, _reason = policy.validate(candidate)
     if not license_valid:
         return "license_rejected"
@@ -148,12 +153,14 @@ def create_rescue_context(
     candidates: list[ImageCandidate], *, provider_precedence: tuple[str, ...],
     downloader: ImageDownloader, license_policy: ImageLicensePolicy,
     local_usage: list[dict], recent_wp_usage: list[dict], article_correlation_id: str,
+    article_context: dict | None = None,
 ) -> StockRescueContext:
     """Check every observed candidate independently of its relevance score."""
     context = StockRescueContext(
         provider_precedence=provider_precedence, downloader=downloader,
         license_policy=license_policy, article_correlation_id=article_correlation_id,
         local_usage=list(local_usage),
+        article_context=image_article_context(article_context or {}),
     )
     parents = list(range(len(candidates)))
 
@@ -179,7 +186,7 @@ def create_rescue_context(
             group_reuse[root] = "wordpress_history_reuse"
     for index, candidate in enumerate(candidates):
         try:
-            hard_reason = _hard_safety_reason(candidate, license_policy)
+            hard_reason = _hard_safety_reason(candidate, license_policy, context.article_context)
         except Exception:
             hard_reason = "required_fields"
         if hard_reason:
@@ -343,7 +350,7 @@ def rescue_images(
         candidate = entry.candidate
         key = transport_key(candidate)
         try:
-            reason = _hard_safety_reason(candidate, context.license_policy)
+            reason = _hard_safety_reason(candidate, context.license_policy, context.article_context)
         except Exception:
             reason = "required_fields"
         if reason:

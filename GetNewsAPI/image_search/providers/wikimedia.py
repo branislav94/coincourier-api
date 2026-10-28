@@ -341,6 +341,9 @@ class WikimediaProvider(ImageSearchProvider):
             metadata={
                 "metadata_text": " ".join((title, fields["ObjectName"][:4000], fields["ImageDescription"][:4000])),
                 "title": title, "credit": credit, "attribution_complete": True,
+                "work_title": _text(_metadata_value(metadata, "ObjectName"), preserve_links=False) or title,
+                "creator_display_name": artist_name,
+                "attribution_notice": custom,
                 "attribution_authoritative": False,
             },
         )

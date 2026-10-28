@@ -46,6 +46,7 @@ from stock_images import StockImageCandidate, find_stock_image
 from image_search import search_images
 from image_search.emergency import rescue_images
 from image_search.models import ImageSearchResult, RescueValidationResult
+from .attribution import build_public_attribution
 from image_search.license_policy import normalize_license_name
 from image_search.reuse import record_image_usage
 from publishing.models import (
@@ -1302,6 +1303,11 @@ def _candidate_stock_content(candidate: Any, downloaded: Any, converted: Any) ->
         "width": dims.get("width"),
         "height": dims.get("height"),
     }
+    if candidate.provider in {"openverse", "wikimedia"}:
+        metadata["work_title"] = candidate.metadata.get("work_title") or candidate.metadata.get("title") or ""
+        for field in ("creator_display_name", "credit", "attribution_notice", "attribution_authoritative", "attribution_complete"):
+            if field in candidate.metadata:
+                metadata[field] = candidate.metadata[field]
     if candidate.metadata.get("emergency_stock_rescue"):
         metadata.update(
             emergency_stock_rescue=True,
@@ -1633,6 +1639,8 @@ def _upload_prepared_image(
 
     required_attribution = image_meta.get("provider") in {"pexels", "pixabay", "openverse", "wikimedia"}
     credit_text = image_meta.get("credit_text") or image_meta.get("attribution_text") or ""
+    public_caption = credit_text
+    attachment_description = credit_text
     if required_attribution:
         try:
             wordpress_media.validate_required_attribution(credit_text)
@@ -1640,6 +1648,10 @@ def _upload_prepared_image(
             if normalize_license_name(image_meta.get("license_name")) == "cc-by":
                 credit_text += "\nChanges: cropped and resized for publication."
             wordpress_media.validate_required_attribution(credit_text)
+            public_caption = attachment_description = credit_text
+            if image_meta.get("provider") in {"openverse", "wikimedia"}:
+                public_caption, attachment_description = build_public_attribution(image_meta, credit_text, modified=True)
+                image_meta["public_attribution_caption"] = public_caption
         except wordpress_media.MediaMetadataError as exc:
             image_meta["featured_image_rejected_reason"] = exc.reason
             logger.warning("[IMG] stock attribution rejected reason=%s", exc.reason)
@@ -1666,8 +1678,8 @@ def _upload_prepared_image(
         metadata_saved = set_media_details(
             media_id,
             article_context.get("seo_focus") or article_context.get("title") or "",
-            caption=credit_text or None,
-            description=credit_text or None,
+            caption=public_caption or None,
+            description=attachment_description or None,
             required_attribution=required_attribution,
         )
         if required_attribution and not metadata_saved:
