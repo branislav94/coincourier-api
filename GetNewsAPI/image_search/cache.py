@@ -45,14 +45,17 @@ class CachedHttpClient:
         self.max_retries = max(0, max_retries)
         self.sleeper = sleeper
 
-    def _cache_path(self, provider: str, query: str, params: dict[str, Any]) -> Path:
+    def _cache_path(self, provider: str, query: str, params: dict[str, Any], url: str = "") -> Path:
         public_params = {
             key: value
             for key, value in sorted(params.items())
             if key.lower() not in SECRET_PARAM_NAMES
         }
+        cache_identity = {"provider": provider, "query": query, "params": public_params}
+        if provider == "openverse":
+            cache_identity["endpoint"] = url
         seed = json.dumps(
-            {"provider": provider, "query": query, "params": public_params},
+            cache_identity,
             sort_keys=True,
             separators=(",", ":"),
         )
@@ -129,12 +132,16 @@ class CachedHttpClient:
         *,
         payload_validator: Callable[[dict[str, Any]], bool] | None = None,
         payload_retry_delay: Callable[[dict[str, Any]], float | None] | None = None,
+        classify_edge_denials: bool = False,
         **kwargs: Any,
     ) -> dict[str, Any]:
         for attempt in range(self.max_retries + 1):
             try:
                 response = self.session.request(method, url, timeout=self.timeout, **kwargs)
                 status = int(response.status_code)
+                diagnostics = self._safe_response_diagnostics(response) if classify_edge_denials else {}
+                if status == 403 and diagnostics.get("content_type") == "text/html":
+                    raise ProviderUnavailable(provider, "edge_access_denied", status_code=status, **diagnostics)
                 if 200 <= status < 300:
                     try:
                         data = response.json()
@@ -156,13 +163,14 @@ class CachedHttpClient:
                 if status not in RETRYABLE_STATUSES:
                     # Search API 401/403 means that provider access is unavailable,
                     # unlike a candidate image URL that may simply forbid hotlinking.
-                    raise ProviderUnavailable(provider, "http_error", status_code=status)
+                    raise ProviderUnavailable(provider, "http_error", status_code=status, **diagnostics)
                 if attempt >= self.max_retries:
                     raise ProviderUnavailable(
                         provider,
                         "http_error",
                         status_code=status,
                         retry_exhausted=True,
+                        **diagnostics,
                     )
                 retry_after = response.headers.get("Retry-After") if response.headers else None
                 try:
@@ -203,18 +211,35 @@ class CachedHttpClient:
         params: dict[str, Any] | None = None,
         payload_validator: Callable[[dict[str, Any]], bool] | None = None,
         payload_retry_delay: Callable[[dict[str, Any]], float | None] | None = None,
+        proxies: dict[str, str] | None = None,
+        classify_edge_denials: bool = False,
+        allow_redirects: bool | None = None,
     ) -> dict[str, Any]:
         params = params or {}
-        path = self._cache_path(provider, query, params)
+        path = self._cache_path(provider, query, params, url)
         cached = self._read_cache(path)
         if cached is not None and self._valid_payload(cached, payload_validator):
             return cached
         data = self._request_json(
             "GET", provider, url, headers=headers, params=params,
             payload_validator=payload_validator, payload_retry_delay=payload_retry_delay,
+            classify_edge_denials=classify_edge_denials,
+            **({"proxies": dict(proxies)} if proxies is not None else {}),
+            **({"allow_redirects": allow_redirects} if allow_redirects is not None else {}),
         )
         self._write_cache(path, data)
         return data
+
+    @staticmethod
+    def _safe_response_diagnostics(response: Any) -> dict[str, Any]:
+        headers = response.headers or {}
+        mime = str(headers.get("Content-Type") or "").partition(";")[0].strip().lower()
+        content_type = mime if mime in {"text/html", "application/json"} else "other"
+        return {
+            "content_type": content_type,
+            "server_cloudflare": str(headers.get("Server") or "").strip().lower() == "cloudflare",
+            "cf_ray_present": bool(headers.get("CF-Ray")),
+        }
 
     @staticmethod
     def _valid_payload(
@@ -235,5 +260,13 @@ class CachedHttpClient:
         url: str,
         *,
         data: dict[str, Any] | None = None,
+        proxies: dict[str, str] | None = None,
+        classify_edge_denials: bool = False,
+        allow_redirects: bool | None = None,
     ) -> dict[str, Any]:
-        return self._request_json("POST", provider, url, data=data or {})
+        return self._request_json(
+            "POST", provider, url, data=data or {},
+            classify_edge_denials=classify_edge_denials,
+            **({"proxies": dict(proxies)} if proxies is not None else {}),
+            **({"allow_redirects": allow_redirects} if allow_redirects is not None else {}),
+        )

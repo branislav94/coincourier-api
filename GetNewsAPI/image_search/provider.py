@@ -8,8 +8,11 @@ from .models import ImageCandidate
 
 
 SAFE_FAILURE_REASONS = {
+    "authentication_failed",
     "connection_failure",
+    "edge_access_denied",
     "http_error",
+    "invalid_configuration",
     "invalid_response",
     "request_error",
     "timeout",
@@ -26,16 +29,28 @@ class ProviderUnavailable(RuntimeError):
         *,
         status_code: int | None = None,
         retry_exhausted: bool = False,
+        content_type: str | None = None,
+        server_cloudflare: bool = False,
+        cf_ray_present: bool = False,
     ) -> None:
         self.provider = re.sub(r"[^a-z0-9_-]", "", (provider or "provider").lower()) or "provider"
         self.reason = reason if reason in SAFE_FAILURE_REASONS else "request_error"
         self.status_code = int(status_code) if status_code is not None else None
         self.retry_exhausted = bool(retry_exhausted)
+        self.content_type = content_type if content_type in {"text/html", "application/json", "other"} else None
+        self.server_cloudflare = bool(server_cloudflare)
+        self.cf_ray_present = bool(cf_ray_present)
         parts = [f"provider={self.provider}", f"reason={self.reason}"]
         if self.status_code is not None:
             parts.append(f"status={self.status_code}")
         if self.retry_exhausted:
             parts.append("retry_exhausted=true")
+        if self.content_type is not None:
+            parts.extend((
+                f"content_type={self.content_type}",
+                f"server_cloudflare={str(self.server_cloudflare).lower()}",
+                f"cf_ray_present={str(self.cf_ray_present).lower()}",
+            ))
         super().__init__(" ".join(parts))
 
 
