@@ -226,6 +226,7 @@ class SemanticShadowMappingTests(unittest.TestCase):
             self.assertEqual(result.status, SemanticAssessmentStatus.DISABLED)
             self.assertEqual(result.reason, reason)
             self.assertFalse(result.persisted)
+            self.assertEqual(result.candidates, ())
             repository.assert_not_called()
             assessment_repository.assert_not_called()
 
@@ -236,6 +237,7 @@ class SemanticShadowMappingTests(unittest.TestCase):
         self.assertEqual(result.status, SemanticAssessmentStatus.NOT_READY)
         self.assertEqual(result.reason, "source_document_not_found")
         self.assertIsNone(writer.calls[0].query_document_id)
+        self.assertEqual(result.candidates, ())
 
     def test_query_not_ready_maps_to_persisted_not_ready(self):
         result, writer = self.run_stubbed(
@@ -243,6 +245,7 @@ class SemanticShadowMappingTests(unittest.TestCase):
         )
         self.assertEqual(result.status, SemanticAssessmentStatus.NOT_READY)
         self.assertEqual(writer.calls[0].query_document_id, 10)
+        self.assertEqual(result.candidates, ())
 
     def test_no_candidates_maps_to_persisted_no_candidates(self):
         result, writer = self.run_stubbed(
@@ -250,6 +253,7 @@ class SemanticShadowMappingTests(unittest.TestCase):
         )
         self.assertEqual(result.status, SemanticAssessmentStatus.NO_CANDIDATES)
         self.assertEqual(writer.calls[0].evidence, ())
+        self.assertEqual(result.candidates, ())
 
     def test_retrieved_maps_to_bounded_candidate_evidence(self):
         result, writer = self.run_stubbed(
@@ -268,6 +272,46 @@ class SemanticShadowMappingTests(unittest.TestCase):
         self.assertEqual(evidence["source_type"], "source_article")
         self.assertNotIn("chunk_text", evidence)
         self.assertNotIn("embedding", evidence)
+        self.assertEqual(result.candidates, (candidate(),))
+
+    def test_valid_candidates_remain_available_when_audit_persistence_fails(self):
+        selected = candidate(distance=0.99)
+        writer = MemoryAssessmentWriter()
+        writer.error = RuntimeError("database credentials must not be logged")
+        with self.assertLogs(shadow.logger, level="ERROR") as captured:
+            result, _writer = self.run_stubbed(
+                StubRetriever(retrieval_result(SemanticRetrievalStatus.RETRIEVED, candidates=(selected,))),
+                writer=writer,
+            )
+        self.assertEqual(result.status, SemanticAssessmentStatus.ERROR)
+        self.assertEqual(result.reason, "persistence_failed")
+        self.assertFalse(result.persisted)
+        self.assertEqual(result.candidate_count, 1)
+        self.assertEqual(result.candidates, (selected,))
+        self.assertIs(result.candidates[0], selected)
+        self.assertEqual(result.candidates[0].candidate_source_article_id, 201)
+        self.assertEqual(result.candidates[0].native_distance, 0.99)
+        self.assertIn("decision=continue", " ".join(captured.output))
+        self.assertNotIn("credentials", " ".join(captured.output))
+
+    def test_candidate_exposure_retains_rank_without_distance_policy(self):
+        selected = (candidate(201, distance=0.001), candidate(202, document_id=2020, distance=0.999))
+        with self.assertLogs(shadow.logger, level="INFO") as captured:
+            result, _writer = self.run_stubbed(
+                StubRetriever(retrieval_result(SemanticRetrievalStatus.RETRIEVED, candidates=selected))
+            )
+        self.assertEqual(result.candidates, selected)
+        self.assertEqual([item.native_distance for item in result.candidates], [0.001, 0.999])
+        self.assertIn("decision=continue", " ".join(captured.output))
+
+    def test_unbounded_candidate_response_is_not_exposed(self):
+        selected = tuple(candidate(item, document_id=item * 10) for item in range(201, 212))
+        result, writer = self.run_stubbed(
+            StubRetriever(retrieval_result(SemanticRetrievalStatus.RETRIEVED, candidates=selected))
+        )
+        self.assertEqual(result.status, SemanticAssessmentStatus.ERROR)
+        self.assertEqual(result.candidates, ())
+        self.assertEqual(writer.calls[-1].evidence, ())
 
     def test_retrieval_exception_persists_error_and_returns_fail_open(self):
         result, writer = self.run_stubbed(
@@ -279,6 +323,7 @@ class SemanticShadowMappingTests(unittest.TestCase):
         self.assertEqual(error.error_type, "RuntimeError")
         self.assertEqual(error.safe_error, "RuntimeError: retrieval failed")
         self.assertNotIn("contents", error.safe_error)
+        self.assertEqual(result.candidates, ())
 
     def test_persistence_exception_returns_error_without_escaping(self):
         writer = MemoryAssessmentWriter()
@@ -310,6 +355,7 @@ class SemanticShadowMappingTests(unittest.TestCase):
                 )
                 self.assertEqual(result.status, SemanticAssessmentStatus.ERROR)
                 self.assertEqual(writer.calls[-1].status, SemanticAssessmentStatus.ERROR)
+                self.assertEqual(result.candidates, ())
 
     def test_same_identity_reconciles_to_one_assessment(self):
         writer = MemoryAssessmentWriter()
@@ -505,6 +551,7 @@ class ExistingVectorReadTests(unittest.TestCase):
                 assessment_repository=writer,
             )
         self.assertEqual(result.status, SemanticAssessmentStatus.RETRIEVED)
+        self.assertEqual([item.candidate_source_article_id for item in result.candidates], [202])
         self.assertEqual(
             writer.calls[0].evidence[0]["candidate_source_article_id"],
             202,

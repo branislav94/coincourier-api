@@ -14,6 +14,7 @@ from config import (
     GROK_TEXT_MODEL,
     LLM_FALLBACK_PROVIDER,
     DUPLICATE_SHADOW_ENABLED,
+    DUPLICATE_ENFORCEMENT_MODE,
     SEMANTIC_SHADOW_ENABLED,
     VECTOR_ENABLED,
     OPENAI_API_KEY,
@@ -27,6 +28,7 @@ from config import (
     get_grok_reasoning_effort,
 )
 from duplicate_detection.shadow import analyze_duplicates_in_shadow
+from duplicate_detection.enforcement import DUPLICATE_COUNTER_NAMES, assess_duplicate_enforcement
 from semantic_retrieval.shadow import run_semantic_shadow
 from repositories.raw_news import RawNewsRepository
 from repositories.state import claim_prefix, safe_error_message
@@ -40,6 +42,7 @@ from urllib.parse import urlsplit
 from runtime.logging_config import configure_logging
 from functools import lru_cache
 from threading import Lock
+from dataclasses import dataclass
 import config as _quality_config
 from article_quality_capture import (
     CaptureRecorder, configure_capture, ENABLE_ENV, DIRECTORY_ENV, AUTHORIZATION_ENV,
@@ -2205,7 +2208,7 @@ def _run_duplicate_shadow_fail_open(raw: dict) -> None:
         )
 
 
-def _run_semantic_shadow_fail_open(raw: dict) -> None:
+def _run_semantic_shadow_fail_open(raw: dict) -> Any:
     article_id = raw.get("id")
     if not VECTOR_ENABLED:
         logging.info(
@@ -2222,7 +2225,7 @@ def _run_semantic_shadow_fail_open(raw: dict) -> None:
         )
         return
     try:
-        run_semantic_shadow(
+        return run_semantic_shadow(
             int(article_id),
             vector_enabled=True,
             semantic_enabled=True,
@@ -2236,13 +2239,77 @@ def _run_semantic_shadow_fail_open(raw: dict) -> None:
             type(error).__name__,
         )
 
+
+@dataclass(frozen=True)
+class ProcessingDuplicate:
+    """A handled duplicate, distinct from successful rewrite or retryable failure."""
+
+    decision: Any
+
+
+class DuplicateDispositionError(RuntimeError):
+    """A controlled ownership/persistence failure, never a duplicate rejection."""
+
+
+def _duplicate_enforcement_fail_open(raw: dict, *, semantic_candidates=(), duplicate_counters=None) -> Any:
+    try:
+        decision = assess_duplicate_enforcement(
+            raw, stage="raw", mode=DUPLICATE_ENFORCEMENT_MODE,
+            semantic_candidates=semantic_candidates,
+        )
+        if duplicate_counters is not None:
+            duplicate_counters.clear()
+            supplied = getattr(decision, "counters", {})
+            duplicate_counters.update({
+                name: count for name in DUPLICATE_COUNTER_NAMES
+                if isinstance((count := supplied.get(name)), int) and not isinstance(count, bool) and count >= 0
+            })
+        return decision
+    except Exception as error:
+        logging.warning(
+            "[DUPLICATE-ENFORCE] article_id=%s stage=raw mode=%s "
+            "decision=continue reason=assessment_unavailable error_type=%s",
+            raw.get("id"), DUPLICATE_ENFORCEMENT_MODE, type(error).__name__,
+        )
+        return None
+
+
+def _persist_processing_duplicate(raw: dict, decision: Any, *, repository=None, token: str | None = None) -> None:
+    try:
+        applied = (repository or RawNewsRepository()).reject_duplicate(
+            int(raw["id"]), token=token, decision=decision,
+        )
+    except Exception as error:
+        logging.error(
+            "[DUPLICATE-ENFORCE] article_id=%s stage=raw "
+            "decision=disposition_failed error_type=%s",
+            raw.get("id"), type(error).__name__,
+        )
+        raise DuplicateDispositionError("duplicate disposition unavailable") from None
+    if not applied:
+        raise DuplicateDispositionError("duplicate disposition ownership was lost")
+    logging.info(
+        "[DUPLICATE-ENFORCE] article_id=%s candidate_id=%s canonical_wp_id=%s "
+        "stage=raw mode=enforce decision=reject_duplicate processing_status=duplicate",
+        raw.get("id"), getattr(decision, "canonical_raw_id", None), getattr(decision, "canonical_wp_id", None),
+    )
+
+
+def _processing_duplicate(raw: dict, decision: Any, *, mark_complete: bool) -> ProcessingDuplicate | None:
+    if getattr(decision, "reject", False) is not True or getattr(decision, "available", False) is not True:
+        return None
+    if mark_complete:
+        _persist_processing_duplicate(raw, decision)
+    return ProcessingDuplicate(decision)
+
+
 @research_citation_scope()
-def process_one(raw, *, mark_complete=True, on_error=None):
+def process_one(raw, *, mark_complete=True, on_error=None, duplicate_counters=None):
     """
     Process a single raw cryptonewsapi row through the GPT enrichment pipeline.
 
     Steps:
-        - Run optional fail-open deterministic duplicate shadow analysis
+        - Apply configured deterministic duplicate policy before paid enrichment
         - Run optional fail-open semantic evidence shadow
         - Optionally enrich via search (enrich_with_search)
         - Detect/normalize YouTube video URL (_maybe_video_url)
@@ -2257,12 +2324,39 @@ def process_one(raw, *, mark_complete=True, on_error=None):
         raw: DB row dict from cryptonewsapi (expects at least title/text/news_url/type fields).
 
     Returns:
-        bool:
-            True when the article was stored and marked processed, False otherwise.
+        bool | ProcessingDuplicate:
+            True for stored work, False for failure, or a confirmed duplicate.
     """
     try:
-        _run_duplicate_shadow_fail_open(raw)
-        _run_semantic_shadow_fail_open(raw)
+        if DUPLICATE_ENFORCEMENT_MODE == "enforce":
+            duplicate = _processing_duplicate(
+                raw, _duplicate_enforcement_fail_open(raw, duplicate_counters=duplicate_counters),
+                mark_complete=mark_complete,
+            )
+            if duplicate is not None:
+                return duplicate
+        elif DUPLICATE_ENFORCEMENT_MODE != "off":
+            _run_duplicate_shadow_fail_open(raw)
+        semantic = _run_semantic_shadow_fail_open(raw)
+        if DUPLICATE_ENFORCEMENT_MODE == "enforce":
+            candidates = getattr(semantic, "candidates", ())
+            if isinstance(candidates, tuple) and candidates:
+                duplicate = _processing_duplicate(
+                    raw, _duplicate_enforcement_fail_open(
+                        raw, semantic_candidates=candidates, duplicate_counters=duplicate_counters,
+                    ),
+                    mark_complete=mark_complete,
+                )
+                if duplicate is not None:
+                    return duplicate
+            if duplicate_counters is not None and VECTOR_ENABLED and SEMANTIC_SHADOW_ENABLED:
+                status = getattr(getattr(semantic, "status", None), "value", getattr(semantic, "status", None))
+                retrieval_status = getattr(semantic, "retrieval_status", None)
+                retrieval_status = getattr(retrieval_status, "value", retrieval_status)
+                if semantic is None or status == "not_ready" or (
+                    status == "error" and retrieval_status not in {"retrieved", "no_candidates", "disabled"}
+                ):
+                    duplicate_counters["fail_open_unavailable_embeddings"] = 1
         extra = enrich_with_search(raw)
         video_url = _maybe_video_url(raw)
         draft, text_provider = classify_and_rewrite(raw, extra, video_url)
@@ -2381,14 +2475,28 @@ def process_news_with_gpt(batch_size: int | None = None):
     attempted = len(articles)
     succeeded = 0
     failed = 0
+    duplicates_rejected = 0
 
+    enforcement_counts = dict.fromkeys(DUPLICATE_COUNTER_NAMES, 0)
     for art in articles:
-        if process_one(art):
+        article_counts: dict[str, int] = {}
+        if DUPLICATE_ENFORCEMENT_MODE == "enforce":
+            outcome = process_one(art, duplicate_counters=article_counts)
+            for name, count in article_counts.items():
+                enforcement_counts[name] = enforcement_counts.get(name, 0) + count
+        else:
+            outcome = process_one(art)
+        if isinstance(outcome, ProcessingDuplicate):
+            duplicates_rejected += 1
+        elif outcome:
             succeeded += 1
         else:
             failed += 1
 
     result = {"attempted": attempted, "succeeded": succeeded, "failed": failed}
+    if DUPLICATE_ENFORCEMENT_MODE == "enforce":
+        result["duplicates_rejected"] = duplicates_rejected
+        result.update(enforcement_counts)
     if failed:
         logging.warning("GPT processing completed with failures: %s", result)
     else:
@@ -2404,6 +2512,9 @@ def _process_news_with_durable_claims(
     """Run claimed work after the claim transaction has been committed."""
     repository = RawNewsRepository()
     result = {"attempted": 0, "succeeded": 0, "failed": 0}
+    if DUPLICATE_ENFORCEMENT_MODE == "enforce":
+        result["duplicates_rejected"] = 0
+        result.update(dict.fromkeys(DUPLICATE_COUNTER_NAMES, 0))
     attempted_raw_ids: set[int] = set()
 
     for _ in range(max(0, batch_size)):
@@ -2428,12 +2539,22 @@ def _process_news_with_durable_claims(
             "reclaimed-expired" if claim.recovered else "claimed",
         )
         captured_error: list[Exception] = []
+        article_counts: dict[str, int] = {}
         try:
             succeeded = process_one(
                 claim.article,
                 mark_complete=False,
                 on_error=captured_error.append,
+                **({"duplicate_counters": article_counts} if DUPLICATE_ENFORCEMENT_MODE == "enforce" else {}),
             )
+            for name, count in article_counts.items():
+                result[name] = result.get(name, 0) + count
+            if isinstance(succeeded, ProcessingDuplicate):
+                _persist_processing_duplicate(
+                    claim.article, succeeded.decision, repository=repository, token=claim.token,
+                )
+                result["duplicates_rejected"] = result.get("duplicates_rejected", 0) + 1
+                continue
             if succeeded:
                 if not repository.complete(raw_id, claim.token):
                     raise RuntimeError("processing claim ownership was lost before completion")

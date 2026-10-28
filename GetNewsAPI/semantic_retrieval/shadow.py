@@ -64,6 +64,7 @@ class SemanticShadowRunResult:
     persisted: bool = False
     assessment_id: int | None = None
     error_type: str | None = None
+    candidates: tuple[SemanticCandidate, ...] = ()
 
 
 def _configured_defaults() -> tuple[bool, bool, str]:
@@ -253,6 +254,7 @@ def run_semantic_shadow(
     tracking_repository = _TrackingRepository(repository)
     writer = assessment_repository or SemanticAssessmentRepository()
     retrieval: SemanticRetrievalResult | None = None
+    validated_candidates: tuple[SemanticCandidate, ...] = ()
     query_document_id: int | None = None
     try:
         if settings is None:
@@ -280,6 +282,9 @@ def run_semantic_shadow(
             retrieval,
             semantic_version=semantic_version,
         )
+        # These are candidate-finder results only. Callers must reload source
+        # records and confirm the deterministic policy before making decisions.
+        validated_candidates = tuple(retrieval.candidates)
     except Exception as error:
         if settings is None:
             error_type, _ = _safe_error(error, "configuration")
@@ -328,6 +333,7 @@ def run_semantic_shadow(
             candidate_count=len(draft.evidence),
             best_native_distance=draft.best_native_distance,
             error_type=error_type,
+            candidates=validated_candidates,
         )
         logger.error(
             "[SEMANTIC-SHADOW] semantic_shadow_error=true article_id=%s "
@@ -350,6 +356,7 @@ def run_semantic_shadow(
         persisted=True,
         assessment_id=assessment_id,
         error_type=(type(retrieval_error).__name__ if retrieval_error else None),
+        candidates=validated_candidates,
     )
     _log_result(result)
     return result

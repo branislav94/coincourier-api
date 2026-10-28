@@ -265,9 +265,12 @@ PROCESS_CLAIM_TIMEOUT_MINUTES = int(os.getenv("PROCESS_CLAIM_TIMEOUT_MINUTES", "
 PUBLISH_DURABLE_STATE_ENABLED = _env_bool("PUBLISH_DURABLE_STATE_ENABLED", False)
 PUBLISH_CLAIM_TIMEOUT_MINUTES = int(os.getenv("PUBLISH_CLAIM_TIMEOUT_MINUTES", "30"))
 
-# Deterministic duplicate analysis is observational only. Apply the Phase 5
-# manual migration before enabling its assessment reads and writes.
+# Apply the existing Phase 2/5 schema before enabling assessment persistence.
+# Shadow remains the rollout/rollback default; enforcement is explicit.
 DUPLICATE_SHADOW_ENABLED = _env_bool("DUPLICATE_SHADOW_ENABLED", False)
+DUPLICATE_ENFORCEMENT_MODE = os.getenv("DUPLICATE_ENFORCEMENT_MODE", "shadow").strip().lower()
+if DUPLICATE_ENFORCEMENT_MODE not in {"off", "shadow", "enforce"}:
+    raise ValueError("DUPLICATE_ENFORCEMENT_MODE must be off, shadow or enforce")
 DUPLICATE_LOOKBACK_HOURS = int(os.getenv("DUPLICATE_LOOKBACK_HOURS", "72"))
 DUPLICATE_POLICY_VERSION = os.getenv("DUPLICATE_POLICY_VERSION", "v1").strip() or "v1"
 
