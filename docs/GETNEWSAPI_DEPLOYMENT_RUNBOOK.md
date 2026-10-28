@@ -99,7 +99,10 @@ budget, and a selected alternate retains its own source, license and attribution
 Provider failures and untried candidates remaining after the global
 download-attempt budget prevent confirmed exhaustion and continue to block
 normal generation. After strict stock fails, the separate emergency phase uses
-only observed hard-safe score/reuse candidates within its own budget. If that
+only observed hard-safe candidates within its own budget: fresh deliveries
+meeting their thresholds but not attempted by strict search are Tier 0, ahead of score/reuse tiers
+1–4. Exact strict attempts are tracked explicitly; failed URLs remain excluded.
+If that
 phase completes without featured media, `IMAGE_REQUIRE_FEATURED_IMAGE=true`
 permits final Grok then OpenAI rescue, including after provider failures.
 Required-credit persistence failure rejects that delivery and advances to other

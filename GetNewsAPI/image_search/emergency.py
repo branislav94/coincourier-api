@@ -247,6 +247,8 @@ def reject_rescue_candidate(result: ImageSearchResult, candidate: ImageCandidate
 
 def _tier(entry: StockRescueCandidate) -> int:
     reasons = set(entry.soft_reasons)
+    if not reasons:
+        return 0
     if reasons & {"local_history_sha_reuse", "local_history_dhash_reuse"}:
         return 4
     recent = bool(reasons & {"local_history_identity_reuse", "wordpress_history_reuse"})
@@ -283,7 +285,12 @@ def _ranked_pool(context: StockRescueContext) -> list[StockRescueCandidate]:
     provider_order = {provider: index for index, provider in enumerate(context.provider_precedence)}
     eligible = [
         entry for entry in context.entries
-        if entry.soft_reasons and not entry.hard_reason
+        if not entry.hard_reason and (
+            entry.soft_reasons or (
+                entry.candidate.final_score >= entry.candidate.provider_threshold
+                and transport_key(entry.candidate) not in context.strict_attempted_transports
+            )
+        )
         and not any(key[1] == entry.candidate.usable_url for key in context.failed_transports)
         and transport_key(entry.candidate) not in context.processed_transports
     ]
@@ -309,7 +316,7 @@ def rescue_images(
     limit: int = IMAGE_EMERGENCY_STOCK_RESCUE_LIMIT,
     enabled: bool = IMAGE_EMERGENCY_STOCK_RESCUE_ENABLED,
 ) -> ImageSearchResult:
-    """Resume the observed safe soft pool without another provider search."""
+    """Rescue observed unattempted or soft-rejected stock without a new search."""
     context = strict_result.rescue_context
     if strict_result.candidate is not None:
         return strict_result
@@ -344,7 +351,7 @@ def rescue_images(
             continue
         context.processed_transports.add(key)
         context.candidate_attempts += 1
-        original_reason = ",".join(entry.soft_reasons)
+        original_reason = ",".join(entry.soft_reasons) or "strict_unattempted"
         candidate.metadata.update(
             emergency_stock_rescue=True, emergency_original_rejection_reason=original_reason,
             emergency_rescue_tier=_tier(entry), original_score=candidate.final_score,

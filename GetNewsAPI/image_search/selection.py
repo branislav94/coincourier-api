@@ -316,6 +316,7 @@ def search_images(
             break
         attempts += 1
         provider_stats[candidate.provider]["download_attempted"] += 1
+        rescue_context.strict_attempted_transports.add((candidate.provider, candidate.usable_url))
         try:
             downloaded = image_downloader.download(candidate)
         except ImageDownloadError as exc:

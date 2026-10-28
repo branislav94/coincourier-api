@@ -117,6 +117,7 @@ class StockRescueContext:
     candidates_available: int = 0
     local_usage: list[dict[str, Any]] = field(default_factory=list)
     candidate_groups: dict[int, int] = field(default_factory=dict)
+    strict_attempted_transports: set[tuple[str, str]] = field(default_factory=set)
 
 
 @dataclass

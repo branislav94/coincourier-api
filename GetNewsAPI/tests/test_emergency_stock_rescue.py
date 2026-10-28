@@ -422,12 +422,127 @@ class EmergencyStockRescueTests(unittest.TestCase):
         self.assertEqual(loader.calls, [(selected.provider, selected.usable_url)])
         self.assertNotIn("emergency_stock_rescue", selected.metadata)
 
-    def test_fresh_above_threshold_untried_candidate_is_not_mislabeled_as_rescue(self):
+    def test_strict_budget_zero_rescues_fresh_above_threshold_as_explicit_tier_zero(self):
         item = candidate(score=.99)
-        strict = self.search([StaticProvider("pexels", [item])], budget=0)
+        loader = StaticDownloader()
+        strict = self.search([StaticProvider("pexels", [item])], downloader=loader, budget=0)
+        self.assertIsNone(strict.candidate)
+        self.assertTrue(strict.search_budget_exhausted)
+        self.assertEqual(strict.rescue_context.strict_attempted_transports, set())
+        self.assertEqual(loader.calls, [])
+        result = rescue_images(strict)
+        self.assertIs(result.candidate, item)
+        self.assertEqual(item.metadata["emergency_rescue_tier"], 0)
+        self.assertEqual(item.metadata["emergency_original_rejection_reason"], "strict_unattempted")
+        self.assertEqual(item.metadata["original_rejection"], "strict_unattempted")
+        self.assertEqual(result.emergency_summary["emergency_candidates_available"], 1)
+        self.assertEqual(result.emergency_summary["emergency_download_attempts"], 1)
+        self.assertEqual(strict.rescue_context.strict_attempted_transports, set())
+
+    def test_strict_budget_consumed_before_later_fresh_above_threshold_candidate(self):
+        first, later = candidate(asset_id="first", score=.99), candidate(asset_id="later", score=.95)
+        loader = StaticDownloader({first.usable_url: ImageDownloadError("http_429", provider_unavailable=True)})
+        strict = self.search([StaticProvider("pexels", [first, later])], downloader=loader, budget=1)
+        self.assertEqual(strict.rescue_context.strict_attempted_transports, {(first.provider, first.usable_url)})
+        self.assertTrue(strict.search_budget_exhausted)
+        result = rescue_images(strict)
+        self.assertIs(result.candidate, later)
+        self.assertEqual(later.metadata["emergency_rescue_tier"], 0)
+        self.assertEqual(loader.calls, [(first.provider, first.usable_url), (later.provider, later.usable_url)])
+
+    def test_tier_zero_score_then_configured_provider_precedence(self):
+        for pixabay_score, order, expected in (
+            (.99, ("pexels", "pixabay"), "pixabay"),
+            (.90, ("pexels", "pixabay"), "pexels"),
+            (.90, ("pixabay", "pexels"), "pixabay"),
+        ):
+            with self.subTest(score=pixabay_score, order=order):
+                items = {"pexels": candidate("pexels", "p", score=.90), "pixabay": candidate("pixabay", "x", score=pixabay_score)}
+                strict = self.search([StaticProvider(name, [items[name]]) for name in order], budget=0)
+                rescued = rescue_images(strict)
+                self.assertEqual(rescued.candidate.provider, expected)
+                self.assertEqual(rescued.candidate.metadata["emergency_rescue_tier"], 0)
+
+    def test_tier_zero_ties_are_deterministic_under_reversed_collection_order(self):
+        for reverse in (False, True):
+            with self.subTest(reverse=reverse):
+                items = [candidate(asset_id="a", score=.99), candidate(asset_id="b", score=.99)]
+                strict = self.search([StaticProvider("pexels", list(reversed(items)) if reverse else items)], budget=0)
+                self.assertEqual(rescue_images(strict).candidate.asset_id, "a")
+
+    def test_tiers_zero_through_four_are_validated_in_order(self):
+        zero = candidate(asset_id="zero", score=.80)
+        one = candidate(asset_id="one", score=.69)
+        two = candidate(asset_id="two", score=.95)
+        three = candidate(asset_id="three", score=.68)
+        four = candidate(asset_id="four", score=.99)
+        content = image(b"recent content for final tier")
+        loader = StaticDownloader({four.usable_url: content})
+        strict = self.search([StaticProvider("pexels", [four, three, two, one, zero])], downloader=loader, budget=0,
+                             local=[{"asset_key": two.asset_key}, {"asset_key": three.asset_key}, {"content_sha256": content.content_sha256}])
+        validated = []
+
+        def validate(item, _downloaded):
+            validated.append((item.asset_id, item.metadata["emergency_rescue_tier"]))
+            if item is zero:
+                self.assertEqual(item.metadata["original_rejection"], "strict_unattempted")
+            return item is four
+
+        result = rescue_images(strict, post_download_validator=validate)
+        self.assertIs(result.candidate, four)
+        self.assertEqual(validated, [("zero", 0), ("one", 1), ("two", 2), ("three", 3), ("four", 4)])
+        self.assertEqual(loader.calls.count((four.provider, four.usable_url)), 1)
+
+    def test_explicitly_attempted_strict_candidate_cannot_return_as_tier_zero(self):
+        item = candidate(score=.99)
+        loader = StaticDownloader()
+        strict = self.search([StaticProvider("pexels", [item])], downloader=loader)
+        self.assertIs(strict.candidate, item)
+        self.assertEqual(strict.rescue_context.strict_attempted_transports, {(item.provider, item.usable_url)})
+        # Even if a caller loses the selected result without recording a soft or
+        # hard rejection, explicit attempt evidence prevents reconsideration.
+        strict.candidate, strict.downloaded = None, None
         result = rescue_images(strict)
         self.assertIsNone(result.candidate)
-        self.assertEqual(result.emergency_summary["emergency_candidates_available"], 0)
+        self.assertEqual(loader.calls, [(item.provider, item.usable_url)])
+
+    def test_failed_strict_transport_cannot_return_as_tier_zero(self):
+        item = candidate(score=.99)
+        loader = StaticDownloader({item.usable_url: ImageDownloadError("http_404")})
+        strict = self.search([StaticProvider("pexels", [item])], downloader=loader)
+        self.assertIn((item.provider, item.usable_url), strict.rescue_context.strict_attempted_transports)
+        self.assertIsNone(rescue_images(strict).candidate)
+        self.assertEqual(loader.calls, [(item.provider, item.usable_url)])
+
+    def test_failed_url_cross_provider_is_blocked_but_different_url_same_identity_is_tier_zero(self):
+        from tests.test_wikimedia_provider import candidate as wikimedia_candidate
+        indexed = candidate("openverse", "strict-indexed", score=.99, canonical="wikimedia:123")
+        direct = wikimedia_candidate()
+        direct.final_score = .99
+        indexed.image_url = indexed.download_url = direct.usable_url
+        alternate = candidate("openverse", "alternate", score=.95, canonical="wikimedia:123")
+        loader = StaticDownloader({indexed.usable_url: ImageDownloadError("http_429", provider_unavailable=True)})
+        strict = self.search([StaticProvider("openverse", [indexed, alternate]), StaticProvider("wikimedia", [direct])], downloader=loader, budget=1)
+        self.assertNotIn((direct.provider, direct.usable_url), strict.rescue_context.strict_attempted_transports)
+        self.assertNotIn((alternate.provider, alternate.usable_url), strict.rescue_context.strict_attempted_transports)
+        rescued = rescue_images(strict)
+        self.assertIs(rescued.candidate, alternate)
+        self.assertEqual(alternate.metadata["emergency_rescue_tier"], 0)
+        self.assertEqual(loader.calls, [(indexed.provider, indexed.usable_url), (alternate.provider, alternate.usable_url)])
+
+    def test_hard_invalid_fresh_above_threshold_candidate_never_becomes_tier_zero(self):
+        for field, value in (
+            ("license_name", "unknown"), ("source_page_url", "http://127.0.0.1/"),
+            ("mime_type", "image/svg+xml"), ("width", 100), ("height", 2000),
+            ("attribution_text", ""), ("attribution_text", "a"*(MAX_REQUIRED_ATTRIBUTION_CHARS+1)),
+        ):
+            with self.subTest(field=field, value_length=len(value) if isinstance(value, str) else value):
+                item = candidate(score=.99)
+                setattr(item, field, value)
+                strict = self.search([StaticProvider("pexels", [item])], budget=0)
+                self.assertEqual(strict.rescue_context.entries, [])
+                self.assertEqual(strict.rescue_context.strict_attempted_transports, set())
+                self.assertIsNone(rescue_images(strict).candidate)
 
     def test_disabled_rescue_finishes_without_downloading(self):
         strict = self.search([StaticProvider("pexels", [candidate()])])

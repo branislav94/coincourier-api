@@ -82,7 +82,7 @@ class FeaturedStockRescueTests(unittest.TestCase):
     @contextmanager
     def route(self, providers, *, downloader=None, local_usage=None, metadata_outcomes=None, engine="v2",
               require=False, generation_results=None, rescue_limit=10, rescue_enabled=True,
-              fallback_enabled=True, mode="hybrid", priority="stock_first"):
+              fallback_enabled=True, mode="hybrid", priority="stock_first", strict_limit=None):
         loader = downloader or FixtureDownloader()
         results, events = [], []
 
@@ -91,6 +91,8 @@ class FeaturedStockRescueTests(unittest.TestCase):
             return candidate
 
         def strict(article, **kwargs):
+            if strict_limit is not None:
+                kwargs["global_candidate_limit"] = strict_limit
             result = selection.search_images(article, providers=providers, downloader=loader,
                                              local_usage=local_usage or [], recent_wp_usage=[], **kwargs)
             results.append(result)
@@ -186,6 +188,91 @@ class FeaturedStockRescueTests(unittest.TestCase):
         route.metadata.assert_called_once()
         route.rescue.assert_not_called()
         route.generate.assert_not_called()
+
+    def test_strict_budget_zero_rescues_fresh_above_threshold_and_publishes_featured_media(self) -> None:
+        item = stock("pexels", "301", 0.99)
+        with self.route([FixtureProvider("pexels", [item])], strict_limit=0, require=True,
+                        generation_results={"grok": self.generated("grok"), "openai": self.generated("openai")}) as route:
+            media_id, metadata = self.upload()
+        self.assertEqual(media_id, 701)
+        self.assertIsNone(route.results[0].candidate)
+        self.assertTrue(route.results[0].search_budget_exhausted)
+        self.assertFalse(route.results[0].generation_allowed)
+        self.assertEqual(route.results[0].rescue_context.strict_attempted_transports, set())
+        self.assertEqual(metadata["provider"], "pexels")
+        self.assertTrue(metadata["emergency_stock_rescue"])
+        self.assertEqual(metadata["emergency_rescue_tier"], 0)
+        self.assertEqual(metadata["emergency_original_rejection_reason"], "strict_unattempted")
+        self.assertEqual(metadata["original_score"], 0.99)
+        self.assertEqual(metadata["original_threshold"], 0.72)
+        self.assertNotIn("score_below_threshold", metadata["emergency_original_rejection_reason"])
+        self.assertEqual(route.loader.calls, [(item.provider, item.usable_url)])
+        route.generate.assert_not_called()
+
+        adapter = publisher.WordPressPublisher()
+        response = Mock(status_code=201)
+        response.json.return_value = {"id": 901, "link": "https://news.example.org/tier-zero"}
+        with (
+            patch.object(adapter, "_validate_yoast"), patch.object(adapter, "reconcile", return_value=None),
+            patch.object(adapter, "_write_yoast"), patch.object(publisher, "ensure_category", return_value=1),
+            patch.object(publisher, "ensure_term", return_value=2), patch.object(publisher.session, "post", return_value=response) as post,
+            patch.object(publisher, "record_image_usage") as usage, patch("builtins.print"),
+        ):
+            result = adapter.publish(PublicationArticle.from_mapping(ARTICLE), PublicationImage(media_id, metadata),
+                                     PublicationContext(datetime(2026, 10, 28, tzinfo=timezone.utc), creation_is_fresh=True))
+        self.assertTrue(result.success)
+        self.assertEqual(post.call_args.kwargs["json"]["featured_media"], 701)
+        usage.assert_called_once_with(metadata, 901, ARTICLE["title"])
+        self.assertEqual(usage.call_args.args[0]["emergency_rescue_tier"], 0)
+        self.assertEqual(usage.call_args.args[0]["license_name"], item.license_name)
+
+    def test_consumed_strict_budget_leaves_later_fresh_candidate_for_tier_zero(self) -> None:
+        failed, unattempted = stock("pexels", "311", 0.99), stock("pexels", "312", 0.98)
+        loader = FixtureDownloader({(failed.provider, failed.usable_url): ImageDownloadError("http_429", provider_unavailable=True)})
+        with self.route([FixtureProvider("pexels", [failed, unattempted])], downloader=loader, strict_limit=1, require=True,
+                        generation_results={"grok": self.generated("grok")}) as route:
+            media_id, metadata = self.upload()
+        self.assertEqual(media_id, 701)
+        self.assertTrue(route.results[0].search_budget_exhausted)
+        self.assertEqual(route.results[0].provider_stats["pexels"]["download_attempted"], 1)
+        self.assertEqual(route.results[0].rescue_context.strict_attempted_transports, {(failed.provider, failed.usable_url)})
+        self.assertEqual(metadata["asset_key"], unattempted.asset_key)
+        self.assertEqual(metadata["emergency_rescue_tier"], 0)
+        self.assertEqual(metadata["emergency_original_rejection_reason"], "strict_unattempted")
+        self.assertEqual(metadata["emergency_download_attempts"], 1)
+        self.assertEqual(route.loader.calls, [(failed.provider, failed.usable_url), (unattempted.provider, unattempted.usable_url)])
+        route.generate.assert_not_called()
+
+    def test_all_tiers_zero_through_four_fail_before_required_grok_openai_chain(self) -> None:
+        tier_zero = stock("pexels", "321", 0.97)
+        tier_one = stock("pexels", "322", 0.71)
+        tier_two = stock("pexels", "323", 0.96)
+        tier_three = stock("pexels", "324", 0.70)
+        tier_four = stock("pexels", "325", 0.99)
+        tier_order = [tier_zero, tier_one, tier_two, tier_three, tier_four]
+        content_sha = hashlib.sha256(tier_four.asset_key.encode()).hexdigest()
+        local_usage = [{"asset_key": tier_two.asset_key}, {"asset_key": tier_three.asset_key}, {"content_sha256": content_sha}]
+        failures = [media.MediaMetadataError("metadata_update_failed") for _ in tier_order]
+        with self.route([FixtureProvider("pexels", list(reversed(tier_order)))], strict_limit=1, require=True,
+                        local_usage=local_usage, metadata_outcomes=[*failures, True],
+                        generation_results={"openai": self.generated("openai")}) as route:
+            media_id, metadata = self.upload()
+        self.assertEqual(media_id, 706)
+        self.assertEqual([call.args[0] for call in route.cover.call_args_list], [item.asset_key.encode() for item in tier_order])
+        self.assertEqual([item.metadata["emergency_rescue_tier"] for item in tier_order], [0, 1, 2, 3, 4])
+        self.assertEqual(tier_zero.metadata["emergency_original_rejection_reason"], "strict_unattempted")
+        self.assertEqual(route.results[0].rescue_context.strict_attempted_transports, {(tier_four.provider, tier_four.usable_url)})
+        self.assertFalse(route.results[0].generation_allowed)
+        self.assertEqual(route.loader.calls, [(tier_four.provider, tier_four.usable_url), *[(item.provider, item.usable_url) for item in tier_order[:4]]])
+        self.assertEqual(metadata["emergency_download_attempts"], 4)
+        self.assertTrue(metadata["emergency_completed"])
+        self.assertFalse(metadata["emergency_selected"])
+        self.assertTrue(metadata["final_generation_rescue_allowed"])
+        self.assertEqual(metadata["final_image_source"], "openai")
+        self.assertFalse(metadata["final_image_failure"])
+        self.assertEqual([call.args[0] for call in route.generate.call_args_list], ["grok", "openai"])
+        self.assertLess(route.events.index(("rescue_completed", True)), route.events.index(("generated", "grok")))
+        self.assertEqual(route.metadata.call_count, 6)
 
     def test_strict_attribution_failure_tries_next_strict_candidate(self) -> None:
         first, second = stock("pexels", "121", 0.95), stock("pexels", "122", 0.90)

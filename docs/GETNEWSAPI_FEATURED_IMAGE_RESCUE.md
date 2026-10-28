@@ -20,12 +20,28 @@ orientation checks, even if strict relevance scoring rejected it before those
 checks. Required attribution remains complete and bounded, including applicable
 CC BY modification notices. Unsupported or uncertain licenses are not relaxed.
 
-Only soft score/reuse rejections enter the emergency pool, in this order:
+The emergency pool includes strict-safe unattempted deliveries and soft
+score/reuse rejections, in this order:
 
-1. Fresh below-threshold candidates.
-2. Above-threshold candidates blocked by local identity/WordPress recent use.
-3. Below-threshold candidates also blocked by recent identity/WordPress use.
-4. Exact SHA/difference-hash local content-history candidates.
+| Tier | Eligible candidate |
+|---|---|
+| 0 | Fresh delivery meeting its threshold, observed but not attempted by strict selection |
+| 1 | Fresh below-threshold candidate |
+| 2 | Above-threshold candidate blocked by local identity/WordPress recent use |
+| 3 | Below-threshold candidate also blocked by recent identity/WordPress use |
+| 4 | Exact SHA/difference-hash local content-history candidate |
+
+Strict selection records each `(provider, usable_url)` in
+`strict_attempted_transports` immediately before starting its download. Tier 0
+requires no strict attempt and no score/history rejection, and passes the same
+independent hard checks as every other rescue candidate. It preserves
+`emergency_rescue_tier=0` and
+`emergency_original_rejection_reason=strict_unattempted`; it is never labeled
+below threshold. Thus a fresh safe candidate left behind by the strict global
+budget is tried before lower rescue tiers or final generation, within the
+separate emergency attempt budget. Existing URL-wide failure exclusions prevent
+a failed URL from returning through another provider, while a different valid
+delivery of the same asset remains eligible.
 
 Within each tier, raw final score sorts descending, followed by configured
 provider precedence and the existing deterministic candidate tie-break fields.
@@ -62,6 +78,9 @@ Local fixture verification reproduces Pexels below-threshold safe candidates,
 Pixabay image HTTP 429 failures, Openverse edge denial and no usable Wikimedia
 result. The safe Pexels rescue supplies featured media and prevents generation.
 This is offline evidence, not a new DEV publication or deployment.
+Additional fixtures cover a strict budget of zero and a consumed strict budget:
+observed fresh stock meeting its threshold is rescued as Tier 0, uploaded and recorded
+through the normal publication path, with no generated-image calls.
 
 ## Final generated-image phase
 
