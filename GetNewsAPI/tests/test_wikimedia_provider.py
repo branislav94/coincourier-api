@@ -744,7 +744,15 @@ class WikimediaReuseAndFallbackTests(unittest.TestCase):
 
     def test_successful_wikimedia_candidate_prevents_generated_fallback(self) -> None:
         import publishing.wordpress.publisher as publisher
-        selected = (b"prepared-jpeg", "wikimedia.jpg", {"provider": "wikimedia", "credit_text": candidate().attribution_text, "license_name": "cc-by", "attribution_text": candidate().attribution_text})
+        item = candidate()
+        selected = (b"prepared-jpeg", "wikimedia.jpg", {
+            "provider": "wikimedia", "credit_text": item.attribution_text,
+            "attribution_text": item.attribution_text, "creator_name": item.creator_name,
+            "creator_display_name": item.metadata["creator_display_name"],
+            "work_title": item.metadata["work_title"], "source_page_url": item.source_page_url,
+            "license_name": item.license_name, "license_version": item.license_version,
+            "license_url": item.license_url,
+        })
         with (
             patch.object(publisher, "IMAGE_SOURCE_MODE", "hybrid"), patch.object(publisher, "IMAGE_SOURCE_PRIORITY", "stock_first"),
             patch.object(publisher, "_search_stock_image_content", return_value=(selected, False)),
@@ -756,7 +764,9 @@ class WikimediaReuseAndFallbackTests(unittest.TestCase):
         self.assertEqual(media_id, 42)
         self.assertEqual(meta["provider"], "wikimedia")
         generate.assert_not_called()
-        self.assertIn("Changes:", str(metadata.call_args))
+        self.assertIn("Cropped", metadata.call_args.kwargs["caption"])
+        self.assertIn("Changes:", metadata.call_args.kwargs["description"])
+        self.assertNotEqual(metadata.call_args.kwargs["caption"], metadata.call_args.kwargs["description"])
 
     def test_wikimedia_usage_recording_roundtrip_preserves_aliases_and_license(self) -> None:
         item, image = candidate(), downloaded()

@@ -737,7 +737,15 @@ class AdvisoryLockTests(unittest.TestCase):
 class AttributionFlowTests(unittest.TestCase):
     @staticmethod
     def upload_selection(metadata, *, metadata_error=None, from_generation=False):
-        selected = (b"prepared", "image.jpg", dict(metadata))
+        selected_meta = dict(metadata)
+        if selected_meta.get("provider") in {"openverse", "wikimedia"} and selected_meta.get("license_name") == "cc-by":
+            selected_meta = {
+                "creator_name": "Example Artist", "work_title": "Example Work",
+                "source_page_url": "https://source.example/file",
+                "license_version": "4.0", "license_url": "https://creativecommons.org/licenses/by/4.0/",
+                "attribution_complete": True, **selected_meta,
+            }
+        selected = (b"prepared", "image.jpg", selected_meta)
         details_response = Mock()
         details_response.raise_for_status.side_effect = metadata_error
         with (
@@ -770,7 +778,11 @@ class AttributionFlowTests(unittest.TestCase):
         })
         published = original + "\nChanges: cropped and resized for publication."
         self.assertEqual(media_id, 88)
-        self.assertEqual(post.call_args.kwargs["json"]["caption"], published)
+        caption = post.call_args.kwargs["json"]["caption"]
+        self.assertNotEqual(caption, published)
+        for expected in ("Example Artist", "Example Work", "CC BY 4.0", "Cropped"):
+            self.assertIn(expected, caption)
+        self.assertNotIn("Provider required notice.", caption)
         self.assertEqual(post.call_args.kwargs["json"]["description"], published)
         self.assertEqual(metadata["provider_attribution_text"], original)
         self.assertEqual(metadata["attribution_text"], published)
@@ -967,7 +979,9 @@ class AttributionFlowTests(unittest.TestCase):
         self.assertEqual(media_id, 88)
         self.assertEqual(metadata["provider"], "openverse")
         payload = post.call_args.kwargs["json"]
-        self.assertEqual(payload["caption"], payload["description"])
+        self.assertNotEqual(payload["caption"], payload["description"])
+        for expected in (raw["title"], raw["creator"], "CC BY 4.0", "Cropped"):
+            self.assertIn(expected, payload["caption"])
         for expected in (
             raw["title"],
             raw["creator"],

@@ -1005,7 +1005,15 @@ class PublisherRoutingTests(unittest.TestCase):
 
     @staticmethod
     def _selected(provider: str = "openverse") -> tuple[bytes, str, dict]:
-        return b"licensed", "licensed.jpg", {"provider": provider, "credit_text": "Credit"}
+        metadata = {"provider": provider, "credit_text": "Credit"}
+        if provider in {"openverse", "wikimedia"}:
+            metadata.update(
+                creator_name="Fixture Creator", work_title="Licensed image",
+                source_page_url="https://source.example/licensed-image",
+                license_name="cc-by", license_version="4.0",
+                license_url="https://creativecommons.org/licenses/by/4.0/",
+            )
+        return b"licensed", "licensed.jpg", metadata
 
     def test_generated_fallback_not_reached_when_search_succeeds(self) -> None:
         response = Mock()
@@ -1236,7 +1244,9 @@ class PublisherRoutingTests(unittest.TestCase):
         self.assertTrue(metadata_call.args[0].endswith("/wp-json/wp/v2/media/82"))
         payload = metadata_call.kwargs["json"]
         attribution = payload["description"]
-        self.assertEqual(payload["caption"], attribution)
+        self.assertNotEqual(payload["caption"], attribution)
+        for expected in (raw["title"], raw["creator"], "CC BY 4.0", "Cropped"):
+            self.assertIn(expected, payload["caption"])
         for expected in (
             raw["title"],
             raw["creator"],
@@ -1416,7 +1426,10 @@ class IdentityTransportFallbackTests(unittest.TestCase):
         self.assertEqual(result.rejection_counts["duplicate_content"], 1)
 
     def test_successful_alternate_variant_prevents_generated_fallback(self) -> None:
-        first, alternate = self.variants()
+        from tests.test_wikimedia_provider import candidate as wikimedia_candidate
+        first, _alternate = self.variants()
+        alternate = wikimedia_candidate()
+        alternate.final_score = .99
         loader = Mock(download=Mock(side_effect=[ImageDownloadError("http_404"), downloaded(b"shared")]))
         converted = (b"prepared-jpeg", {"width": 1600, "height": 900})
         with (
