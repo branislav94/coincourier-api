@@ -52,12 +52,9 @@ class PixabayProvider(ImageSearchProvider):
                 "safesearch": "true",
                 "per_page": self.per_page,
             },
+            payload_validator=lambda payload: self.valid_result_list(payload, "hits"),
         )
-        return [
-            candidate
-            for rank, raw in enumerate(data.get("hits") or [])
-            if (candidate := self.normalize_candidate(raw, query, rank)) is not None
-        ]
+        return self.normalize_results(data["hits"], query)
 
     def normalize_candidate(self, raw: dict[str, Any], query: str, provider_rank: int) -> ImageCandidate | None:
         image_url = raw.get("largeImageURL") or raw.get("webformatURL")

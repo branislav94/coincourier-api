@@ -17,6 +17,7 @@ from config import (
 )
 
 from .downloader import perceptual_hash_distance
+from .commons_identity import commons_identities, commons_identities_from_text
 from .models import DownloadedImage, ImageCandidate
 
 
@@ -85,7 +86,7 @@ def _write_image_usage(entries: list[dict[str, Any]]) -> None:
 
 def record_image_usage(meta: dict[str, Any], post_id: int, title: str) -> None:
     provider = str(meta.get("provider") or "").lower()
-    if provider not in {"pexels", "pixabay", "openverse"}:
+    if provider not in {"pexels", "pixabay", "openverse", "wikimedia"}:
         return
     asset_id = str(meta.get("asset_id") or meta.get("provider_asset_id") or "")
     source_page = str(meta.get("source_page_url") or meta.get("credit_url") or "")
@@ -95,6 +96,7 @@ def record_image_usage(meta: dict[str, Any], post_id: int, title: str) -> None:
         "asset_id": asset_id,
         "asset_key": meta.get("asset_key") or (f"{provider}:{asset_id}" if asset_id else ""),
         "canonical_source": meta.get("canonical_source") or "",
+        "identity_aliases": sorted(_string_aliases(meta.get("identity_aliases"))),
         "source_page_url": source_page,
         "image_url_hash": meta.get("image_url_hash") or _image_url_hash(image_url),
         "content_sha256": meta.get("content_sha256") or "",
@@ -121,18 +123,40 @@ def record_image_usage(meta: dict[str, Any], post_id: int, title: str) -> None:
     logger.info("[IMG-V2] recorded image usage provider=%s asset_key=%s post_id=%s", provider, entry["asset_key"], post_id)
 
 
+def _string_aliases(value: Any) -> set[str]:
+    return {item for item in value if isinstance(item, str) and item} if isinstance(value, (list, tuple, set)) else set()
+
+
+def candidate_identity_values(candidate: ImageCandidate) -> set[str]:
+    values = {
+        candidate.asset_key, candidate.canonical_source, candidate.source_page_url,
+        candidate.usable_url, candidate.url_hash,
+    } | _string_aliases(candidate.identity_aliases)
+    values.discard("")
+    source = candidate.metadata.get("source") or ("wikimedia" if candidate.provider == "wikimedia" else "")
+    foreign_id = candidate.metadata.get("foreign_identifier") or (candidate.asset_id if candidate.provider == "wikimedia" else "")
+    return values | commons_identities(*values, source=source, foreign_identifier=foreign_id)
+
+
+def _history_identity_values(entry: dict[str, Any]) -> set[str]:
+    values = {
+        str(entry.get(key) or "")
+        for key in ("asset_key", "canonical_source", "source_page_url", "credit_url", "image_url")
+    } | _string_aliases(entry.get("identity_aliases"))
+    values.discard("")
+    source = entry.get("source") or ("wikimedia" if entry.get("provider") == "wikimedia" else "")
+    foreign_id = entry.get("foreign_identifier") or (entry.get("asset_id") if entry.get("provider") == "wikimedia" else "")
+    return values | commons_identities(*values, source=source, foreign_identifier=foreign_id)
+
+
 def candidate_recent_local_usage(
     candidate: ImageCandidate,
     entries: list[dict[str, Any]],
 ) -> dict[str, Any] | None:
     candidate_hash = _image_url_hash(candidate.usable_url)
+    identities = candidate_identity_values(candidate)
     for entry in entries:
-        if entry.get("asset_key") and entry.get("asset_key") == candidate.asset_key:
-            return entry
-        if candidate.canonical_source and entry.get("canonical_source") == candidate.canonical_source:
-            return entry
-        source_page = entry.get("source_page_url") or entry.get("credit_url")
-        if candidate.source_page_url and source_page == candidate.source_page_url:
+        if identities & _history_identity_values(entry):
             return entry
         if entry.get("image_url_hash") and entry.get("image_url_hash") == candidate_hash:
             return entry
@@ -159,16 +183,20 @@ def candidate_recent_wp_usage(
     candidate: ImageCandidate,
     rows: list[dict[str, Any]],
 ) -> dict[str, Any] | None:
-    terms = {
-        candidate.asset_key,
-        candidate.canonical_source,
-        candidate.source_page_url,
-        candidate.usable_url,
-    }
-    terms.discard("")
+    terms = candidate_identity_values(candidate)
+    commons_terms = commons_identities(*terms)
     for row in rows:
         blob = " ".join(str(row.get(key) or "") for key in ("post_excerpt", "post_content", "guid"))
-        if any(term in blob for term in terms):
+        # Commons comparisons use parsed complete identities rather than numeric
+        # substrings (wikimedia:12 must not match wikimedia:123).
+        if commons_terms & commons_identities_from_text(blob):
+            return row
+        ordinary_terms = {
+            term for term in terms
+            if not commons_identities(term)
+            and not (commons_terms and term[:5].lower() == "file:")
+        }
+        if any(term in blob for term in ordinary_terms):
             return row
     return None
 

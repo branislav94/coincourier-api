@@ -8,6 +8,64 @@ databases intact. This repository update performs no remote deployment or data
 copy. Follow the [generic deployment runbook](GETNEWSAPI_DEPLOYMENT_RUNBOOK.md)
 for independently approved mutations, migrations, recovery, and monitoring.
 
+## Controlled stock-provider DEV verification (2026-10-27)
+
+Code merge alone does not activate V2. Keep the current accepted DEV settings
+until the separate stock-provider trial is approved. Source defaults remain V1
+and the three-provider list; direct Wikimedia requires explicit inclusion.
+
+Code deployment nevertheless changes the shared Pexels/Pixabay attribution
+failure behavior under `IMAGE_SEARCH_ENGINE=v1`: if required media metadata
+cannot be saved, the image is rejected as featured media and the post may still
+publish without one. That failure does not invoke Grok. A V1 search rollback
+retains this shared attribution safeguard.
+
+For the later DEV trial, use these runtime values:
+
+```dotenv
+IMAGE_SEARCH_ENGINE=v2
+IMAGE_SEARCH_PROVIDERS=pexels,pixabay,openverse,wikimedia
+OPENVERSE_ENABLED=true
+WIKIMEDIA_ENABLED=true
+IMAGE_SOURCE_MODE=hybrid
+IMAGE_SOURCE_PRIORITY=stock_first
+IMAGE_GENERATION_ONLY_AFTER_SEARCH_EXHAUSTED=true
+IMAGE_GENERATION_ON_PROVIDER_ERROR=false
+STOCK_IMAGE_REUSE_WINDOW_DAYS=20
+STOCK_IMAGE_REUSE_CHECK_WP_HISTORY=true
+PEXELS_MIN_SCORE=0.72
+PIXABAY_MIN_SCORE=0.78
+OPENVERSE_MIN_SCORE=0.70
+WIKIMEDIA_MIN_SCORE=0.70
+```
+
+Restart the runtime processes after changing their environment. Preserve current
+dimensions, candidate budget, license allowlist, local/WP history, SHA/difference
+hash protection, models, topology and schedules. Wikimedia has no credentials;
+Openverse credentials remain optional. The `.70` Wikimedia threshold is a
+provisional default, not measured production calibration.
+
+Capture provider/rejection `provider_summary` and correlated `terminal` records,
+including selected provider/asset, provider failures, confirmed exhaustion,
+budget exhaustion and generation eligibility. Verify final WordPress image and
+required-credit outcomes as well as selection logs. Provider failure or budget
+exhaustion must not trigger generation with the trial settings above; attribution
+failure must not trigger Grok. Publication must remain successful and
+`publish_failed` must remain zero, including posts permitted to publish without
+featured media.
+
+Compare final generated-image share with the previous **12/15 (80%)** baseline
+and report sample size/window, provider counts, rejection breakdown, missing
+featured media, visible attribution and reuse/duplicate checks. Keep all existing
+thresholds and the 20-day reuse policy unchanged. Use the detailed
+[controlled DEV trial procedure](GETNEWSAPI_DEPLOYMENT_RUNBOOK.md#controlled-stock-provider-dev-trial-2026-10-27)
+for evidence and stop/rollback conditions.
+
+DEV verification must occur before any production consideration. **Stop after
+DEV verification** and return evidence to the application team. DevOps owns
+`dev -> main` and production deployment. No production activation, merge,
+deployment, migration or schedule change is authorized by this handoff addition.
+
 ## Git and Dokploy Compose contract
 
 | Setting | Required contract |

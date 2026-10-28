@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import logging
 import mimetypes
 from collections.abc import Callable
 from typing import Any
@@ -9,6 +10,26 @@ from typing import Any
 from config import WP_API_URL
 
 from .client import API_BASE, WP_HTTP_TIMEOUT, session
+
+
+logger = logging.getLogger(__name__)
+MAX_REQUIRED_ATTRIBUTION_CHARS = 16_384
+
+
+class MediaMetadataError(RuntimeError):
+    """A sanitized failure to preserve required image attribution."""
+
+    def __init__(self, reason: str) -> None:
+        self.reason = reason
+        super().__init__(reason)
+
+
+def validate_required_attribution(value: str | None) -> None:
+    """Reject incomplete or unbounded credits instead of clipping required text."""
+    if not isinstance(value, str) or not value.strip():
+        raise MediaMetadataError("attribution_missing")
+    if len(value) > MAX_REQUIRED_ATTRIBUTION_CHARS:
+        raise MediaMetadataError("attribution_too_large")
 
 
 def upload_media(
@@ -38,26 +59,38 @@ def set_media_details(
     *,
     caption: str | None = None,
     description: str | None = None,
+    required_attribution: bool = False,
     http_session=None,
     api_url: str | None = None,
-) -> None:
-    payload: dict[str, str] = {"alt_text": (alt_text or "")[:120]}
-    if caption:
-        payload["caption"] = caption[:500]
-    if description:
-        payload["description"] = description[:1000]
+) -> bool:
+    """Preserve complete stock credits, failing closed when they are required."""
     try:
+        if required_attribution:
+            validate_required_attribution(caption)
+            validate_required_attribution(description)
+        payload: dict[str, str] = {"alt_text": (alt_text or "")[:120]}
+        if caption:
+            payload["caption"] = caption if required_attribution else caption[:500]
+        if description:
+            payload["description"] = description if required_attribution else description[:1000]
         active_session = session if http_session is None else http_session
         active_session.post(
             f"{WP_API_URL if api_url is None else api_url}/wp-json/wp/v2/media/{media_id}",
             json=payload,
             timeout=WP_HTTP_TIMEOUT,
         ).raise_for_status()
+        return True
     except Exception as exc:
-        print(
-            f"Could not set media details for media {media_id}: "
-            f"{type(exc).__name__}"
+        reason = exc.reason if isinstance(exc, MediaMetadataError) else "metadata_update_failed"
+        logger.warning(
+            "[IMG] media metadata failed media_id=%s reason=%s error_type=%s",
+            media_id,
+            reason,
+            type(exc).__name__,
         )
+        if required_attribution:
+            raise MediaMetadataError(reason) from None
+        return False
 
 
 def set_media_alt(

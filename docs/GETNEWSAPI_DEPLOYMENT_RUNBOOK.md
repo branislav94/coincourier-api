@@ -46,6 +46,98 @@ For parallel Dokploy DEV Compose cutover, use the focused
 - Keep `IMAGE_SEARCH_ENGINE=v1` unless a separate reviewed test explicitly
   authorizes V2.
 
+## Controlled stock-provider DEV trial (2026-10-27)
+
+The stock-provider expansion does not activate V2 when code is merged. Source
+defaults remain `IMAGE_SEARCH_ENGINE=v1` and
+`IMAGE_SEARCH_PROVIDERS=pexels,pixabay,openverse`; Wikimedia participates only
+when explicitly listed. No runtime environment, Compose topology, scheduler,
+model, database schema, threshold, or reuse policy is changed by the code merge.
+
+Deploying this code does change shared Pexels/Pixabay attribution handling even
+when `IMAGE_SEARCH_ENGINE=v1` remains active. A required media-metadata update
+failure now rejects the uploaded stock image as featured media; the post may
+still publish without a featured image, and the failure does not invoke Grok.
+Switching back to V1 rolls back search selection, but retains this shared
+attribution safeguard.
+
+After local mocked tests pass and a DEV trial is approved, the DEV operator must
+set these explicit runtime values in the existing DEV resource:
+
+```dotenv
+IMAGE_SEARCH_ENGINE=v2
+IMAGE_SEARCH_PROVIDERS=pexels,pixabay,openverse,wikimedia
+OPENVERSE_ENABLED=true
+WIKIMEDIA_ENABLED=true
+IMAGE_SOURCE_MODE=hybrid
+IMAGE_SOURCE_PRIORITY=stock_first
+IMAGE_GENERATION_ONLY_AFTER_SEARCH_EXHAUSTED=true
+IMAGE_GENERATION_ON_PROVIDER_ERROR=false
+IMAGE_EMERGENCY_STOCK_RESCUE_ENABLED=true
+IMAGE_EMERGENCY_STOCK_RESCUE_LIMIT=10
+IMAGE_REQUIRE_FEATURED_IMAGE=true
+STOCK_IMAGE_REUSE_WINDOW_DAYS=20
+STOCK_IMAGE_REUSE_CHECK_WP_HISTORY=true
+PEXELS_MIN_SCORE=0.72
+PIXABAY_MIN_SCORE=0.78
+OPENVERSE_MIN_SCORE=0.70
+WIKIMEDIA_MIN_SCORE=0.70
+```
+
+Keep the existing dimensions, candidate budget, license allowlist, duplicate
+checks, Pexels/Pixabay credentials, and generated-provider/model settings.
+Openverse credentials remain optional; Wikimedia needs no credentials.
+`WIKIMEDIA_MIN_SCORE=0.70` is provisional and must be assessed using DEV evidence,
+without lowering any threshold during the trial. Runtime processes must restart
+after an environment change because configuration is captured at import time.
+
+V2 may fetch providers concurrently. Identity groups are ordered by their first
+eligible variant in configured provider order and within-provider rank. After a
+download or conversion failure, alternate deliveries of that asset are tried
+before the next identity group. Each provider/URL attempt consumes the shared
+budget, and a selected alternate retains its own source, license and attribution.
+Provider failures and untried candidates remaining after the global
+download-attempt budget prevent confirmed exhaustion and continue to block
+normal generation. After strict stock fails, the separate emergency phase uses
+only observed hard-safe candidates within its own budget: fresh deliveries
+meeting their thresholds but not attempted by strict search are Tier 0, ahead of score/reuse tiers
+1–4. Exact strict attempts are tracked explicitly; failed URLs remain excluded.
+If that
+phase completes without featured media, `IMAGE_REQUIRE_FEATURED_IMAGE=true`
+permits final Grok then OpenAI rescue, including after provider failures.
+Required-credit persistence failure rejects that delivery and advances to other
+stock candidates before final generation. See the exact tiers, hard exclusions,
+remaining failure conditions and V1 scope in
+[featured-image rescue](GETNEWSAPI_FEATURED_IMAGE_RESCUE.md).
+
+Capture the reviewed commit/image digest, trial window, article cohort and exact
+non-secret settings. Retain correlated `provider_summary` and `terminal` logs,
+including provider failures, rejection reasons, selected provider/asset,
+`all_available_providers_exhausted`, `search_budget_exhausted`, and
+`generation_allowed`, plus emergency and final policy fields in `image_terminal`.
+Join these with final upload/attribution and publication
+outcomes; a selector success alone does not prove an image was published.
+
+Require successful publication and `publish_failed=0`. Review final image
+counts/share by provider, posts without featured media, attribution visibility
+and completeness, reuse/duplicates, provider errors and budget exhaustion.
+Compare generated-image share against the earlier **12/15 (80%)** generated-image
+baseline, recording that it is a small historical sample. Do not assume improved
+yield merely because a provider was called. Preserve fresh DEV comparison data
+for the same measurement window where available.
+
+Stop the DEV trial on publication failures, missing required credits, unsupported
+licenses, reuse outside the documented emergency tiers, or generation before
+emergency completion. Final-policy generation after non-exhaustion is expected
+only with `final_generation_rescue_allowed=true`. The
+DEV rollback is `IMAGE_SEARCH_ENGINE=v1` followed by a process restart; retain
+the persistent image-usage history. Do not tune thresholds, reuse windows or
+queries to conceal a failed acceptance result.
+
+DEV verification must finish before any production consideration. **Stop after
+DEV verification** and return the evidence for review. DevOps owns `dev -> main`
+and production deployment; this procedure does not authorize either action.
+
 ## Environment Types
 
 | Environment | Execution | Services | Intended use |

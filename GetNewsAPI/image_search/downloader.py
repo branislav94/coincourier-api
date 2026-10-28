@@ -20,6 +20,7 @@ from .models import DownloadedImage, ImageCandidate
 
 RETRYABLE_STATUSES = {408, 429, 500, 502, 503, 504}
 MAX_IMAGE_BYTES = 20 * 1024 * 1024
+IMAGE_SEARCH_USER_AGENT = "CoinCourierGetNewsAPIBot/2.0 (https://github.com/branislav94/coincourier-api)"
 SUPPORTED_FORMATS = {"JPEG": "image/jpeg", "PNG": "image/png", "WEBP": "image/webp"}
 
 
@@ -107,7 +108,7 @@ class ImageDownloader:
                 response = self.session.get(
                     candidate.usable_url,
                     timeout=self.timeout,
-                    headers={"User-Agent": "CryptoCourierImageSelector/2.0"},
+                    headers={"User-Agent": IMAGE_SEARCH_USER_AGENT},
                 )
                 status = int(response.status_code)
                 if 200 <= status < 300:
