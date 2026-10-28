@@ -527,6 +527,223 @@ class PublicationRepository:
             (code[:500], rich_article_id, token),
         )
 
+    def reject_duplicate(
+        self,
+        rich_article_id: int,
+        raw_article_id: int,
+        decision: Any,
+        *,
+        token: str | None = None,
+    ) -> bool:
+        """Atomically consume an unpublished duplicate and its verified source.
+
+        The caller has already persisted the policy audit. This transaction
+        revalidates source identity, canonical external proof and ownership;
+        a stale decision cannot modify a published or newly owned row.
+        """
+        canonical_raw_id = getattr(decision, "canonical_raw_id", None)
+        canonical_rich_id = getattr(decision, "canonical_rich_id", None)
+        canonical_wp_id = getattr(decision, "canonical_wp_id", None)
+        ids = (rich_article_id, raw_article_id, canonical_raw_id, canonical_rich_id)
+        if (
+            any(type(value) is not int or value <= 0 for value in ids)
+            or canonical_raw_id == raw_article_id
+            or canonical_rich_id == rich_article_id
+            or getattr(decision, "reject", False) is not True
+            or getattr(decision, "available", False) is not True
+            or getattr(decision, "mode", "") != "enforce"
+            or getattr(decision, "stage", "") != "pre_publish"
+            or getattr(decision, "article_id", None) != raw_article_id
+            or (canonical_wp_id is not None and (type(canonical_wp_id) is not int or canonical_wp_id <= 0))
+            or (token is not None and (not isinstance(token, str) or not token))
+        ):
+            raise ValueError("duplicate disposition requires a confirmed pre-publication decision")
+
+        identity = """
+            (r.raw_article_id = c.id OR (
+                r.raw_article_id IS NULL
+                AND c.news_url IS NOT NULL AND c.news_url <> ''
+                AND r.news_url = c.news_url
+                AND NOT EXISTS (
+                    SELECT 1 FROM cryptonewsapi other_source
+                    WHERE other_source.news_url = r.news_url AND other_source.id <> c.id
+                )
+            ))
+        """
+        ownership = (
+            "r.publish_status = 'claimed' AND r.publish_claim_token = %s"
+            if token is not None else
+            "r.publish_status IN ('fresh', 'pending', 'retryable') "
+            "AND r.publish_claim_token IS NULL AND r.publish_claimed_at IS NULL"
+        )
+        ownership_params = (token,) if token is not None else ()
+        conn = self._connect()
+        cursor = None
+        try:
+            conn.start_transaction()
+            cursor = conn.cursor(dictionary=True)
+            cursor.execute(
+                f"""
+                SELECT r.id, c.id AS raw_article_id,
+                       c.processing_status, c.processing_claim_token,
+                       c.processing_claimed_at, c.processing_last_error
+                FROM rich_crpytonews r
+                JOIN cryptonewsapi c ON c.id = %s
+                WHERE r.id = %s AND {identity}
+                  AND r.published = 0
+                  AND r.wp_post_id IS NULL AND r.wp_post_url IS NULL
+                  AND r.wp_post_created_at IS NULL
+                  AND {ownership}
+                  AND NOT EXISTS (
+                    SELECT 1 FROM rich_crpytonews prior_post
+                    WHERE (prior_post.raw_article_id = c.id
+                        OR (prior_post.raw_article_id IS NULL AND prior_post.news_url = c.news_url))
+                      AND (prior_post.published = 1 OR prior_post.wp_post_id > 0
+                        OR prior_post.publish_status IN ('published', 'post_created'))
+                  )
+                LIMIT 1 FOR UPDATE
+                """,
+                (raw_article_id, rich_article_id, *ownership_params),
+            )
+            source_before = cursor.fetchone()
+            if source_before is None:
+                conn.rollback()
+                return False
+            if source_before.get("processing_status") == "claimed":
+                expected_raw_state = {
+                    name: source_before.get(name) for name in (
+                        "processing_status", "processing_claim_token", "processing_claimed_at", "processing_last_error",
+                    )
+                }
+            else:
+                expected_raw_state = {
+                    "processing_status": "duplicate" if source_before.get("processing_status") == "duplicate" else "completed",
+                    "processing_claim_token": None,
+                    "processing_claimed_at": None,
+                    "processing_last_error": None,
+                }
+
+            post_expectation = " AND r.wp_post_id = %s" if canonical_wp_id is not None else ""
+            cursor.execute(
+                f"""
+                SELECT r.id
+                FROM rich_crpytonews r
+                JOIN cryptonewsapi c ON c.id = %s
+                WHERE r.id = %s AND {identity}
+                  AND COALESCE(c.processing_status, '') <> 'duplicate'
+                  AND COALESCE(r.publish_status, '') <> 'duplicate'
+                  AND (r.wp_post_id > 0 OR r.published = 1
+                       OR r.publish_status IN ('published', 'post_created'))
+                  {post_expectation}
+                LIMIT 1 FOR UPDATE
+                """,
+                (canonical_raw_id, canonical_rich_id, *((canonical_wp_id,) if canonical_wp_id is not None else ())),
+            )
+            if cursor.fetchone() is None:
+                conn.rollback()
+                return False
+
+            update_ownership = ownership.replace("r.", "")
+            cursor.execute(
+                f"""
+                UPDATE rich_crpytonews
+                SET publish_status = 'duplicate',
+                    publish_claim_token = NULL,
+                    publish_claimed_at = NULL,
+                    publish_last_error = NULL
+                WHERE id = %s AND published = 0
+                  AND wp_post_id IS NULL AND wp_post_url IS NULL
+                  AND wp_post_created_at IS NULL
+                  AND {update_ownership}
+                """,
+                (rich_article_id, *ownership_params),
+            )
+            if cursor.rowcount != 1:
+                conn.rollback()
+                return False
+            # MySQL/MariaDB evaluate SET left to right: inspect the original
+            # status for each claim field, then assign status last. The raw
+            # worker may have stored rich content just before completing.
+            cursor.execute(
+                """
+                UPDATE cryptonewsapi
+                SET processed = 1,
+                    chosen_for_publish = 0,
+                    scheduled_for = NULL,
+                    processing_claim_token = CASE WHEN processing_status = 'claimed'
+                                                 THEN processing_claim_token ELSE NULL END,
+                    processing_claimed_at = CASE WHEN processing_status = 'claimed'
+                                                THEN processing_claimed_at ELSE NULL END,
+                    processing_last_error = CASE WHEN processing_status = 'claimed'
+                                                THEN processing_last_error ELSE NULL END,
+                    processing_status = CASE WHEN processing_status IN ('claimed', 'duplicate')
+                                             THEN processing_status ELSE 'completed' END
+                WHERE id = %s
+                """,
+                (raw_article_id,),
+            )
+            cursor.execute(
+                """
+                SELECT processed, chosen_for_publish, scheduled_for, processing_status,
+                       processing_claim_token, processing_claimed_at, processing_last_error
+                FROM cryptonewsapi WHERE id = %s
+                """,
+                (raw_article_id,),
+            )
+            source_state = cursor.fetchone()
+            if not (
+                source_state is not None
+                and source_state.get("processed") == 1
+                and source_state.get("chosen_for_publish") == 0
+                and source_state.get("scheduled_for") is None
+                and all(source_state.get(name) == value for name, value in expected_raw_state.items())
+            ):
+                conn.rollback()
+                return False
+            conn.commit()
+            return True
+        except BaseException:
+            conn.rollback()
+            raise
+        finally:
+            if cursor is not None:
+                cursor.close()
+            conn.close()
+
+    def defer_duplicate_guard(
+        self,
+        rich_article_id: int,
+        token: str,
+        *,
+        creation_is_fresh: bool,
+    ) -> bool:
+        """Release a first claim only when no external creation was attempted."""
+        if type(rich_article_id) is not int or rich_article_id <= 0 or not isinstance(token, str) or not token:
+            raise ValueError("duplicate guard deferral requires an owned article")
+        if creation_is_fresh is not True:
+            return self.require_manual_reconciliation(
+                rich_article_id, token, "duplicate_guard_creation_not_fresh",
+            )
+        return self._owned_update(
+            """
+            UPDATE rich_crpytonews
+            SET publish_status = 'fresh',
+                publish_attempt_count = 0,
+                publish_claim_token = NULL,
+                publish_claimed_at = NULL,
+                publish_last_error = NULL
+            WHERE id = %s
+              AND publish_claim_token = %s
+              AND published = 0
+              AND publish_status = 'claimed'
+              AND publish_attempt_count = 1
+              AND wp_post_id IS NULL
+              AND wp_post_url IS NULL
+              AND wp_post_created_at IS NULL
+            """,
+            (rich_article_id, token),
+        )
+
     def _owned_update(self, sql: str, params: tuple[Any, ...]) -> bool:
         conn = self._connect()
         cursor = conn.cursor()

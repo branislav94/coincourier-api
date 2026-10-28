@@ -100,6 +100,107 @@ The last counts actual unavailable retrieval, not disabled retrieval or an empty
 successful search. Pair classifications count assessed pairs; block counters
 count the final article decision.
 
+## Final publication boundary
+
+`duplicate_detection/publication.py:PublicationDuplicateGuard` reuses the
+application-database advisory-lock helper with conflict group
+`duplicate-publication`. It serializes new publication globally, including
+direct service callers that bypass the normal one-shot job lock. A single
+global group also covers identical content with different or missing event IDs.
+It holds a connection-bound mutex, not a SQL transaction, across external work.
+
+In enforce mode, `PublishingService.publish_due` acquires this mutex **before
+claiming** due articles. Claiming both fresh peers first would make each appear
+to be an unresolved prior attempt. After reconciling the current article's own
+WordPress identity, the service checks fresh source evidence before preparing
+media. `PublicationContext.pre_create_duplicate_guard` then rechecks immediately
+before the WordPress creation intent and POST. The mutex remains held through
+external-ID persistence and local completion. The legacy batch path uses the
+same check-before-media and callback-before-CREATE boundary; its existing outer
+job lock is unchanged. A lost named-lock session prevents creation.
+
+At `stage=pre_publish`, a confirmed prior published/post-created/WP-linked
+article can reject the current candidate. Merely fresh, pending rich peers
+cannot suppress one another. An earlier attempted publication with an unknown
+external outcome is not falsely labeled a published duplicate: the candidate
+enters `manual_review` with `duplicate_prior_publication_unresolved`, preventing
+an endless CREATE retry while preserving the earlier attempt for reconciliation.
+The current article's own existing WordPress identity is reconciled normally.
+
+`PublicationRepository.reject_duplicate` atomically verifies the current claim,
+source identity and canonical external proof, then sets the unpublished rich
+article to `publish_status='duplicate'`. Its raw selection is consumed
+(`processed=1`, `chosen_for_publish=0`, schedule cleared). No canonical WP ID is
+copied into the rejected row; it remains in the assessment audit. Published or
+already WP-linked current rows are never converted to duplicates. A live raw
+processing owner retains its claim until it can finish safely. Durable and
+legacy due queries do not reacquire terminal duplicates. Successful duplicate
+disposition increments `duplicates_rejected`, not publication failures.
+
+Lock acquisition failure defers before any durable claim or media work.
+Application-database/audit unavailability after a claim also defers creation.
+A genuinely fresh owned first attempt can be reset without consuming its
+first-CREATE permission; older ambiguous attempts require manual review.
+`duplicate_guard_deferred` records these outcomes separately from failures.
+Errors from the publisher body retain their ordinary failure behavior rather
+than being mislabeled lock failures. Shadow/off modes do no duplicate-lock I/O.
+
+The guard coordinates publishers running this code against the same application
+database. It cannot serialize unrelated manual WordPress creation or an older
+worker that does not participate in the lock. Deploy participating workers
+together before activating enforce mode. It does not query WordPress for other
+events; it uses the locally persisted external identities and existing own-post
+reconciliation.
+
+## Verification
+
+The regression fixtures cover all six reported site patterns, material updates,
+related events, broad overlap, distance-only matches, missing embeddings,
+concurrent workers, final pre-CREATE rechecks, claim ownership and lock loss.
+Offline discovery explicitly disables opt-in integration suites and blocks real
+HTTP/database/socket connections. The opt-in
+`tests/integration/test_duplicate_enforcement_mariadb.py` adds actual SQL
+disposition and concurrent named-lock tests with synthetic CMS effects. It
+accepts only loopback and the dedicated `coincourier_duplicate_test` schema.
+Its destructive fixture reset is limited to that disposable test schema.
+
+Final validation on 2026-10-28: **514 targeted tests passed**, no skips, failures,
+errors or blocked-network attempts. The exact module counts are:
+
+| `tests.` module | Tests |
+| --- | ---: |
+| `test_duplicate_detection` | 30 |
+| `test_duplicate_enforcement` | 34 |
+| `test_duplicate_processing_enforcement` | 17 |
+| `test_duplicate_semantic_enforcement` | 7 |
+| `test_duplicate_publication_guard` | 16 |
+| `test_duplicate_publication_repository` | 19 |
+| `test_durable_state` | 62 |
+| `test_processing_retry_invocation` | 7 |
+| `test_publishing` | 48 |
+| `test_publication_hotfix` | 1 |
+| `test_publication_identity` | 17 |
+| `test_publication_identity_idempotency` | 23 |
+| `test_semantic_shadow` | 29 |
+| `test_semantic_retrieval` | 26 |
+| `test_semantic_calibration` | 25 |
+| `test_vector_store` | 9 |
+| `test_embeddings` | 40 |
+| `test_embedding_operations` | 36 |
+| `test_embedding_fresh_start_cutoff` | 12 |
+| `test_embedding_fresh_start_config` | 9 |
+| `test_deployment` | 47 |
+
+Full offline discovery: **1,165 run, 1,104 passed, 61 skipped**, zero failures or
+errors and no blocked-network attempts. The skips were the explicitly opt-in
+MariaDB suites: vector/embedding 26, durable state 24, migration tooling 7,
+job locking 2 and duplicate enforcement 2.
+
+All **61 integration tests passed separately**, with zero skips, against the
+disposable local `11.8.9-MariaDB-ubu2404` server. A socket guard allowed only its
+loopback port. The owned tmpfs-backed container was stopped and removed after
+verification; no production database or persistent volume was used.
+
 ## Schema, activation and rollback
 
 No new migration is required. Existing durable-state migration

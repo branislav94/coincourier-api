@@ -11,9 +11,11 @@ from openai import OpenAI
 import hashlib, random
 from datetime import datetime, timedelta, timezone
 from typing import Any
+from dataclasses import replace
 from urllib.parse import urlsplit
 from config import (
     DB_CONFIG,
+    DUPLICATE_ENFORCEMENT_MODE,
     GROK_API_KEY,
     GROK_BASE_URL,
     GROK_IMAGE_ASPECT_RATIO,
@@ -49,6 +51,10 @@ from image_search.models import ImageSearchResult, RescueValidationResult
 from .attribution import build_public_attribution
 from image_search.license_policy import normalize_license_name
 from image_search.reuse import record_image_usage
+from duplicate_detection.enforcement import DUPLICATE_COUNTER_NAMES
+from duplicate_detection.publication import (
+    PublicationDuplicateGuard, PublicationDuplicateRejected, PublicationDuplicateUnavailable,
+)
 from publishing.models import (
     PublicationArticle,
     PublicationContext,
@@ -323,6 +329,7 @@ def _count_due_now() -> int:
             JOIN cryptonewsapi c ON c.news_url = r.news_url
             WHERE r.published = 0
               AND COALESCE(r.publish_status, 'pending') <> 'manual_review'
+              AND COALESCE(r.publish_status, 'pending') <> 'duplicate'
               AND c.chosen_for_publish = 1
               AND c.scheduled_for IS NOT NULL
               AND c.scheduled_for <= UTC_TIMESTAMP()
@@ -778,6 +785,7 @@ def fetch_unpublished(limit: int = 10) -> list[dict]:
             JOIN cryptonewsapi c ON c.news_url = r.news_url
             WHERE r.published = 0
               AND COALESCE(r.publish_status, 'pending') <> 'manual_review'
+              AND COALESCE(r.publish_status, 'pending') <> 'duplicate'
               AND c.chosen_for_publish = 1
               AND c.scheduled_for IS NOT NULL
               AND c.scheduled_for <= UTC_TIMESTAMP()
@@ -1983,6 +1991,9 @@ class WordPressPublisher:
         if image:
             post_data["featured_media"] = image.external_id
 
+        if context.pre_create_duplicate_guard is not None:
+            context.pre_create_duplicate_guard()
+
         if context.persist_creation_intent is not None:
             try:
                 context.persist_creation_intent()
@@ -2133,6 +2144,7 @@ def publish_news_to_wp() -> dict[str, int | str]:
                 prepare_image,
                 claim_timeout_minutes=PUBLISH_CLAIM_TIMEOUT_MINUTES,
                 fresh_start_after=PIPELINE_FRESH_START_AFTER_UTC_SQL,
+                duplicate_mode=DUPLICATE_ENFORCEMENT_MODE,
             )
             durable_result = service.publish_due(min(due, batch_cap))
             if durable_result["attempted"] == 0:
@@ -2163,6 +2175,12 @@ def publish_news_to_wp() -> dict[str, int | str]:
         publication_repository = PublicationRepository()
         succeeded = 0
         failed = 0
+        duplicate_counts = {}
+        if DUPLICATE_ENFORCEMENT_MODE == "enforce":
+            duplicate_counts = {
+                "duplicates_rejected": 0, "duplicate_guard_deferred": 0,
+                **dict.fromkeys(DUPLICATE_COUNTER_NAMES, 0),
+            }
 
         for item in news_items:
             rich_id = int(item['id'])
@@ -2215,19 +2233,47 @@ def publish_news_to_wp() -> dict[str, int | str]:
                 except wordpress_seo.MetadataSyncError as exc:
                     result = wordpress_publisher._metadata_failure(None, None, exc)
                 else:
-                    featured_id, image_meta = upload_image(
-                        item.get('image_url'),
-                        title=item['title'],
-                        hashtags=item.get('hashtags', ''),
-                        article=item,
-                    )
-                    image = None
-                    if featured_id:
-                        image = PublicationImage(
-                            external_id=featured_id,
-                            metadata=image_meta,
-                        )
-                    result = wordpress_publisher.publish(article, image, context)
+                    guard = PublicationDuplicateGuard(raw_id, mode=DUPLICATE_ENFORCEMENT_MODE)
+                    try:
+                        with guard.hold():
+                            guard.check()
+                            if guard.enabled:
+                                context = replace(context, pre_create_duplicate_guard=guard.check)
+                            featured_id, image_meta = upload_image(
+                                item.get('image_url'),
+                                title=item['title'],
+                                hashtags=item.get('hashtags', ''),
+                                article=item,
+                            )
+                            image = None
+                            if featured_id:
+                                image = PublicationImage(external_id=featured_id, metadata=image_meta)
+                            result = wordpress_publisher.publish(article, image, context)
+                    except PublicationDuplicateRejected as exc:
+                        try:
+                            if raw_id is None or not publication_repository.reject_duplicate(rich_id, raw_id, exc.decision):
+                                raise RuntimeError('duplicate disposition ownership was lost')
+                            duplicate_counts['duplicates_rejected'] += 1
+                        except Exception as error:
+                            logger.error('[DUPLICATE-PUBLISH] rich_article_id=%s stage=pre_publish decision=disposition_failed error_type=%s', rich_id, type(error).__name__)
+                            failed += 1
+                        continue
+                    except PublicationDuplicateUnavailable as exc:
+                        try:
+                            if exc.code == 'prior_publication_unresolved':
+                                if not publication_repository.defer_legacy_manual_reconciliation(rich_id):
+                                    raise RuntimeError('duplicate guard manual review could not be saved')
+                            duplicate_counts['duplicate_guard_deferred'] += 1
+                            logger.warning('[DUPLICATE-PUBLISH] rich_article_id=%s stage=pre_publish decision=defer code=%s', rich_id, exc.code)
+                        except Exception as error:
+                            logger.error('[DUPLICATE-PUBLISH] rich_article_id=%s decision=deferral_failed error_type=%s', rich_id, type(error).__name__)
+                            failed += 1
+                        continue
+                    finally:
+                        if guard.enabled and guard.decision is not None:
+                            for name, count in guard.decision.counters.items():
+                                if name in DUPLICATE_COUNTER_NAMES:
+                                    duplicate_counts[name] += count
             if result.success:
                 mark_news_as_published(item['news_url'])
                 succeeded += 1
@@ -2248,6 +2294,7 @@ def publish_news_to_wp() -> dict[str, int | str]:
             "attempted": len(news_items),
             "succeeded": succeeded,
             "failed": failed,
+            **duplicate_counts,
         }
 
     finally:
