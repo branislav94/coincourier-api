@@ -41,31 +41,43 @@ The verbose block came from `_upload_prepared_image`: it sent the entire
 provider credit plus the CC BY change notice to both WordPress attachment
 `caption` and `description`. Required media metadata is deliberately not clipped,
 so the caption contained every raw File/Artist/Credit/Source/License field. No
-credit is injected into the article body. The repository contains no theme
-template; the reported live placement is consistent with rendering this caption,
-but the remote template itself was not inspected.
+credit is injected into the article body.
 
-The publisher now sends a single inline HTML caption for Wikimedia/Openverse CC
+The first compact-caption implementation generated `<a href="...">` markup.
+The supplied DEV evidence shows those tags displayed literally. This repository
+contains the REST writer, but no CoinCourier article renderer: no WordPress
+theme/PHP templates, React/Next components, or media-caption consumer. The only
+tracked JavaScript-related code is an unrelated Apps Script PDF receiver and its
+test. The backend posts the caption unchanged and checks HTTP success; it does
+not read back `caption.raw`/`caption.rendered`. Consequently this checkout cannot
+identify whether the downstream text conversion occurs in WordPress, a theme,
+React or another service. No external renderer change is inferred or attempted.
+
+The publisher now sends a single **plain-text** caption for Wikimedia/Openverse CC
 assets, built from the actual structured work title, creator, source, license
 version and required notices. A typical visible result is:
 
 > Photo: Paul Williamson · “Solana blockchain illustration” · Wikimedia Commons · CC BY 2.0 · Cropped
 
-The supplied title links to the source, the exact license label links to its
-validated license URL, and a supplied safe creator URI links the creator name.
-Additional required credit parties, copyright/custom notices and credit URIs are
-preserved as concise text and `Credit details` links. Only exact `Own work` or
-duplicate creator/title boilerplate is omitted. No raw audit field labels,
-internal identity keys or long visible URLs are generated.
+The caption string itself contains the human-readable creator, supplied title,
+provider label, exact license name/version and crop indicator, plus required
+plain-text notices. It requires no HTML interpretation. It contains no tags,
+`href`/`rel` attributes, raw HTTP URLs, raw audit field labels or internal identity
+keys. Only exact `Own work` or duplicate creator/title boilerplate is omitted.
+CC BY custom credit that cannot be represented completely in this compact text
+fails closed; a required additional credit URI is not silently discarded.
 
 The full provider original remains in `provider_attribution_text`. Full
 `credit_text` and `attribution_text` retain that original plus the existing CC BY
 cropping/resizing notice, and still follow the existing usage/persistence path.
 The attachment `description` retains the complete audit text in safely encoded
-HTML: `html.escape(html.unescape(full_audit), quote=False)`. Existing escaped
-Commons text is not double escaped, and raw provider HTML cannot execute. The
-compact caption uses only escaped text and formatter-generated safe links;
-provider markup and event attributes are never copied into it.
+HTML, including the validated source/license URLs and supplied credit details.
+Any missing structural attribution facts are added to the description rather
+than to the public caption; the original provider metadata stays unchanged.
+Existing escaped Commons text is not double escaped, and raw provider HTML cannot
+execute. The caption uses normalized readable text, including real Unicode
+punctuation and ampersands rather than HTML entities. Encoded HTML/script input
+is never reactivated as caption markup.
 
 Supplied titles are retained for every CC BY version, including 2.0, 2.5 and 3.0.
 This follows the title/credit conditions in CC BY
@@ -91,3 +103,18 @@ environment setting. Featured-media assignment, title/slug/status/scheduling,
 Yoast, identity and reuse recording retain their existing contracts. These are
 local code/test changes only; no push, deployment or live metadata rewrite is
 authorized or performed.
+
+## Historical media and future clickable credits
+
+This change affects newly prepared media only. Historical WordPress attachments
+retain their existing raw-audit or HTML-anchor captions. There is no automatic
+backfill, cache reset or migration. Historical cleanup needs a separately
+controlled WP Admin operation or one-time backfill.
+
+Clickable attribution would require work in the actual frontend repository after
+identifying its media-field contract. Prefer exposing validated structured credit
+fields and constructing safe, framework-escaped links. If HTML is used, the
+platform's approved sanitizer must allow only the necessary safe anchors and
+attributes. Never render arbitrary audit HTML or parse an audit string into a
+new public data contract. The current release depends on neither that frontend
+change nor an HTML-capable caption renderer.

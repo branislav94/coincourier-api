@@ -782,6 +782,8 @@ class AttributionFlowTests(unittest.TestCase):
         self.assertNotEqual(caption, published)
         for expected in ("Example Artist", "Example Work", "CC BY 4.0", "Cropped"):
             self.assertIn(expected, caption)
+        for forbidden in ("<", ">", "href=", "rel=", "https://", "http://"):
+            self.assertNotIn(forbidden, caption)
         self.assertNotIn("Provider required notice.", caption)
         self.assertEqual(post.call_args.kwargs["json"]["description"], published)
         self.assertEqual(metadata["provider_attribution_text"], original)
@@ -982,6 +984,8 @@ class AttributionFlowTests(unittest.TestCase):
         self.assertNotEqual(payload["caption"], payload["description"])
         for expected in (raw["title"], raw["creator"], "CC BY 4.0", "Cropped"):
             self.assertIn(expected, payload["caption"])
+        for forbidden in ("<", ">", "href=", "rel=", "https://", "http://"):
+            self.assertNotIn(forbidden, payload["caption"])
         for expected in (
             raw["title"],
             raw["creator"],

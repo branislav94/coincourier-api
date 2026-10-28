@@ -1247,6 +1247,8 @@ class PublisherRoutingTests(unittest.TestCase):
         self.assertNotEqual(payload["caption"], attribution)
         for expected in (raw["title"], raw["creator"], "CC BY 4.0", "Cropped"):
             self.assertIn(expected, payload["caption"])
+        for forbidden in ("<", ">", "href=", "rel=", "https://", "http://"):
+            self.assertNotIn(forbidden, payload["caption"])
         for expected in (
             raw["title"],
             raw["creator"],

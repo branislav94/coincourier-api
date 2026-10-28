@@ -69,6 +69,13 @@ def metadata(version="2.0"):
 
 
 class PublicAttributionTests(unittest.TestCase):
+    def assert_plain_caption(self, caption):
+        self.assertEqual(Caption(caption).tags, [])
+        for forbidden in ("<", ">", "href=", "rel=", "http://", "https://", "//", "www.", "&lt;", "&gt;", "&amp;",
+                          "File:", "Artist:", "Credit:", "Attribution:", "Source:", "License:", "Changes:",
+                          "wikimedia:", "openverse:", "identity_aliases"):
+            self.assertNotIn(forbidden, caption)
+
     def upload(self, selected):
         response = Mock()
         with (
@@ -84,15 +91,12 @@ class PublicAttributionTests(unittest.TestCase):
         original = item.attribution_text
         (media_id, result), payload, _upload = self.upload(prepared(item))
         self.assertEqual(media_id, 77)
-        view = Caption(payload["caption"])
-        self.assertIn("Paul Williamson", view.text)
-        self.assertIn(TITLE, view.text)
-        self.assertIn("Wikimedia Commons", view.text)
-        self.assertIn("CC BY 2.0", view.text)
-        self.assertIn("Cropped", view.text)
-        self.assertIn("Please credit Paul Williamson", view.text)
-        self.assertIn(SOURCE, view.links)
-        self.assertIn(item.license_url, view.links)
+        caption = payload["caption"]
+        self.assert_plain_caption(caption)
+        for component in ("Paul Williamson", TITLE, "Wikimedia Commons", "CC BY 2.0", "Cropped", "Please credit Paul Williamson"):
+            self.assertIn(component, caption)
+        self.assertIn(SOURCE, html.unescape(payload["description"]))
+        self.assertIn(item.license_url, html.unescape(payload["description"]))
         self.assertNotEqual(payload["caption"], payload["description"])
         self.assertEqual(html.unescape(payload["description"]), html.unescape(original + CHANGE_NOTICE))
         self.assertEqual(result["provider_attribution_text"], original)
@@ -103,54 +107,56 @@ class PublicAttributionTests(unittest.TestCase):
 
     def test_public_caption_does_not_show_audit_labels_urls_or_internal_identities(self):
         (_media_id, _result), payload, _upload = self.upload(prepared(wikimedia()))
-        text = Caption(payload["caption"]).text
-        for value in ("File:", "Artist:", "Credit:", "Source:", "License:", "Changes:", "https://", "http://", "wikimedia:11"):
-            self.assertNotIn(value, text)
-        self.assertNotIn("identity_aliases", payload["caption"])
+        self.assert_plain_caption(payload["caption"])
 
     def test_old_cc_by_versions_preserve_supplied_title_and_exact_license(self):
         for version in ("2.0", "2.5", "3.0", "4.0"):
             with self.subTest(version=version):
                 item = wikimedia(version)
-                caption, _description = build_public_attribution(prepared(item)[2], item.attribution_text + CHANGE_NOTICE)
-                view = Caption(caption)
-                self.assertIn(TITLE, view.text)
-                self.assertIn(f"CC BY {version}", view.text)
-                self.assertIn(item.license_url, view.links)
+                caption, description = build_public_attribution(prepared(item)[2], item.attribution_text + CHANGE_NOTICE)
+                self.assert_plain_caption(caption)
+                self.assertIn(TITLE, caption)
+                self.assertIn(f"CC BY {version}", caption)
+                self.assertIn(item.license_url, html.unescape(description))
+                self.assertIn(SOURCE, html.unescape(description))
 
     def test_real_structured_creator_name_does_not_display_embedded_creator_url(self):
         item = wikimedia()
         self.assertIn("https://creator.example/paul", item.creator_name)
         values = prepared(item)[2]
         self.assertEqual(values["creator_display_name"], "Paul Williamson")
-        caption, _description = build_public_attribution(values, item.attribution_text + CHANGE_NOTICE)
-        self.assertNotIn("https://", Caption(caption).text)
-        self.assertIn("Paul Williamson", Caption(caption).text)
-        self.assertIn("https://creator.example/paul", Caption(caption).links)
+        caption, description = build_public_attribution(values, item.attribution_text + CHANGE_NOTICE)
+        self.assert_plain_caption(caption)
+        self.assertIn("Paul Williamson", caption)
+        self.assertIn("https://creator.example/paul", html.unescape(description))
 
-    def test_notice_uri_sharing_source_prefix_is_preserved_as_its_own_link(self):
+    def test_required_custom_uri_cannot_be_silently_removed_for_plain_caption(self):
         values = metadata()
         values["provider"] = "openverse"
         values["source_page_url"] = "https://source.example/work"
-        values["attribution_notice"] = "Please credit here https://source.example/work/credits."
-        caption, _description = build_public_attribution(values, "Complete required credit")
-        view = Caption(caption)
-        self.assertIn("https://source.example/work/credits", view.links)
-        self.assertIn("Please credit here", view.text)
-        self.assertNotIn("/credits", view.text)
+        for uri in ("https://source.example/work/credits", "//archive.example/credit", "www.archive.example/credit",
+                    "https&#58;//archive.example/credit"):
+            with self.subTest(uri=uri):
+                values["attribution_notice"] = "Please credit here " + uri
+                full = "Complete required credit. " + values["attribution_notice"]
+                with self.assertRaises(media.MediaMetadataError) as caught:
+                    build_public_attribution(values, full)
+                self.assertEqual(caught.exception.reason, "attribution_missing")
+                self.assertIn(uri, full)
 
-    def test_source_urls_remain_links_without_giant_visible_url_text(self):
+    def test_source_urls_remain_in_description_without_giant_visible_url_text(self):
         values = metadata()
         values["provider"] = "openverse"
         values["source_page_url"] = "https://source.example/" + "long-source-path-" * 100
-        caption, _description = build_public_attribution(values, "Complete credit")
-        view = Caption(caption)
-        self.assertIn(values["source_page_url"], view.links)
-        self.assertNotIn("long-source-path", view.text)
-        self.assertNotIn("https://", view.text)
+        caption, description = build_public_attribution(values, "Complete credit")
+        self.assert_plain_caption(caption)
+        self.assertIn(values["source_page_url"], html.unescape(description))
+        self.assertIn(values["license_url"], html.unescape(description))
+        self.assertNotIn("long-source-path", caption)
 
     def test_supplied_unrepresentable_title_fails_closed_instead_of_disappearing(self):
-        for title in ("https://source.example/work-title", "Map at https://title.example/reference", "<script>supplied-title</script>", "File:"):
+        for title in ("https://source.example/work-title", "Map at https://title.example/reference", "<script>supplied-title</script>",
+                      "File:", "Value > cost", "Artist: supplied title", "wikimedia:11", "www.example.org/title", "//example.org/title"):
             with self.subTest(title=title):
                 values = metadata()
                 values["work_title"] = title
@@ -164,22 +170,23 @@ class PublicAttributionTests(unittest.TestCase):
         caption, description = build_public_attribution(values, full)
         self.assertGreater(len(full), 1000)
         self.assertEqual(html.unescape(description), html.unescape(full))
-        self.assertNotIn("Provider audit provenance", Caption(caption).text)
+        self.assert_plain_caption(caption)
+        self.assertNotIn("Provider audit provenance", caption)
 
     def test_required_custom_credit_and_copyright_notice_are_preserved(self):
         item = wikimedia(notice="© 2020 Paul Williamson and Museum Trust. Please credit Museum Trust.", credit="Museum Trust archive")
         caption, description = build_public_attribution(prepared(item)[2], item.attribution_text + CHANGE_NOTICE)
-        text = Caption(caption).text
-        self.assertIn("© 2020 Paul Williamson and Museum Trust", text)
-        self.assertIn("Please credit Museum Trust", text)
-        self.assertIn("Museum Trust archive", text)
+        self.assert_plain_caption(caption)
+        self.assertIn("© 2020 Paul Williamson and Museum Trust", caption)
+        self.assertIn("Please credit Museum Trust", caption)
+        self.assertIn("Museum Trust archive", caption)
         self.assertIn("Museum Trust", html.unescape(description))
 
     def test_unrepresentable_custom_credit_is_rejected_not_truncated(self):
         values = metadata()
         values["attribution_notice"] = "Required named party and notice. " * 30
         with self.assertRaises(media.MediaMetadataError) as caught:
-            build_public_attribution(values, "Complete provider credit")
+            build_public_attribution(values, "Complete provider credit. " + values["attribution_notice"])
         self.assertEqual(caught.exception.reason, "attribution_too_large")
 
     def test_html_is_safe_in_caption_and_complete_attachment_description(self):
@@ -187,25 +194,32 @@ class PublicAttributionTests(unittest.TestCase):
         values["creator_display_name"] = 'Paul<img src=x onerror="steal()"> &amp; Team'
         values["work_title"] = '<script>steal()</script>Solana <b>blockchain</b>'
         values["attribution_notice"] = '© 2020 Paul <img src=x onerror="steal()"> and Team'
-        full = '<a href="https://source.example/work">Required credit</a><script>steal()</script><img src=x onerror="steal()">' + CHANGE_NOTICE
+        full = '<a href="https://source.example/work">Required credit</a><script>steal()</script><img src=x onerror="steal()"> © 2020 Paul and Team' + CHANGE_NOTICE
         caption, description = build_public_attribution(values, full)
-        view = Caption(caption)
-        self.assertEqual({tag for tag, _attrs in view.tags}, {"a"})
-        self.assertNotIn("steal()", view.text)
-        self.assertIn("Paul", view.text)
+        self.assert_plain_caption(caption)
+        self.assertNotIn("steal()", caption)
+        self.assertIn("Paul & Team", caption)
+        self.assertIn("Solana blockchain", caption)
+        self.assertIn("© 2020 Paul and Team", caption)
         self.assertEqual(Caption(description).tags, [])
-        self.assertEqual(html.unescape(description), html.unescape(full))
-        self.assertTrue(all(not any(name.startswith("on") for name in attrs) for _tag, attrs in view.tags))
+        self.assertTrue(html.unescape(description).startswith(html.unescape(full)))
+        self.assertIn(SOURCE, html.unescape(description))
+        self.assertIn(values["license_url"], html.unescape(description))
 
     def test_encoded_markup_is_not_reactivated_and_commons_text_is_not_double_escaped(self):
         values = metadata()
-        values["creator_display_name"] = "Paul &amp; Team"
-        full = "Paul &amp; Team &lt;img src=x onerror=bad&gt; Source: https://source.example/work"
-        caption, description = build_public_attribution(values, full)
-        self.assertIn("Paul &amp; Team", caption)
-        self.assertNotIn("&amp;amp;", description)
-        self.assertEqual(Caption(description).tags, [])
-        self.assertEqual(html.unescape(description), html.unescape(full))
+        for creator in ("Paul &amp; Team &lt;img src=x onerror=bad&gt;", "Paul &amp;amp; Team &amp;lt;script&amp;gt;bad&amp;lt;/script&amp;gt;"):
+            with self.subTest(creator=creator):
+                values["creator_display_name"] = creator
+                full = "Paul &amp; Team &lt;img src=x onerror=bad&gt; Source: https://source.example/work"
+                caption, description = build_public_attribution(values, full)
+                self.assert_plain_caption(caption)
+                self.assertIn("Paul & Team", caption)
+                self.assertNotIn("onerror", caption)
+                self.assertNotIn("bad", caption)
+                self.assertNotIn("&amp;amp;", description)
+                self.assertEqual(Caption(description).tags, [])
+                self.assertTrue(html.unescape(description).startswith(html.unescape(full)))
 
     def test_invalid_source_or_license_link_fails_closed(self):
         for field, value in (("source_page_url", "javascript:alert(1)"), ("source_page_url", "http://127.0.0.1/work"),
@@ -241,9 +255,11 @@ class PublicAttributionTests(unittest.TestCase):
         assert item is not None
         self.assertTrue(item.metadata["attribution_authoritative"])
         (_media_id, result), payload, _upload = self.upload(prepared(item))
-        self.assertIn("Archive Museum", Caption(payload["caption"]).text)
-        self.assertIn(TITLE, Caption(payload["caption"]).text)
-        self.assertIn(source, Caption(payload["caption"]).links)
+        self.assert_plain_caption(payload["caption"])
+        self.assertIn("Archive Museum", payload["caption"])
+        self.assertIn(TITLE, payload["caption"])
+        self.assertIn(source, html.unescape(payload["description"]))
+        self.assertIn(license_url, html.unescape(payload["description"]))
         self.assertEqual(result["provider_attribution_text"], authoritative)
 
     def test_unknown_creator_without_representable_party_fails_closed(self):
@@ -270,9 +286,11 @@ class PublicAttributionTests(unittest.TestCase):
                 values = metadata()
                 values.update(license_name=name, license_version="1.0", license_url=url, creator_name="", creator_display_name="")
                 caption, description = build_public_attribution(values, "Full public-domain provider audit")
-                self.assertIn(name.upper(), Caption(caption).text)
-                self.assertIn(url, Caption(caption).links)
-                self.assertEqual(description, "Full public-domain provider audit")
+                self.assert_plain_caption(caption)
+                self.assertIn(name.upper(), caption)
+                self.assertIn(url, html.unescape(description))
+                self.assertIn(SOURCE, html.unescape(description))
+                self.assertTrue(description.startswith("Full public-domain provider audit"))
 
     def test_public_domain_long_optional_credits_do_not_reject_valid_asset(self):
         for name, url in (("cc0", "https://creativecommons.org/publicdomain/zero/1.0/"), ("pdm", "https://creativecommons.org/publicdomain/mark/1.0/")):
@@ -287,18 +305,68 @@ class PublicAttributionTests(unittest.TestCase):
                 values["credit_text"] = values["attribution_text"] = full
                 (media_id, result), payload, _upload = self.upload((b"image", "public-domain.jpg", values))
                 self.assertEqual(media_id, 77)
-                view = Caption(payload["caption"])
-                self.assertIn(SOURCE, view.links)
-                self.assertIn(url, view.links)
-                self.assertIn(name.upper(), view.text)
-                self.assertNotIn("Long optional", view.text)
+                self.assert_plain_caption(payload["caption"])
+                self.assertIn(SOURCE, html.unescape(payload["description"]))
+                self.assertIn(url, html.unescape(payload["description"]))
+                self.assertIn(name.upper(), payload["caption"])
+                self.assertNotIn("Long optional", payload["caption"])
                 self.assertEqual(result["provider_attribution_text"], full)
                 self.assertEqual(result["attribution_text"], full)
-                self.assertEqual(html.unescape(payload["description"]), html.unescape(full))
+                self.assertTrue(html.unescape(payload["description"]).startswith(html.unescape(full)))
         values = metadata()
         values.update(license_name="cc0", license_url="https://creativecommons.org/publicdomain/zero/1.0/", work_title="Map at https://title.example/reference")
-        caption, _description = build_public_attribution(values, "Complete public-domain audit")
-        self.assertIn(SOURCE, Caption(caption).links)
+        caption, description = build_public_attribution(values, "Complete public-domain audit")
+        self.assert_plain_caption(caption)
+        self.assertIn(SOURCE, html.unescape(description))
+
+    def test_frontend_rendering_caption_as_strict_text_displays_clean_credit(self):
+        values = metadata()
+        values.update(creator_name="edwinchuen", creator_display_name="edwinchuen",
+                      work_title="Bitcoin Cryptocurrency Laws & Regulations")
+        full = f"Bitcoin Cryptocurrency Laws &amp; Regulations. Artist: edwinchuen. Source: {SOURCE}. License: CC BY 2.0 ({values['license_url']})"
+        values["credit_text"] = values["attribution_text"] = full
+        (media_id, result), payload, _upload = self.upload((b"photo", "bitcoin.jpg", values))
+        expected = "Photo: edwinchuen · “Bitcoin Cryptocurrency Laws & Regulations” · Wikimedia Commons · CC BY 2.0 · Cropped"
+        self.assertEqual(media_id, 77)
+        self.assertEqual(payload["caption"], expected)
+        self.assertEqual(str(payload["caption"]), expected)
+        self.assertEqual(result["public_attribution_caption"], expected)
+        self.assert_plain_caption(expected)
+        self.assertEqual(result["credit_text"], full + CHANGE_NOTICE)
+        self.assertEqual(result["attribution_text"], full + CHANGE_NOTICE)
+        self.assertEqual(result["provider_attribution_text"], full)
+        self.assertEqual(html.unescape(payload["description"]), html.unescape(full + CHANGE_NOTICE))
+
+    def test_required_notice_must_already_be_retained_in_complete_audit(self):
+        values = metadata()
+        values["attribution_notice"] = "Please credit the Archive Foundation."
+        with self.assertRaises(media.MediaMetadataError) as caught:
+            build_public_attribution(values, "Unrelated complete credit")
+        self.assertEqual(caught.exception.reason, "attribution_missing")
+
+    def test_structural_uri_within_required_notice_preserves_plain_notice_and_full_uri(self):
+        values = metadata()
+        values["attribution_notice"] = f"Please credit Paul {SOURCE} here."
+        full = "Complete credit. " + values["attribution_notice"]
+        caption, description = build_public_attribution(values, full)
+        self.assert_plain_caption(caption)
+        self.assertIn("Please credit Paul here", caption)
+        self.assertIn(values["attribution_notice"], html.unescape(description))
+
+    def test_missing_standard_uris_are_retained_exactly_not_by_prefix_match(self):
+        values = metadata()
+        values.update(provider="openverse", source_page_url="https://source.example/work")
+        full = f"Source: {values['source_page_url']}/other. License: {values['license_url']}deed.en"
+        caption, description = build_public_attribution(values, full)
+        self.assert_plain_caption(caption)
+        self.assertIn("\nSource: https://source.example/work\n", html.unescape(description))
+        self.assertIn(f"\nLicense: CC BY 2.0 ({values['license_url']})", html.unescape(description))
+
+    def test_description_additions_cannot_bypass_complete_audit_size_bound(self):
+        values = metadata()
+        with self.assertRaises(media.MediaMetadataError) as caught:
+            build_public_attribution(values, "x" * 16380)
+        self.assertEqual(caught.exception.reason, "attribution_too_large")
 
     def test_generated_images_have_no_false_cc_crop_caption(self):
         (media_id, result), payload, _upload = self.upload((b"generated", "grok.jpg", {"provider": "grok-image", "credit_text": ""}))
