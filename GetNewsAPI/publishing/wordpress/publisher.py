@@ -2176,7 +2176,7 @@ def publish_news_to_wp() -> dict[str, int | str]:
         succeeded = 0
         failed = 0
         duplicate_counts = {}
-        if DUPLICATE_ENFORCEMENT_MODE == "enforce":
+        if DUPLICATE_ENFORCEMENT_MODE != "off":
             duplicate_counts = {
                 "duplicates_rejected": 0, "duplicate_guard_deferred": 0,
                 **dict.fromkeys(DUPLICATE_COUNTER_NAMES, 0),
@@ -2237,7 +2237,7 @@ def publish_news_to_wp() -> dict[str, int | str]:
                     try:
                         with guard.hold():
                             guard.check()
-                            if guard.enabled:
+                            if guard.mode != "off":
                                 context = replace(context, pre_create_duplicate_guard=guard.check)
                             featured_id, image_meta = upload_image(
                                 item.get('image_url'),
@@ -2270,7 +2270,7 @@ def publish_news_to_wp() -> dict[str, int | str]:
                             failed += 1
                         continue
                     finally:
-                        if guard.enabled and guard.decision is not None:
+                        if guard.mode != "off" and guard.decision is not None:
                             for name, count in guard.decision.counters.items():
                                 if name in DUPLICATE_COUNTER_NAMES:
                                     duplicate_counts[name] += count

@@ -115,12 +115,13 @@ class SemanticConfirmationIntegrationTests(unittest.TestCase):
         self.assertEqual(result.counters["semantic_candidates_promoted"], 0)
         self.assertIn("new_numeric_value", result.audit["candidate_audits"][201]["new_fact_codes"])
 
-    def test_inferred_same_event_without_provider_event_id_cannot_be_promoted(self):
+    def test_strong_structured_same_event_without_provider_id_is_confirmed_after_vector_retrieval(self):
         current, prior = source(100, event_id=None), source(201, prior=True, event_id=None)
         result, _repo = self.assess(current, prior, candidates=(semantic_candidate(distance=0.000001),))
-        self.assertFalse(result.reject)
+        self.assertTrue(result.reject)
         self.assertFalse(result.audit["candidate_audits"][201]["same_event_id"])
-        self.assertEqual(result.counters["semantic_candidates_promoted"], 0)
+        self.assertEqual(result.audit["candidate_audits"][201]["event_identity_source"], "structured_cross_source")
+        self.assertEqual(result.counters["semantic_candidates_promoted"], 1)
 
     def test_missing_vectors_do_not_disable_direct_duplicate_confirmation(self):
         current, prior = source(100), source(201, prior=True)

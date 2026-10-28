@@ -1,7 +1,8 @@
-"""Serialize duplicate validation through the external publication boundary."""
+"""Observe duplicate policy or serialize enforcement at publication."""
 from __future__ import annotations
 
 from contextlib import ExitStack, contextmanager
+import logging
 from typing import Any, Callable, Iterator
 
 import config
@@ -11,6 +12,9 @@ from operations.models import DatabaseTarget
 from repositories.duplicate_assessments import DuplicateAssessmentRepository
 
 from .enforcement import DuplicateDecision, assess_duplicate_enforcement
+
+
+logger = logging.getLogger(__name__)
 
 
 class PublicationDuplicateRejected(RuntimeError):
@@ -27,12 +31,13 @@ class PublicationDuplicateUnavailable(RuntimeError):
 
 
 class PublicationDuplicateGuard:
-    """One application-DB mutex spans recheck, media, CREATE and ID persistence.
+    """Enforcement holds one DB mutex through checks, media, CREATE and persistence.
 
     The additional conflict group also protects callers bypassing the ordinary
     one-shot job lock. A global publication mutex covers identical content with
     different or missing event IDs as well as shared provider-event identities.
     No SQL transaction remains open across image or WordPress network work.
+    Shadow evaluates the same policy without acquiring this mutex or rejecting.
     """
 
     def __init__(
@@ -92,11 +97,11 @@ class PublicationDuplicateGuard:
                 self._held = False
 
     def check(self) -> None:
-        if not self.enabled:
+        if self.mode == "off":
             return
-        if not self._held:
+        if self.enabled and not self._held:
             raise PublicationDuplicateUnavailable("duplicate_publication_lock_not_held")
-        if self._connection is not None:
+        if self.enabled and self._connection is not None:
             cursor = None
             try:
                 cursor = self._connection.cursor()
@@ -112,10 +117,23 @@ class PublicationDuplicateGuard:
                         cursor.close()
                     except mysql.connector.Error:
                         raise PublicationDuplicateUnavailable("duplicate_publication_lock_lost") from None
-        self.decision = assess_duplicate_enforcement(
-            {"id": self.raw_article_id}, stage="pre_publish", mode="enforce",
-            repository=self.repository,
-        )
+        try:
+            self.decision = assess_duplicate_enforcement(
+                {"id": self.raw_article_id}, stage="pre_publish", mode=self.mode,
+                repository=self.repository,
+            )
+        except Exception as error:
+            if self.mode != "shadow":
+                raise
+            self.decision = None
+            logger.warning(
+                "[DUPLICATE-POLICY] article_id=%s stage=pre_publish mode=shadow "
+                "decision=would_continue reason=assessment_unavailable error_type=%s",
+                self.raw_article_id, type(error).__name__,
+            )
+            return
+        if self.mode == "shadow":
+            return
         if not self.decision.available:
             code = self.decision.error if self.decision.error == "prior_publication_unresolved" else "duplicate_assessment_unavailable"
             raise PublicationDuplicateUnavailable(code, self.decision)

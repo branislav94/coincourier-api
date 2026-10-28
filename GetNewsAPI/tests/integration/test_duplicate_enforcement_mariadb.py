@@ -130,10 +130,11 @@ class DuplicateEnforcementMariaDBTests(unittest.TestCase):
             INSERT INTO cryptonewsapi
                 (id,news_id,event_id,news_url,title,full_text,publish_date,source_name,
                  processed,processing_status,chosen_for_publish,scheduled_for,selected_at)
-            VALUES (%s,%s,'alpenglow-activation-20261028',%s,%s,%s,UTC_TIMESTAMP(),
-                    'Synthetic independent outlet',%s,%s,1,TIMESTAMPADD(MINUTE,-1,UTC_TIMESTAMP()),UTC_TIMESTAMP())
-        """, (raw_id, f"source-{raw_id}", f"https://source.example/{raw_id}",
-               "Solana Alpenglow mainnet activation", body, int(processed), "completed" if processed else "pending"))
+            VALUES (%s,%s,%s,%s,%s,%s,UTC_TIMESTAMP(),
+                    %s,%s,%s,1,TIMESTAMPADD(MINUTE,-1,UTC_TIMESTAMP()),UTC_TIMESTAMP())
+        """, (raw_id, f"source-{raw_id}", f"different-provider-event-{raw_id}", f"https://source.example/{raw_id}",
+               "Solana Alpenglow mainnet activation", body, f"Synthetic independent outlet {raw_id}",
+               int(processed), "completed" if processed else "pending"))
 
     def seed_rich(self, rich_id, raw_id, *, published=False):
         _execute("""
@@ -147,7 +148,7 @@ class DuplicateEnforcementMariaDBTests(unittest.TestCase):
                "https://coincourier.example/canonical/901" if published else None,
                "2026-10-28 12:00:00" if published else None))
 
-    def test_real_named_lock_allows_one_post_and_terminal_duplicate_for_concurrent_workers(self):
+    def test_real_named_lock_allows_one_post_for_concurrent_cross_source_workers(self):
         for raw_id in (10, 20):
             self.seed_source(raw_id, processed=True)
             self.seed_rich(raw_id + 100, raw_id)
@@ -182,6 +183,8 @@ class DuplicateEnforcementMariaDBTests(unittest.TestCase):
         self.assertEqual(audit["stage"], "pre_publish")
         self.assertEqual(audit["decision"], "reject_duplicate")
         self.assertEqual(audit["canonical_wp_id"], cms.posts[0])
+        self.assertEqual(audit["event_identity_source"], "structured_cross_source")
+        self.assertFalse(audit["same_event_id"])
 
     def test_raw_claim_duplicate_audit_and_terminal_disposition_prevent_reacquisition(self):
         self.seed_source(10, processed=True)
@@ -208,8 +211,38 @@ class DuplicateEnforcementMariaDBTests(unittest.TestCase):
         self.assertEqual(audit["decision"], "reject_duplicate")
         self.assertEqual(audit["canonical_raw_id"], 10)
         self.assertEqual(audit["canonical_wp_id"], 901)
-        self.assertEqual(audit["event_id"], "alpenglow-activation-20261028")
+        self.assertEqual(audit["event_id"], "different-provider-event-20")
+        self.assertEqual(audit["event_identity_source"], "structured_cross_source")
         self.assertEqual(len(_rows("SELECT id FROM rich_crpytonews")), 1)
+
+    def test_shadow_persists_cross_source_would_reject_but_publishes_normally(self):
+        self.seed_source(10, processed=True)
+        self.seed_rich(110, 10, published=True)
+        self.seed_source(20, processed=True)
+        self.seed_rich(120, 20)
+        cms = FakePublisher()
+        def guard(raw_id):
+            return PublicationDuplicateGuard(raw_id, mode="shadow",
+                repository=DuplicateAssessmentRepository(connect=_connect), connection_factory=_connect)
+        service = PublishingService(PublicationRepository(connect=_connect), cms, cms.prepare_image,
+            fresh_start_after=None, duplicate_mode="shadow", duplicate_guard_factory=guard)
+        with patch.dict(config.DB_CONFIG, {"database": DATABASE}):
+            result = service.publish_due(1)
+        self.assertEqual(result["succeeded"], 1)
+        self.assertEqual(result["failed"], 0)
+        self.assertEqual(result["duplicates_rejected"], 0)
+        self.assertEqual(result["shadow_would_reject_duplicates"], 1)
+        self.assertEqual((len(cms.posts), len(cms.media)), (1, 1))
+        states = _rows("SELECT publish_status FROM rich_crpytonews ORDER BY id")
+        self.assertEqual([row["publish_status"] for row in states], ["published", "published"])
+        audit = json.loads(_rows("SELECT reason_json FROM duplicate_assessments WHERE article_id=20 AND candidate_article_id=10")[0]["reason_json"])["enforcement"]
+        self.assertEqual(audit["stage"], "pre_publish")
+        self.assertEqual(audit["mode"], "shadow")
+        self.assertEqual(audit["decision"], "would_reject_duplicate")
+        self.assertEqual(audit["event_identity_source"], "structured_cross_source")
+        self.assertTrue(audit["confirmed_duplicate"])
+        self.assertEqual(audit["canonical_wp_id"], 901)
+        self.assertEqual(_rows("SELECT chosen_for_publish FROM cryptonewsapi WHERE id=20")[0]["chosen_for_publish"], 1)
 
 
 if __name__ == "__main__":

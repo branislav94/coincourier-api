@@ -70,12 +70,12 @@ class PublishingService:
         self.duplicate_guard_factory = duplicate_guard_factory
 
     def publish_due(self, limit: int) -> dict[str, int]:
-        if self.duplicate_mode != "enforce" or limit <= 0:
+        if self.duplicate_mode == "off" or limit <= 0:
             return self._publish_due_locked(limit)
         guard = (self.duplicate_guard_factory or (
             lambda raw_id: PublicationDuplicateGuard(raw_id, mode=self.duplicate_mode)
         ))(None)
-        # Claim while holding the cluster mutex. Otherwise two fresh claims
+        # Enforcement claims while holding the cluster mutex. Two fresh claims
         # could mistake one another for an unresolved external CREATE attempt.
         try:
             with guard.hold():
@@ -90,7 +90,7 @@ class PublishingService:
 
     def _publish_due_locked(self, limit: int, *, duplicate_guard: PublicationDuplicateGuard | None = None) -> dict[str, int]:
         result = {"attempted": 0, "succeeded": 0, "failed": 0}
-        if self.duplicate_mode == "enforce":
+        if self.duplicate_mode != "off":
             result.update(duplicates_rejected=0, duplicate_guard_deferred=0)
             result.update(dict.fromkeys(DUPLICATE_COUNTER_NAMES, 0))
         attempted_rich_ids: set[int] = set()

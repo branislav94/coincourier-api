@@ -21,6 +21,7 @@ if str(PROJECT_DIR) not in sys.path:
 
 import publish_to_wp
 import tasks
+from duplicate_detection.enforcement import DUPLICATE_COUNTER_NAMES
 from image_search.providers.openverse import OpenverseProvider
 from publishing import PublicationArticle, PublicationContext, PublicationImage
 from publishing.wordpress import client, media, publisher, seo, taxonomy
@@ -106,7 +107,9 @@ class CompatibilityTests(unittest.TestCase):
 
         self.assertEqual(
             result,
-            {"status": "success", "attempted": 1, "succeeded": 1, "failed": 0},
+            {"status": "success", "attempted": 1, "succeeded": 1, "failed": 0,
+             "duplicates_rejected": 0, "duplicate_guard_deferred": 0,
+             **dict.fromkeys(DUPLICATE_COUNTER_NAMES, 0)},
         )
         adapter_type.assert_called_once_with()
         published_article, published_image, context = adapter.publish.call_args.args
@@ -140,7 +143,9 @@ class CompatibilityTests(unittest.TestCase):
             result = publish_to_wp.publish_news_to_wp()
         self.assertEqual(
             result,
-            {"status": "failed", "attempted": 1, "succeeded": 0, "failed": 1},
+            {"status": "failed", "attempted": 1, "succeeded": 0, "failed": 1,
+             "duplicates_rejected": 0, "duplicate_guard_deferred": 0,
+             **dict.fromkeys(DUPLICATE_COUNTER_NAMES, 0)},
         )
         mark_published.assert_not_called()
 

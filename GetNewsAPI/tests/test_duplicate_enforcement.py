@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import json
 import unittest
-from unittest.mock import Mock
+from unittest.mock import Mock, patch
 
 from duplicate_detection.enforcement import DuplicateDecision, assess_duplicate_enforcement
 from duplicate_detection.identities import valid_event_id
@@ -233,6 +233,98 @@ class DuplicateEnforcementTests(unittest.TestCase):
         self.assertFalse(result.reject)
         self.assertEqual(result.canonical_raw_id, 1)
         self.assertTrue(repo.saved[0][2]["candidate_audits"][1]["confirmed_duplicate"])
+        self.assertEqual(result.audit["decision"], "would_reject_duplicate")
+        self.assertEqual(result.counters["shadow_would_reject_duplicates"], 1)
+        self.assertEqual(result.counters["same_event_blocks"], 0)
+
+    def test_fomc_shadow_and_enforce_share_classification_and_confirmation_at_both_stages(self):
+        from tests.test_duplicate_cross_source import fomc_source_pair
+
+        prior, current = fomc_source_pair()
+        canonical = {**prior, "processed": 1, "canonical_rich_id": 301,
+                     "canonical_wp_id": 901, "canonical_published": 1,
+                     "canonical_publish_status": "published"}
+        for stage in ("raw", "pre_publish"):
+            with self.subTest(stage=stage), patch(
+                "duplicate_detection.enforcement.assess_relationship", wraps=assess_relationship,
+            ) as shared_policy:
+                decisions = {}
+                for mode in ("shadow", "enforce"):
+                    repo = MemoryRepository(current, [canonical])
+                    with self.assertLogs(level="INFO") as logs:
+                        decisions[mode] = assess_duplicate_enforcement(
+                            current, stage=stage, mode=mode, repository=repo,
+                        )
+                    evidence = decisions[mode].audit["candidate_audits"][prior["id"]]
+                    self.assertEqual(evidence["event_identity_source"], "structured_cross_source")
+                    self.assertTrue(evidence["confirmed_duplicate"])
+                    self.assertFalse(evidence["same_event_id"])
+                    self.assertEqual(evidence["contradiction_flags"], ())
+                    self.assertEqual(evidence["new_fact_flags"], ())
+                    self.assertGreaterEqual(len(evidence["confirmation_anchors"]), 2)
+                    self.assertIn("confirmed_duplicate=true", " ".join(logs.output))
+                    self.assertNotIn(current["full_text"], " ".join(logs.output))
+                shadow, enforced = decisions["shadow"], decisions["enforce"]
+                self.assertEqual(shared_policy.call_count, 2)
+                self.assertEqual(shared_policy.call_args_list[0], shared_policy.call_args_list[1])
+                self.assertEqual(shadow.assessment, enforced.assessment)
+                self.assertFalse(shadow.reject)
+                self.assertTrue(enforced.reject)
+                self.assertEqual(shadow.audit["decision"], "would_reject_duplicate")
+                self.assertEqual(enforced.audit["decision"], "reject_duplicate")
+                self.assertEqual(shadow.counters["shadow_would_reject_duplicates"], 1)
+                self.assertEqual(shadow.counters["same_event_blocks"], 0)
+                self.assertEqual(enforced.counters["same_event_blocks"], 1)
+                self.assertEqual(enforced.counters["shadow_would_reject_duplicates"], 0)
+                self.assertEqual(shadow.counters["cross_source_duplicates_confirmed"], 1)
+
+    def test_fomc_semantic_distance_only_expands_coverage_and_cannot_override_numeric_contradiction(self):
+        from tests.test_duplicate_cross_source import fomc_source_pair
+
+        prior, current = fomc_source_pair()
+        canonical = {**prior, "processed": 1, "canonical_rich_id": 301,
+                     "canonical_wp_id": 901, "canonical_published": 1,
+                     "canonical_publish_status": "published"}
+        for distance in (0.000001, 0.999):
+            with self.subTest(distance=distance):
+                result = assess_duplicate_enforcement(
+                    current, stage="raw", mode="enforce", repository=MemoryRepository(current, [canonical]),
+                    semantic_candidates=({"source_article_id": prior["id"], "native_distance": distance},),
+                )
+                self.assertTrue(result.reject)
+                self.assertEqual(result.counters["semantic_candidates_promoted"], 1)
+                self.assertEqual(result.audit["candidate_audits"][prior["id"]]["semantic_distance"], distance)
+        changed = {**current, "full_text": current["full_text"] + " Bitcoin subsequently falls 15%."}
+        result = assess_duplicate_enforcement(
+            changed, stage="raw", mode="enforce", repository=MemoryRepository(changed, [canonical]),
+            semantic_candidates=({"source_article_id": prior["id"], "native_distance": 0.000001},),
+        )
+        self.assertFalse(result.reject)
+        self.assertEqual(result.counters["material_updates_allowed"], 1)
+        self.assertEqual(result.counters["semantic_candidates_promoted"], 0)
+
+    def test_shadow_material_update_logs_would_continue_with_fact_flags(self):
+        current = source(title="Solana Alpenglow activation completed with 2000 transactions")
+        repo = MemoryRepository(current, [primary(title="Solana Alpenglow activation completed with 1000 transactions")])
+        with self.assertLogs(level="INFO") as logs:
+            result = assess_duplicate_enforcement(current, stage="raw", mode="shadow", repository=repo)
+        self.assertFalse(result.reject)
+        self.assertEqual(result.audit["decision"], "would_continue")
+        self.assertEqual(result.counters["shadow_would_reject_duplicates"], 0)
+        self.assertEqual(result.counters["material_updates_allowed"], 1)
+        self.assertIn("new_numeric_value", " ".join(logs.output))
+        self.assertIn("decision=would_continue", " ".join(logs.output))
+
+    def test_shadow_audit_failure_remains_nonblocking_and_sanitized(self):
+        repo = MemoryRepository(source(), [primary()])
+        repo.fail_save = True
+        with self.assertLogs(level="WARNING") as logs:
+            result = assess_duplicate_enforcement(source(), stage="pre_publish", mode="shadow", repository=repo)
+        self.assertFalse(result.reject)
+        self.assertFalse(result.available)
+        self.assertEqual(result.counters["shadow_would_reject_duplicates"], 0)
+        self.assertIn("decision=would_continue", " ".join(logs.output))
+        self.assertNotIn("secret", " ".join(logs.output))
 
     def test_off_performs_no_reads_or_writes(self):
         repo = Mock()

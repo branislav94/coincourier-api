@@ -8,7 +8,7 @@ import unittest
 from unittest.mock import patch
 
 import gpt_processor
-from duplicate_detection.enforcement import DUPLICATE_COUNTER_NAMES, DuplicateDecision
+from duplicate_detection.enforcement import DUPLICATE_COUNTER_NAMES, DuplicateDecision, assess_duplicate_enforcement
 from operations import jobs
 from operations.models import JobStatus
 from repositories.raw_news import RawNewsRepository
@@ -24,6 +24,24 @@ class SelectionCursor(SQLiteCursor):
 class SelectionConnection(SQLiteConnection):
     def cursor(self, dictionary=False):
         return SelectionCursor(self.database.cursor(), dictionary=dictionary)
+
+
+class PolicyMemoryRepository:
+    def __init__(self, source, candidates):
+        self.source = source
+        self.candidates = candidates
+        self.saved = []
+
+    def load_source_article(self, raw_id):
+        return self.source if self.source["id"] == raw_id else None
+
+    def load_enforcement_candidates(self, _raw_id, **_kwargs):
+        return self.candidates
+
+    def save_assessments(self, raw_id, assessments, *, audit_context):
+        pairs = list(assessments)
+        self.saved.append((raw_id, pairs, audit_context))
+        return len(pairs)
 
 
 class DuplicateProcessingEnforcementTests(unittest.TestCase):
@@ -254,16 +272,104 @@ class DuplicateProcessingEnforcementTests(unittest.TestCase):
         self.assertNotIn("private-body", rendered)
         self.assertNotIn("secret-token", rendered)
 
-    def test_shadow_and_off_preserve_boolean_result_and_original_counter_shape(self):
+    def test_shadow_evaluates_policy_and_off_keeps_original_counter_shape(self):
         for mode in ("shadow", "off"):
             with self.subTest(mode=mode), self.processing(mode=mode, durable=False) as calls:
                 self.assertEqual(gpt_processor.process_news_with_gpt(batch_size=1),
-                                 {"attempted": 1, "succeeded": 1, "failed": 0})
-                calls["assess"].assert_not_called()
+                                 self.counts(attempted=1, succeeded=1, failed=0, duplicates_rejected=0)
+                                 if mode == "shadow" else {"attempted": 1, "succeeded": 1, "failed": 0})
+                self.assertEqual(calls["assess"].call_count, int(mode == "shadow"))
                 self.assertEqual(calls["shadow"].call_count, int(mode == "shadow"))
                 calls["semantic"].assert_called_once()
                 calls["rewrite"].assert_called_once()
                 calls["reject"].assert_not_called()
+
+    def test_shadow_and_enforce_share_real_policy_but_only_enforce_stops_processing(self):
+        raw = {**self.row(), "event_id": "alpenglow-event-20261028",
+               "title": "Solana Alpenglow mainnet activation confirmed",
+               "full_text": "Solana validators activate Alpenglow mainnet on October 28, 2026 with 1000 transactions.",
+               "publish_date": "2026-10-28 12:00:00"}
+        prior = {**raw, "id": 17, "news_url": "https://other.example.invalid/alpenglow",
+                 "title": "Solana Confirms Alpenglow Mainnet Activation",
+                 "full_text": "Alpenglow mainnet activation on Solana occurs on October 28, 2026 with 1000 transactions. Validators confirm the protocol details.",
+                 "source_name": "Other outlet", "processed": 1, "processing_status": "completed",
+                 "canonical_rich_id": 27, "canonical_wp_id": 37, "canonical_published": 1,
+                 "canonical_publish_status": "published"}
+        decisions = []
+        for mode in ("shadow", "enforce"):
+            repository = PolicyMemoryRepository(raw, [prior])
+            def evaluate(selected, **kwargs):
+                decision = assess_duplicate_enforcement(selected, repository=repository, **kwargs)
+                decisions.append(decision)
+                return decision
+            with self.subTest(mode=mode), self.processing(
+                mode=mode, durable=False, semantic=SimpleNamespace(status="not_ready", candidates=()),
+            ) as calls, patch.object(gpt_processor, "VECTOR_ENABLED", True), patch.object(
+                gpt_processor, "SEMANTIC_SHADOW_ENABLED", True,
+            ):
+                calls["assess"].side_effect = evaluate
+                counters = {}
+                result = gpt_processor.process_one(raw, duplicate_counters=counters)
+            self.assertEqual(len(repository.saved), 1)
+            self.assertEqual(repository.saved[0][2]["decision"],
+                             "would_reject_duplicate" if mode == "shadow" else "reject_duplicate")
+            if mode == "shadow":
+                self.assertIs(result, True)
+                for name in ("enrich", "rewrite", "repair", "store", "mark"):
+                    calls[name].assert_called_once()
+                calls["reject"].assert_not_called()
+                self.assertIn("would_reject_duplicate", str(calls["log_info"].call_args_list))
+                self.assertEqual(self.row()["processing_status"], "pending")
+                self.assertEqual(counters["shadow_would_reject_duplicates"], 1)
+                self.assertEqual(counters["fail_open_unavailable_embeddings"], 1)
+                calls["semantic"].assert_called_once()
+            else:
+                self.assertIsInstance(result, gpt_processor.ProcessingDuplicate)
+                self.assert_no_generation(calls)
+                self.assert_terminal_duplicate(attempts=0)
+                calls["semantic"].assert_not_called()
+        self.assertEqual(decisions[0].assessment.assessment_type, decisions[1].assessment.assessment_type)
+        self.assertFalse(decisions[0].reject)
+        self.assertTrue(decisions[1].reject)
+
+    def test_shadow_semantic_candidates_reach_same_policy_without_any_disposition(self):
+        candidate = SimpleNamespace(candidate_source_article_id=17, native_distance=0.001)
+        semantic = SimpleNamespace(candidates=(candidate,))
+        with self.processing(mode="shadow", durable=False, semantic=semantic) as calls:
+            calls["assess"].side_effect = [
+                DuplicateDecision(mode="shadow", article_id=101, counters={"related_events_allowed": 1}),
+                DuplicateDecision(mode="shadow", article_id=101, counters={
+                    "shadow_would_reject_duplicates": 1, "semantic_candidates_evaluated": 1,
+                    "cross_source_duplicates_confirmed": 1,
+                }),
+            ]
+            result = gpt_processor.process_news_with_gpt(batch_size=1)
+        self.assertEqual(calls["assess"].call_count, 2)
+        self.assertEqual(calls["assess"].call_args.kwargs["semantic_candidates"], (candidate,))
+        self.assertEqual(calls["assess"].call_args.kwargs["mode"], "shadow")
+        self.assertEqual(result, self.counts(
+            attempted=1, succeeded=1, failed=0, duplicates_rejected=0,
+            shadow_would_reject_duplicates=1, semantic_candidates_evaluated=1,
+            cross_source_duplicates_confirmed=1,
+        ))
+        calls["rewrite"].assert_called_once()
+        calls["reject"].assert_not_called()
+        calls["complete"].assert_not_called()
+        calls["mark"].assert_called_once()
+
+    def test_shadow_ignores_unavailable_or_erroneously_rejecting_decision(self):
+        for available in (True, False):
+            with self.subTest(available=available), self.processing(
+                mode="shadow", decision=self.decision(available=available),
+            ) as calls:
+                result = gpt_processor.process_news_with_gpt(batch_size=1)
+            self.assertEqual((result["succeeded"], result["failed"], result["duplicates_rejected"]), (1, 0, 0))
+            calls["rewrite"].assert_called_once()
+            calls["reject"].assert_not_called()
+            calls["complete"].assert_called_once()
+            self.database.execute("""UPDATE cryptonewsapi SET processed = 0, processing_status = 'pending'
+                WHERE id = 101""")
+            self.database.commit()
 
     def test_lost_durable_ownership_is_failure_without_false_duplicate_success(self):
         with self.processing(decision=self.decision()) as calls:

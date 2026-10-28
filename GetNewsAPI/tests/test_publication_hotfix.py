@@ -10,6 +10,7 @@ import tempfile
 import unittest
 from unittest.mock import Mock, patch
 
+from duplicate_detection.enforcement import DUPLICATE_COUNTER_NAMES
 from publishing.service import PublishingService
 from publishing.wordpress import publisher
 from repositories.publication import PublicationRepository
@@ -117,7 +118,9 @@ class DurablePublicationHotfixTests(unittest.TestCase):
                            FROM rich_crpytonews ORDER BY id""",
                     ).fetchall()
 
-                self.assertEqual(first, {"attempted": 3, "succeeded": 2, "failed": 1})
+                self.assertEqual(first, {"attempted": 3, "succeeded": 2, "failed": 1,
+                                        "duplicates_rejected": 0, "duplicate_guard_deferred": 0,
+                                        **dict.fromkeys(DUPLICATE_COUNTER_NAMES, 0)})
                 self.assertEqual(http.updates, [5303, 5304, 5305])
                 self.assertEqual(rows[0][:5], (445, 0, "retryable", 32, 5303))
                 self.assertEqual(rows[0][5], f"{WORDPRESS_ORIGIN}/posts/5303/")
@@ -141,7 +144,9 @@ class DurablePublicationHotfixTests(unittest.TestCase):
                                   wp_post_id, wp_post_url, seo_meta
                            FROM rich_crpytonews WHERE id = 445""",
                     ).fetchone()
-                self.assertEqual(second, {"attempted": 1, "succeeded": 1, "failed": 0})
+                self.assertEqual(second, {"attempted": 1, "succeeded": 1, "failed": 0,
+                                         "duplicates_rejected": 0, "duplicate_guard_deferred": 0,
+                                         **dict.fromkeys(DUPLICATE_COUNTER_NAMES, 0)})
                 self.assertEqual(http.updates, [5303, 5304, 5305, 5303])
                 self.assertEqual(state, (1, "published", 33, 5303,
                                         f"{WORDPRESS_ORIGIN}/posts/5303/", PRODUCTION_DESCRIPTION))

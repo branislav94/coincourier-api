@@ -2267,9 +2267,10 @@ def _duplicate_enforcement_fail_open(raw: dict, *, semantic_candidates=(), dupli
         return decision
     except Exception as error:
         logging.warning(
-            "[DUPLICATE-ENFORCE] article_id=%s stage=raw mode=%s "
-            "decision=continue reason=assessment_unavailable error_type=%s",
-            raw.get("id"), DUPLICATE_ENFORCEMENT_MODE, type(error).__name__,
+            "[DUPLICATE-POLICY] article_id=%s stage=raw mode=%s "
+            "decision=%s reason=assessment_unavailable error_type=%s",
+            raw.get("id"), DUPLICATE_ENFORCEMENT_MODE,
+            "would_continue" if DUPLICATE_ENFORCEMENT_MODE == "shadow" else "continue", type(error).__name__,
         )
         return None
 
@@ -2328,27 +2329,27 @@ def process_one(raw, *, mark_complete=True, on_error=None, duplicate_counters=No
             True for stored work, False for failure, or a confirmed duplicate.
     """
     try:
-        if DUPLICATE_ENFORCEMENT_MODE == "enforce":
-            duplicate = _processing_duplicate(
-                raw, _duplicate_enforcement_fail_open(raw, duplicate_counters=duplicate_counters),
-                mark_complete=mark_complete,
-            )
-            if duplicate is not None:
-                return duplicate
-        elif DUPLICATE_ENFORCEMENT_MODE != "off":
+        if DUPLICATE_ENFORCEMENT_MODE == "shadow":
+            # Preserve legacy observability first; the shared policy writes
+            # its richer audit afterward so the old hook cannot replace it.
             _run_duplicate_shadow_fail_open(raw)
-        semantic = _run_semantic_shadow_fail_open(raw)
-        if DUPLICATE_ENFORCEMENT_MODE == "enforce":
-            candidates = getattr(semantic, "candidates", ())
-            if isinstance(candidates, tuple) and candidates:
-                duplicate = _processing_duplicate(
-                    raw, _duplicate_enforcement_fail_open(
-                        raw, semantic_candidates=candidates, duplicate_counters=duplicate_counters,
-                    ),
-                    mark_complete=mark_complete,
-                )
+        if DUPLICATE_ENFORCEMENT_MODE in {"shadow", "enforce"}:
+            decision = _duplicate_enforcement_fail_open(raw, duplicate_counters=duplicate_counters)
+            if DUPLICATE_ENFORCEMENT_MODE == "enforce":
+                duplicate = _processing_duplicate(raw, decision, mark_complete=mark_complete)
                 if duplicate is not None:
                     return duplicate
+        semantic = _run_semantic_shadow_fail_open(raw)
+        if DUPLICATE_ENFORCEMENT_MODE in {"shadow", "enforce"}:
+            candidates = getattr(semantic, "candidates", ())
+            if isinstance(candidates, tuple) and candidates:
+                decision = _duplicate_enforcement_fail_open(
+                    raw, semantic_candidates=candidates, duplicate_counters=duplicate_counters,
+                )
+                if DUPLICATE_ENFORCEMENT_MODE == "enforce":
+                    duplicate = _processing_duplicate(raw, decision, mark_complete=mark_complete)
+                    if duplicate is not None:
+                        return duplicate
             if duplicate_counters is not None and VECTOR_ENABLED and SEMANTIC_SHADOW_ENABLED:
                 status = getattr(getattr(semantic, "status", None), "value", getattr(semantic, "status", None))
                 retrieval_status = getattr(semantic, "retrieval_status", None)
@@ -2480,7 +2481,7 @@ def process_news_with_gpt(batch_size: int | None = None):
     enforcement_counts = dict.fromkeys(DUPLICATE_COUNTER_NAMES, 0)
     for art in articles:
         article_counts: dict[str, int] = {}
-        if DUPLICATE_ENFORCEMENT_MODE == "enforce":
+        if DUPLICATE_ENFORCEMENT_MODE in {"shadow", "enforce"}:
             outcome = process_one(art, duplicate_counters=article_counts)
             for name, count in article_counts.items():
                 enforcement_counts[name] = enforcement_counts.get(name, 0) + count
@@ -2494,7 +2495,7 @@ def process_news_with_gpt(batch_size: int | None = None):
             failed += 1
 
     result = {"attempted": attempted, "succeeded": succeeded, "failed": failed}
-    if DUPLICATE_ENFORCEMENT_MODE == "enforce":
+    if DUPLICATE_ENFORCEMENT_MODE in {"shadow", "enforce"}:
         result["duplicates_rejected"] = duplicates_rejected
         result.update(enforcement_counts)
     if failed:
@@ -2512,7 +2513,7 @@ def _process_news_with_durable_claims(
     """Run claimed work after the claim transaction has been committed."""
     repository = RawNewsRepository()
     result = {"attempted": 0, "succeeded": 0, "failed": 0}
-    if DUPLICATE_ENFORCEMENT_MODE == "enforce":
+    if DUPLICATE_ENFORCEMENT_MODE in {"shadow", "enforce"}:
         result["duplicates_rejected"] = 0
         result.update(dict.fromkeys(DUPLICATE_COUNTER_NAMES, 0))
     attempted_raw_ids: set[int] = set()
@@ -2545,7 +2546,7 @@ def _process_news_with_durable_claims(
                 claim.article,
                 mark_complete=False,
                 on_error=captured_error.append,
-                **({"duplicate_counters": article_counts} if DUPLICATE_ENFORCEMENT_MODE == "enforce" else {}),
+                **({"duplicate_counters": article_counts} if DUPLICATE_ENFORCEMENT_MODE in {"shadow", "enforce"} else {}),
             )
             for name, count in article_counts.items():
                 result[name] = result.get(name, 0) + count

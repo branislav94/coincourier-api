@@ -12,7 +12,7 @@ import config
 from repositories.duplicate_assessments import DuplicateAssessmentRepository
 
 from .event_matching import extract_event_facts
-from .identities import build_article_identity, valid_event_id
+from .identities import build_article_identity
 from .policy import AssessmentType, DuplicateAssessment, assess_relationship
 
 
@@ -21,6 +21,7 @@ DUPLICATE_COUNTER_NAMES = (
     "related_events_allowed", "broad_topic_overlaps_allowed",
     "semantic_candidates_evaluated", "semantic_candidates_promoted",
     "fail_open_unavailable_embeddings",
+    "shadow_would_reject_duplicates", "cross_source_duplicates_confirmed",
 )
 
 
@@ -102,16 +103,21 @@ def _structured_enough(assessment: DuplicateAssessment) -> bool:
 
 
 def _confirmed(assessment: DuplicateAssessment) -> bool:
-    if assessment.new_fact_codes or assessment.evidence_uncertainty:
+    if assessment.new_fact_codes or assessment.evidence_uncertainty or assessment.contradiction_flags:
         return False
     if assessment.assessment_type is AssessmentType.EXACT_DUPLICATE:
         # A mutable URL or provider article ID is not immutable source content.
         return assessment.same_content_hash
     return bool(
         assessment.assessment_type is AssessmentType.SAME_EVENT_DUPLICATE
-        and assessment.same_event_id
         and "no_new_structured_facts" in assessment.reason_codes
-        and _structured_enough(assessment)
+        and (
+            (assessment.same_event_id and _structured_enough(assessment))
+            or (
+                assessment.event_identity_source == "structured_cross_source"
+                and len(assessment.confirmation_anchors) >= 2
+            )
+        )
     )
 
 
@@ -177,6 +183,8 @@ def assess_duplicate_enforcement(
             seen.add(candidate_id)
             assessment = assess_relationship(source, candidate, policy_version=getattr(config, "DUPLICATE_POLICY_VERSION", "v1"), lookback_hours=getattr(config, "DUPLICATE_LOOKBACK_HOURS", 72))
             confirmed = _confirmed(assessment)
+            if confirmed and assessment.event_identity_source == "structured_cross_source":
+                counters["cross_source_duplicates_confirmed"] += 1
             assessments.append((candidate_id, assessment))
             if candidate_id in semantic:
                 counters["semantic_candidates_evaluated"] += 1
@@ -197,6 +205,7 @@ def assess_duplicate_enforcement(
             candidate_audits[candidate_id] = {
                 "classification": assessment.assessment_type.value,
                 "same_event_id": assessment.same_event_id,
+                "event_identity_source": assessment.event_identity_source,
                 "provider_article_id": build_article_identity(source).provider_article_id,
                 "event_id": build_article_identity(source).event_id,
                 "prior_provider_article_id": build_article_identity(candidate).provider_article_id,
@@ -209,26 +218,42 @@ def assess_duplicate_enforcement(
                 "title_similarity": assessment.title_token_jaccard,
                 "shared_entities": assessment.shared_entities,
                 "new_fact_codes": assessment.new_fact_codes,
+                "new_fact_flags": assessment.new_fact_codes,
+                "contradiction_flags": assessment.contradiction_flags,
+                "confirmation_anchors": assessment.confirmation_anchors,
                 "shared_actions": assessment.shared_actions,
                 "evidence_uncertainty": assessment.evidence_uncertainty,
                 "decision_reason": "insufficient_structured_evidence" if assessment.same_event_id and assessment.assessment_type is AssessmentType.SAME_EVENT_DUPLICATE and not _structured_enough(assessment) else ",".join(assessment.reason_codes),
                 "current_facts": _facts(source), "prior_facts": _facts(candidate),
-                "decision": ("defer_manual_review" if stage == "pre_publish" and _unresolved(candidate) else "reject_duplicate") if confirmed and selected_mode == "enforce" else "continue",
+                "decision": (
+                    "would_reject_duplicate" if confirmed and not (stage == "pre_publish" and _unresolved(candidate)) else "would_continue"
+                ) if selected_mode == "shadow" else (
+                    ("defer_manual_review" if stage == "pre_publish" and _unresolved(candidate) else "reject_duplicate") if confirmed else "continue"
+                ),
                 "confirmed_duplicate": confirmed,
             }
         reject = chosen is not None and selected_mode == "enforce"
         defer = not chosen and unresolved is not None and selected_mode == "enforce"
         if reject:
             counters["exact_blocks" if chosen[1].assessment_type is AssessmentType.EXACT_DUPLICATE else "same_event_blocks"] += 1
-        audit = {"stage": stage, "mode": selected_mode, "decision": "reject_duplicate" if reject else "defer_manual_review" if defer else "continue", "counters": counters, "candidate_audits": candidate_audits}
+        if selected_mode == "shadow" and chosen is not None:
+            counters["shadow_would_reject_duplicates"] = 1
+        decision = (
+            "would_reject_duplicate" if chosen is not None else "would_continue"
+        ) if selected_mode == "shadow" else (
+            "reject_duplicate" if reject else "defer_manual_review" if defer else "continue"
+        )
+        audit = {"stage": stage, "mode": selected_mode, "decision": decision, "counters": counters, "candidate_audits": candidate_audits}
         # No silent terminal rejection if the evidence could not be stored.
         persisted = repo.save_assessments(article_id, assessments, audit_context=audit)
         if persisted != len(assessments):
             raise RuntimeError("incomplete duplicate assessment audit")
         for candidate_id, assessment in assessments:
             evidence = candidate_audits[candidate_id]
-            logging.info("[DUPLICATE-POLICY] article_id=%s candidate_id=%s classification=%s same_event_id=%s title_similarity=%.5f evidence=%s reason=%s mode=%s stage=%s decision=%s canonical_wp_id=%s",
-                         article_id, candidate_id, assessment.assessment_type.value, assessment.same_event_id, assessment.title_token_jaccard,
+            logging.info("[DUPLICATE-POLICY] article_id=%s candidate_id=%s classification=%s same_event_id=%s event_identity_source=%s confirmed_duplicate=%s new_fact_flags=%s contradiction_flags=%s title_similarity=%.5f evidence=%s reason=%s mode=%s stage=%s decision=%s canonical_wp_id=%s",
+                         article_id, candidate_id, assessment.assessment_type.value, assessment.same_event_id,
+                         assessment.event_identity_source, str(evidence["confirmed_duplicate"]).lower(),
+                         ",".join(assessment.new_fact_codes) or "none", ",".join(assessment.contradiction_flags) or "none", assessment.title_token_jaccard,
                          json.dumps(evidence, ensure_ascii=True, separators=(",", ":"), default=str), evidence["decision_reason"], selected_mode, stage, evidence["decision"], evidence["canonical_wp_id"])
         logging.info("[DUPLICATE-COUNTERS] article_id=%s stage=%s mode=%s counters=%s", article_id, stage, selected_mode, json.dumps(counters, sort_keys=True))
         match = chosen or unresolved
@@ -239,5 +264,7 @@ def assess_duplicate_enforcement(
     except Exception as error:
         # Exception messages can contain credentials, SQL, or source text.
         safe_error = type(error).__name__
-        logging.warning("[DUPLICATE-POLICY] article_id=%s mode=%s stage=%s decision=continue available=false error_type=%s", article_id, selected_mode, stage, safe_error)
+        for name in ("exact_blocks", "same_event_blocks", "shadow_would_reject_duplicates"):
+            counters[name] = 0
+        logging.warning("[DUPLICATE-POLICY] article_id=%s mode=%s stage=%s decision=%s available=false error_type=%s", article_id, selected_mode, stage, "would_continue" if selected_mode == "shadow" else "continue", safe_error)
         return DuplicateDecision(**base, available=False, error=safe_error)

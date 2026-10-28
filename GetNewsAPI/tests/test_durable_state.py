@@ -20,6 +20,7 @@ if str(PROJECT_DIR) not in sys.path:
 import config
 import gpt_processor
 import publish_to_wp
+from duplicate_detection.enforcement import DUPLICATE_COUNTER_NAMES
 from publishing.models import PublicationArticle, PublicationContext, PublicationResult
 from publishing.service import PublishingService, build_publication_key
 from publishing.wordpress import persistence, publisher, seo
@@ -51,6 +52,13 @@ ARTICLE = {
     "wp_media_id": None,
     "wp_media_metadata_json": None,
 }
+
+
+def shadow_counts(*, publication=False, **counts):
+    result = {"duplicates_rejected": 0, **dict.fromkeys(DUPLICATE_COUNTER_NAMES, 0), **counts}
+    if publication:
+        result["duplicate_guard_deferred"] = 0
+    return result
 
 
 class FakeCursor:
@@ -624,9 +632,9 @@ class ProcessingWiringTests(unittest.TestCase):
             patch.object(gpt_processor.logging, "warning"),
         ):
             result = gpt_processor.process_news_with_gpt(batch_size=1)
-        self.assertEqual(result, {"attempted": 1, "succeeded": 1, "failed": 0})
+        self.assertEqual(result, shadow_counts(attempted=1, succeeded=1, failed=0))
         repository_type.assert_not_called()
-        process_one.assert_called_once_with({"id": 1})
+        process_one.assert_called_once_with({"id": 1}, duplicate_counters={})
 
     def test_durable_path_claims_before_processing_and_completes(self):
         events = []
@@ -1049,7 +1057,7 @@ class PublishingServiceTests(unittest.TestCase):
 
         result = PublishingService(repository, adapter, image_preparer).publish_due(3)
 
-        self.assertEqual(result, {"attempted": 3, "succeeded": 2, "failed": 1})
+        self.assertEqual(result, shadow_counts(publication=True, attempted=3, succeeded=2, failed=1))
         self.assertEqual(adapter.reconciled_ids, [445, 446, 447])
         self.assertEqual(repository.claim_exclusions, [(), (445,), (445, 446)])
         failed = repository.rows[445]
@@ -1071,7 +1079,7 @@ class PublishingServiceTests(unittest.TestCase):
 
         result = service.publish_due(3)
 
-        self.assertEqual(result, {"attempted": 1, "succeeded": 1, "failed": 0})
+        self.assertEqual(result, shadow_counts(publication=True, attempted=1, succeeded=1, failed=0))
         self.assertEqual(adapter.reconciled_ids, [445, 446, 447, 445])
         self.assertEqual(repository.claim_exclusions[3:], [(), (445,)])
         self.assertEqual(repository.rows[445]["publish_attempt_count"], 2)
@@ -1085,7 +1093,7 @@ class PublishingServiceTests(unittest.TestCase):
 
         result = PublishingService(repository, adapter, Mock()).publish_due(2)
 
-        self.assertEqual(result, {"attempted": 2, "succeeded": 1, "failed": 1})
+        self.assertEqual(result, shadow_counts(publication=True, attempted=2, succeeded=1, failed=1))
         self.assertEqual(adapter.reconciled_ids, [445, 446])
         self.assertEqual(repository.rows[447]["publish_attempt_count"], 0)
         self.assertEqual(repository.rows[447]["publish_status"], "fresh")
@@ -1097,7 +1105,7 @@ class PublishingServiceTests(unittest.TestCase):
 
                 result = PublishingService(repository, BatchServicePublisher(), Mock()).publish_due(limit)
 
-                self.assertEqual(result, {"attempted": 0, "succeeded": 0, "failed": 0})
+                self.assertEqual(result, shadow_counts(publication=True, attempted=0, succeeded=0, failed=0))
                 self.assertEqual(repository.claim_exclusions, [])
 
     def test_claim_is_excluded_before_identity_ownership_failure(self):
@@ -1108,7 +1116,7 @@ class PublishingServiceTests(unittest.TestCase):
         with self.assertLogs("publishing.service", level="ERROR"):
             result = PublishingService(repository, adapter, Mock()).publish_due(3)
 
-        self.assertEqual(result, {"attempted": 3, "succeeded": 2, "failed": 1})
+        self.assertEqual(result, shadow_counts(publication=True, attempted=3, succeeded=2, failed=1))
         self.assertEqual(repository.claim_exclusions, [(), (445,), (445, 446)])
         self.assertEqual(adapter.reconciled_ids, [446, 447])
         self.assertEqual(repository.rows[445]["publish_attempt_count"], 1)
@@ -1128,7 +1136,7 @@ class PublishingServiceTests(unittest.TestCase):
             Mock(return_value=(None, {})),
         ).publish_due(1)
 
-        self.assertEqual(result, {"attempted": 1, "succeeded": 1, "failed": 0})
+        self.assertEqual(result, shadow_counts(publication=True, attempted=1, succeeded=1, failed=0))
         self.assertEqual(len(database.connections), 2)
         self.assertIsNot(database.connections[0], database.connections[1])
         self.assertEqual(database.connections[0].rollbacks, 1)
@@ -1201,7 +1209,7 @@ class PublishingServiceTests(unittest.TestCase):
         image_preparer = Mock()
         with patch.object(publisher.session, "post") as post:
             result = PublishingService(repository, publisher.WordPressPublisher(), image_preparer).publish_due(1)
-        self.assertEqual(result, {"attempted": 1, "succeeded": 0, "failed": 1})
+        self.assertEqual(result, shadow_counts(publication=True, attempted=1, succeeded=0, failed=1))
         image_preparer.assert_not_called()
         post.assert_not_called()
         self.assertFalse(repository.completed)

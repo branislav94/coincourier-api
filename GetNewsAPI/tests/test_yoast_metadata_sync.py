@@ -18,8 +18,14 @@ from unittest.mock import MagicMock, patch
 
 import requests
 
+from duplicate_detection.enforcement import DUPLICATE_COUNTER_NAMES
 from publishing import PublicationArticle, PublicationContext
 from publishing.wordpress import publisher
+
+
+def shadow_publication_counts(**counts):
+    return {"duplicates_rejected": 0, "duplicate_guard_deferred": 0,
+            **dict.fromkeys(DUPLICATE_COUNTER_NAMES, 0), **counts}
 
 
 class FakeResponse:
@@ -1145,7 +1151,7 @@ class DurableMetadataProcessRestartTests(unittest.TestCase):
                 row = connection.execute(
                     'SELECT seo_meta, published, publish_status FROM rich_crpytonews WHERE id = 11',
                 ).fetchone()
-        self.assertEqual(result, {'attempted': 1, 'succeeded': 1, 'failed': 0})
+        self.assertEqual(result, shadow_publication_counts(attempted=1, succeeded=1, failed=0))
         self.assertEqual(row, (description, 1, 'published'))
         self.assertEqual(http.updates[0]['json']['meta']['_yoast_wpseo_metadesc'], description)
 
@@ -1215,12 +1221,12 @@ print(json.dumps(result, ensure_ascii=False))
 
     def test_metadata_timeout_then_process_restart_reuses_committed_post_identity(self) -> None:
         first, second = self.restart_attempts('first')
-        self.assertEqual(first['result'], {'attempted': 1, 'succeeded': 0, 'failed': 1})
+        self.assertEqual(first['result'], shadow_publication_counts(attempted=1, succeeded=0, failed=1))
         self.assertEqual(first['state'][0], 77)
         self.assertEqual(first['state'][1], 'https://wordpress.example.invalid/posts/77/')
         self.assertEqual(first['state'][2:4], [0, 'retryable'])
         self.assertEqual(first['persist_observed'], [77])
-        self.assertEqual(second['result'], {'attempted': 1, 'succeeded': 1, 'failed': 0})
+        self.assertEqual(second['result'], shadow_publication_counts(attempted=1, succeeded=1, failed=0))
         self.assertEqual(second['state'][0], 77)
         self.assertEqual(second['state'][2:4], [1, 'published'])
         self.assertEqual(second['state'][4], 2)
@@ -1235,12 +1241,12 @@ print(json.dumps(result, ensure_ascii=False))
 
     def test_create_then_pointer_commit_failure_restart_requires_manual_reconciliation(self) -> None:
         first, second = self.restart_attempts('identity_commit_failure')
-        self.assertEqual(first['result'], {'attempted': 1, 'succeeded': 0, 'failed': 1})
+        self.assertEqual(first['result'], shadow_publication_counts(attempted=1, succeeded=0, failed=1))
         self.assertEqual(first['identity_commit_failures'], 1)
         self.assertIsNone(first['state'][0])
         self.assertEqual(first['creates'], 1)
         self.assertEqual(first['update_post_ids'], [])
-        self.assertEqual(second['result'], {'attempted': 1, 'succeeded': 0, 'failed': 1})
+        self.assertEqual(second['result'], shadow_publication_counts(attempted=1, succeeded=0, failed=1))
         self.assertIsNone(second['state'][0])
         self.assertEqual(second['state'][2:4], [0, 'manual_review'])
         self.assertEqual(second['creates'], 1)
@@ -1292,7 +1298,7 @@ print(json.dumps(result, ensure_ascii=False))
                 rows = connection.execute(
                     'SELECT id, published, publish_status, wp_post_id FROM rich_crpytonews ORDER BY id',
                 ).fetchall()
-        self.assertEqual(result, {'attempted': 2, 'succeeded': 1, 'failed': 1})
+        self.assertEqual(result, shadow_publication_counts(attempted=2, succeeded=1, failed=1))
         self.assertEqual(rows, [(11, 0, 'manual_review', None), (12, 1, 'published', 77)])
         self.assertEqual(len(http.creates), 1)
         self.assertEqual(image.call_count, 1)

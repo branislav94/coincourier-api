@@ -54,6 +54,7 @@ class SharedStore:
         self.events, self.audits, self.media_calls, self.requests = [], [], [], []
         self.mutex = threading.Lock()
         self.owner = None
+        self.require_mutex = True
 
     @contextmanager
     def lock(self):
@@ -70,7 +71,7 @@ class SharedStore:
                 self.mutex.release()
 
     def assert_owned(self):
-        if self.owner != threading.get_ident():
+        if self.require_mutex and self.owner != threading.get_ident():
             raise AssertionError("claim/image/create/persist escaped the duplicate mutex")
 
     def load_source_article(self, raw_id):
@@ -95,8 +96,8 @@ class SharedStore:
         self.audits.append((article_id, pairs, deepcopy(audit_context)))
         return len(pairs)
 
-    def guard(self, raw_id):
-        return PublicationDuplicateGuard(raw_id, mode="enforce", repository=self, lock_factory=self.lock)
+    def guard(self, raw_id, mode="enforce"):
+        return PublicationDuplicateGuard(raw_id, mode=mode, repository=self, lock_factory=self.lock)
 
     def image(self, row):
         self.assert_owned()
@@ -189,10 +190,10 @@ class PublicationGuardTests(unittest.TestCase):
         adapter.persist_external_media_identity = Mock()
         return adapter
 
-    def service(self, store, rich_id, *, guard_factory=None, adapter=None):
+    def service(self, store, rich_id, *, guard_factory=None, adapter=None, mode="enforce"):
         repo = ClaimRepository(store, rich_id)
-        service = PublishingService(repo, adapter or self.adapter(), store.image, duplicate_mode="enforce",
-                                    duplicate_guard_factory=guard_factory or store.guard)
+        service = PublishingService(repo, adapter or self.adapter(), store.image, duplicate_mode=mode,
+                                    duplicate_guard_factory=guard_factory or (lambda raw_id: store.guard(raw_id, mode)))
         return service, repo
 
     @contextmanager
@@ -213,8 +214,10 @@ class PublicationGuardTests(unittest.TestCase):
             usage = stack.enter_context(patch.object(publisher, "record_image_usage"))
             yield usage
 
-    def test_concurrent_fresh_same_event_workers_create_one_post_and_one_media(self):
+    def test_concurrent_cross_source_same_event_workers_create_one_post_and_one_media(self):
         store = SharedStore()
+        store.raw[10].update(event_id="upstream-a-activation", source_name="Synthetic source A")
+        store.raw[20].update(event_id="upstream-b-activation", source_name="Synthetic source B")
         # Both raw checks pass before either rewrite has created a rich row.
         rich_rows, store.rich = store.rich, {}
         for raw in store.raw.values():
@@ -241,6 +244,9 @@ class PublicationGuardTests(unittest.TestCase):
         phases = [event[0] for event in store.events]
         self.assertLess(phases.index("lock"), phases.index("claim"))
         self.assertLess(phases.index("persist"), phases.index("unlock"))
+        rejected = next(repo.rejections[0] for _service, repo in workers if repo.rejections)
+        self.assertFalse(rejected.assessment.same_event_id)
+        self.assertEqual(rejected.assessment.event_identity_source, "structured_cross_source")
 
     def test_later_material_numeric_update_creates_second_post(self):
         store = SharedStore()
@@ -408,26 +414,130 @@ class PublicationGuardTests(unittest.TestCase):
         self.assertEqual((rich_id, raw_id, decision.canonical_wp_id), (110, 10, 800))
         repository.begin_legacy_creation.assert_not_called()
 
+    def test_shadow_pre_publish_logs_would_reject_but_prepares_media_and_creates_post(self):
+        store = SharedStore()
+        store.require_mutex = False
+        store.rich[120].update(publish_status="published", published=1, wp_post_id=800)
+        lock = Mock(side_effect=AssertionError("shadow must not acquire an enforcement mutex"))
+        factory = lambda raw_id: PublicationDuplicateGuard(raw_id, mode="shadow", repository=store, lock_factory=lock)
+        service, repo = self.service(store, 110, mode="shadow", guard_factory=factory)
+        with self.wordpress(store), self.assertLogs(level="INFO") as logs:
+            result = service.publish_due(1)
+        self.assertEqual(result["succeeded"], 1)
+        self.assertEqual(result["failed"], 0)
+        self.assertEqual(result["duplicates_rejected"], 0)
+        self.assertEqual(result["duplicate_guard_deferred"], 0)
+        self.assertEqual(result["shadow_would_reject_duplicates"], 1)
+        self.assertEqual(len(store.media_calls), 1)
+        self.assertEqual(len(store.requests), 1)
+        self.assertEqual(repo.rejections, [])
+        self.assertEqual(repo.manual, [])
+        self.assertEqual(store.rich[110]["publish_status"], "published")
+        self.assertEqual(len(store.audits), 2)  # Before media, then immediately before CREATE.
+        self.assertTrue(all(audit[2]["decision"] == "would_reject_duplicate" for audit in store.audits))
+        self.assertIn("mode=shadow", " ".join(logs.output))
+        self.assertIn("stage=pre_publish", " ".join(logs.output))
+        self.assertIn("decision=would_reject_duplicate", " ".join(logs.output))
+        lock.assert_not_called()
+
+    def test_shadow_assessment_errors_are_sanitized_and_never_block_publication(self):
+        store = SharedStore()
+        store.require_mutex = False
+        service, repo = self.service(store, 110, mode="shadow")
+        with self.wordpress(store), patch(
+            "duplicate_detection.publication.assess_duplicate_enforcement",
+            side_effect=RuntimeError("sensitive assessment connection details"),
+        ) as assess, self.assertLogs("duplicate_detection.publication", level="WARNING") as logs:
+            result = service.publish_due(1)
+        self.assertEqual(result["succeeded"], 1)
+        self.assertEqual(result["duplicates_rejected"], 0)
+        self.assertEqual(result["duplicate_guard_deferred"], 0)
+        self.assertEqual(result["shadow_would_reject_duplicates"], 0)
+        self.assertEqual(len(store.media_calls), 1)
+        self.assertEqual(len(store.requests), 1)
+        self.assertEqual(assess.call_count, 2)
+        self.assertEqual(repo.rejections, [])
+        self.assertIn("decision=would_continue", " ".join(logs.output))
+        self.assertIn("error_type=RuntimeError", " ".join(logs.output))
+        self.assertNotIn("sensitive", " ".join(logs.output))
+
+    def test_shadow_and_enforce_guards_share_engine_and_classification(self):
+        store = SharedStore()
+        store.rich[120].update(publish_status="published", published=1, wp_post_id=800)
+        decisions = {}
+        with patch("duplicate_detection.publication.assess_duplicate_enforcement",
+                   wraps=assess_duplicate_enforcement) as assess:
+            for mode in ("shadow", "enforce"):
+                guard = store.guard(10, mode)
+                with guard.hold():
+                    if mode == "enforce":
+                        with self.assertRaises(PublicationDuplicateRejected):
+                            guard.check()
+                    else:
+                        guard.check()
+                decisions[mode] = guard.decision
+        self.assertEqual([call.kwargs["mode"] for call in assess.call_args_list], ["shadow", "enforce"])
+        self.assertTrue(all(call.kwargs["stage"] == "pre_publish" for call in assess.call_args_list))
+        self.assertEqual(decisions["shadow"].assessment, decisions["enforce"].assessment)
+        self.assertFalse(decisions["shadow"].reject)
+        self.assertTrue(decisions["enforce"].reject)
+        self.assertEqual(decisions["shadow"].audit["decision"], "would_reject_duplicate")
+        self.assertEqual(decisions["enforce"].audit["decision"], "reject_duplicate")
+
+    def test_legacy_shadow_runs_policy_twice_and_never_applies_duplicate_disposition(self):
+        store = SharedStore()
+        store.require_mutex = False
+        store.rich[120].update(publish_status="published", published=1, wp_post_id=800)
+        repository = Mock()
+        repository.get_external_post_state.return_value = deepcopy(store.rich[110])
+        adapter = self.adapter()
+        with (
+            self.wordpress(store),
+            patch.object(publisher.mysql.connector, "connect", return_value=Mock()),
+            patch.object(publisher, "_get_lock", return_value=True),
+            patch.object(publisher, "_release_lock", return_value=True),
+            patch.object(publisher, "_count_due_now", return_value=1),
+            patch.object(publisher, "fetch_unpublished", return_value=[deepcopy(store.rich[110])]),
+            patch.object(publisher, "PUBLISH_DURABLE_STATE_ENABLED", False),
+            patch.object(publisher, "DUPLICATE_ENFORCEMENT_MODE", "shadow"),
+            patch.object(publisher, "PublicationRepository", return_value=repository),
+            patch.object(publisher, "WordPressPublisher", return_value=adapter),
+            patch.object(publisher, "PublicationDuplicateGuard", side_effect=lambda raw_id, **kwargs: store.guard(raw_id, kwargs["mode"])),
+            patch.object(publisher, "upload_image", return_value=(610, {"provider": "pexels"})) as upload,
+            patch.object(publisher, "mark_news_as_published") as mark_published,
+            self.assertLogs(level="INFO") as logs,
+        ):
+            result = publisher.publish_news_to_wp()
+        self.assertEqual(result["succeeded"], 1)
+        self.assertEqual(result["failed"], 0)
+        self.assertEqual(result["duplicates_rejected"], 0)
+        self.assertEqual(result["shadow_would_reject_duplicates"], 1)
+        self.assertEqual(len(store.requests), 1)
+        self.assertEqual(len(store.audits), 2)
+        upload.assert_called_once()
+        mark_published.assert_called_once()
+        repository.reject_duplicate.assert_not_called()
+        repository.defer_legacy_manual_reconciliation.assert_not_called()
+        self.assertIn("decision=would_reject_duplicate", " ".join(logs.output))
+
 
 class PublicationGuardLivenessTests(unittest.TestCase):
-    def test_off_and_shadow_hold_and_check_perform_no_database_or_assessment_io(self):
-        for mode in ("off", "shadow"):
-            with self.subTest(mode=mode):
-                connect = Mock(side_effect=AssertionError("rollback must not connect"))
-                lock = Mock(side_effect=AssertionError("rollback must not lock"))
-                repository = Mock()
-                guard = PublicationDuplicateGuard(10, mode=mode, repository=repository,
-                                                  connection_factory=connect, lock_factory=lock)
-                with patch("duplicate_detection.publication.assess_duplicate_enforcement") as assess:
-                    guard.check()
-                    with guard.hold() as held:
-                        self.assertIs(held, guard)
-                        guard.check()
-                    guard.check()
-                connect.assert_not_called()
-                lock.assert_not_called()
-                assess.assert_not_called()
-                self.assertEqual(repository.mock_calls, [])
+    def test_off_hold_and_check_perform_no_database_or_assessment_io(self):
+        connect = Mock(side_effect=AssertionError("off must not connect"))
+        lock = Mock(side_effect=AssertionError("off must not lock"))
+        repository = Mock()
+        guard = PublicationDuplicateGuard(10, mode="off", repository=repository,
+                                          connection_factory=connect, lock_factory=lock)
+        with patch("duplicate_detection.publication.assess_duplicate_enforcement") as assess:
+            guard.check()
+            with guard.hold() as held:
+                self.assertIs(held, guard)
+                guard.check()
+            guard.check()
+        connect.assert_not_called()
+        lock.assert_not_called()
+        assess.assert_not_called()
+        self.assertEqual(repository.mock_calls, [])
 
     def probe(self, *, owner=(71, 71), failure=None):
         """Exercise the real advisory-lock path with SQL-only connection doubles."""
