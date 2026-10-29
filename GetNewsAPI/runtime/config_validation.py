@@ -289,6 +289,12 @@ def validate_runtime_config(
     vector_enabled = _boolean(env, "VECTOR_ENABLED", False, issues)
     embedding_enabled = _boolean(env, "EMBEDDING_ENABLED", False, issues)
     semantic_enabled = _boolean(env, "SEMANTIC_SHADOW_ENABLED", False, issues)
+    duplicate_mode = (
+        _value(env, "DUPLICATE_ENFORCEMENT_MODE").lower()
+        if "DUPLICATE_ENFORCEMENT_MODE" in env else "shadow"
+    )
+    if duplicate_mode not in {"off", "shadow", "enforce"}:
+        issues.append(ConfigIssue("DUPLICATE_ENFORCEMENT_MODE", "must be off, shadow or enforce"))
 
     scheduler_enabled = _boolean(env, "ENABLE_APSCHEDULER", False, issues)
     scheduler_profile = normalized_profile == "web" and scheduler_enabled

@@ -57,6 +57,7 @@ class PublicationContext:
     existing_external_url: str | None = None
     creation_is_fresh: bool = False
     persist_creation_intent: Callable[[], None] | None = None
+    pre_create_duplicate_guard: Callable[[], None] | None = None
 
 
 @dataclass(frozen=True)

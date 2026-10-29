@@ -181,13 +181,50 @@ class RawNewsRepository:
             (safe_error[:500], raw_article_id, token),
         )
 
+    def reject_duplicate(self, raw_article_id: int, *, token: str | None = None, decision: Any) -> bool:
+        """Consume a confirmed duplicate without claiming or completing another worker's row."""
+        if (
+            getattr(decision, "reject", False) is not True
+            or getattr(decision, "available", False) is not True
+            or getattr(decision, "mode", "") != "enforce"
+            or getattr(decision, "stage", "") != "raw"
+            or getattr(decision, "article_id", None) != raw_article_id
+        ):
+            raise ValueError("duplicate disposition requires a confirmed raw enforcement decision")
+        ownership = (
+            "processing_status = 'claimed' AND processing_claim_token = %s"
+            if token is not None else
+            "(processing_status IS NULL OR processing_status IN ('pending', 'retryable')) "
+            "AND processing_claim_token IS NULL AND processing_claimed_at IS NULL"
+        )
+        params = (raw_article_id, token) if token is not None else (raw_article_id,)
+        return self._finish(
+            raw_article_id,
+            token,
+            f"""
+            UPDATE cryptonewsapi
+            SET processed = 1,
+                chosen_for_publish = 0,
+                scheduled_for = NULL,
+                processing_status = 'duplicate',
+                processing_claim_token = NULL,
+                processing_claimed_at = NULL,
+                processing_last_error = NULL
+            WHERE id = %s
+              AND processed = 0
+              AND chosen_for_publish = 1
+              AND {ownership}
+            """,
+            params,
+        )
+
     def release_interrupted(self, raw_article_id: int, token: str) -> bool:
         return self.fail(raw_article_id, token, "Interrupted: processing will retry")
 
     def _finish(
         self,
         raw_article_id: int,
-        token: str,
+        token: str | None,
         sql: str,
         params: tuple[Any, ...],
     ) -> bool:

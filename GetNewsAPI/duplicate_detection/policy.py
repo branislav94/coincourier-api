@@ -7,7 +7,7 @@ from datetime import datetime, timezone
 from enum import Enum
 from typing import Any, Mapping
 
-from .event_matching import EventFacts, extract_event_facts
+from .event_matching import EventFacts, compare_cross_source_events, extract_event_facts
 from .identities import ArticleIdentity, build_article_identity
 from .lexical import token_set_jaccard
 
@@ -34,6 +34,12 @@ class DuplicateAssessment:
     publication_distance_hours: float | None
     reason_codes: tuple[str, ...]
     policy_version: str
+    new_fact_codes: tuple[str, ...] = ()
+    evidence_uncertainty: tuple[str, ...] = ()
+    shared_actions: tuple[str, ...] = ()
+    event_identity_source: str = "none"
+    contradiction_flags: tuple[str, ...] = ()
+    confirmation_anchors: tuple[str, ...] = ()
 
 
 def _same_nonempty(left: str | None, right: str | None) -> bool:
@@ -71,7 +77,7 @@ def _new_fact_codes(current: EventFacts, prior: EventFacts) -> tuple[str, ...]:
         codes.append("new_numeric_value")
     if current.key_entities - prior.key_entities:
         codes.append("new_named_participant")
-    if set(current.actions) - set(prior.actions):
+    if set(current.actions) != set(prior.actions):
         codes.append("new_action_or_status")
     return tuple(codes)
 
@@ -109,8 +115,15 @@ def assess_relationship(
     distance = _publication_distance_hours(article, candidate)
     close_in_time = distance is None or distance <= lookback_hours
     new_fact_codes = _new_fact_codes(current_facts, prior_facts)
+    cross_source = compare_cross_source_events(current_facts, prior_facts)
+    uncertainty = tuple(sorted(set(current_facts.uncertainty) | set(prior_facts.uncertainty)))
+    identity_source = "provider_event_id" if same_event else "none"
 
-    if same_provider or same_url or same_content:
+    if (same_provider or same_url or same_event or same_content) and new_fact_codes:
+        classification = AssessmentType.MATERIAL_UPDATE
+        identity_reasons = ("same_event_id",) if same_event else ("existing_article_identity",)
+        reason_codes = (*identity_reasons, *new_fact_codes)
+    elif same_provider or same_url or same_content:
         exact_reasons = []
         if same_provider:
             exact_reasons.append("same_provider_article_id")
@@ -127,6 +140,17 @@ def assess_relationship(
         else:
             classification = AssessmentType.SAME_EVENT_DUPLICATE
             reason_codes = ("same_event_id", "no_new_structured_facts")
+    elif cross_source.plausible_identity and new_fact_codes and "different_named_target" not in cross_source.contradiction_flags:
+        classification = AssessmentType.MATERIAL_UPDATE
+        reason_codes = ("structured_cross_source", *new_fact_codes)
+        identity_source = "structured_cross_source"
+    elif cross_source.strong_identity and not cross_source.contradiction_flags and not uncertainty:
+        classification = AssessmentType.SAME_EVENT_DUPLICATE
+        reason_codes = ("structured_cross_source", "no_new_structured_facts")
+        identity_source = "structured_cross_source"
+    elif cross_source.contradiction_flags:
+        classification = AssessmentType.RELATED_EVENT
+        reason_codes = ("structured_contradiction", *cross_source.contradiction_flags)
     else:
         inferred_same_event = bool(
             shared_key_entities
@@ -170,4 +194,10 @@ def assess_relationship(
         publication_distance_hours=round(distance, 3) if distance is not None else None,
         reason_codes=reason_codes,
         policy_version=policy_version,
+        new_fact_codes=new_fact_codes,
+        evidence_uncertainty=uncertainty,
+        shared_actions=tuple(sorted(set(current_facts.actions) & set(prior_facts.actions))),
+        event_identity_source=identity_source,
+        contradiction_flags=cross_source.contradiction_flags,
+        confirmation_anchors=cross_source.confirmation_anchors,
     )

@@ -6,6 +6,7 @@ import unittest
 from unittest.mock import patch
 
 import gpt_processor
+from duplicate_detection.enforcement import DUPLICATE_COUNTER_NAMES, DuplicateDecision
 from operations import jobs
 from operations.models import JobStatus
 from repositories.raw_news import RawNewsRepository
@@ -64,6 +65,10 @@ class SQLiteConnection:
 
 
 class ProcessingRetryInvocationTests(unittest.TestCase):
+    def counts(self, *, attempted, succeeded, failed):
+        return {"attempted": attempted, "succeeded": succeeded, "failed": failed,
+                "duplicates_rejected": 0, **dict.fromkeys(DUPLICATE_COUNTER_NAMES, 0)}
+
     def setUp(self):
         self.database = sqlite3.connect(":memory:")
         self.database.row_factory = sqlite3.Row
@@ -114,12 +119,16 @@ class ProcessingRetryInvocationTests(unittest.TestCase):
                 return stack.enter_context(patch.object(gpt_processor, name, **kwargs))
 
             patched("PROCESS_DURABLE_CLAIMS_ENABLED", new=True)
+            patched("DUPLICATE_ENFORCEMENT_MODE", new="shadow")
             patched("PROCESS_BATCH_MIN", new=minimum)
             patched("PROCESS_BATCH_MAX", new=maximum)
             patched("PIPELINE_FRESH_START_AFTER_UTC_SQL", new=cutoff)
             patched("RawNewsRepository", return_value=self.repository)
             patched("_count_due_within", return_value=due)
             duplicate = patched("_run_duplicate_shadow_fail_open")
+            policy = patched("assess_duplicate_enforcement", side_effect=lambda raw, **_kwargs: DuplicateDecision(
+                mode="shadow", article_id=raw["id"], counters=dict.fromkeys(DUPLICATE_COUNTER_NAMES, 0),
+            ))
             semantic = patched("_run_semantic_shadow_fail_open")
             enrich = patched("enrich_with_search", return_value={})
             patched("_maybe_video_url", return_value=None)
@@ -133,7 +142,7 @@ class ProcessingRetryInvocationTests(unittest.TestCase):
             for level in ("info", "warning", "error", "exception"):
                 stack.enter_context(patch.object(gpt_processor.logging, level))
             yield {
-                "duplicate": duplicate, "semantic": semantic, "enrich": enrich,
+                "duplicate": duplicate, "policy": policy, "semantic": semantic, "enrich": enrich,
                 "rewrite": rewrite, "repair": repair, "store": store, "mark": mark,
                 "claim": claim,
             }
@@ -146,8 +155,8 @@ class ProcessingRetryInvocationTests(unittest.TestCase):
         # A due count below the minimum must still allow three distinct attempts.
         with self.processing(due=1) as calls:
             result = gpt_processor.process_news_with_gpt()
-        self.assertEqual(result, {"attempted": 3, "succeeded": 2, "failed": 1})
-        for boundary in ("duplicate", "semantic", "enrich", "rewrite", "repair"):
+        self.assertEqual(result, self.counts(attempted=3, succeeded=2, failed=1))
+        for boundary in ("duplicate", "policy", "semantic", "enrich", "rewrite", "repair"):
             self.assertEqual([call.args[0]["id"] for call in calls[boundary].call_args_list],
                              [18160, 18161, 18162])
         self.assertEqual([call.args[1]["id"] for call in calls["store"].call_args_list],
@@ -169,7 +178,7 @@ class ProcessingRetryInvocationTests(unittest.TestCase):
         self.short_ids.clear()
         with self.processing() as later_calls:
             later = gpt_processor.process_news_with_gpt()
-        self.assertEqual(later, {"attempted": 1, "succeeded": 1, "failed": 0})
+        self.assertEqual(later, self.counts(attempted=1, succeeded=1, failed=0))
         self.assertEqual([call.args[0]["id"] for call in later_calls["rewrite"].call_args_list], [18160])
         self.assertEqual(later_calls["claim"].call_args_list[0].kwargs["exclude_raw_article_ids"], ())
         self.assertEqual((self.row(18160)["processed"], self.row(18160)["processing_attempt_count"]), (1, 2))
@@ -186,7 +195,7 @@ class ProcessingRetryInvocationTests(unittest.TestCase):
         self.assertEqual((result.status, result.stage, result.reason_type),
                          (JobStatus.FAILED, "process", "ArticleFailures"))
         self.assertEqual(result.counts, {
-            "process_attempted": 1, "process_succeeded": 0, "process_failed": 1,
+            **{f"process_{name}": count for name, count in self.counts(attempted=1, succeeded=0, failed=1).items()},
             "publish_attempted": 3, "publish_succeeded": 3, "publish_failed": 0,
         })
         self.assertEqual(calls["rewrite"].call_count, 1)
@@ -201,7 +210,7 @@ class ProcessingRetryInvocationTests(unittest.TestCase):
         self.short_ids.update((1, 2, 3))
         with self.processing() as calls:
             result = gpt_processor.process_news_with_gpt(batch_size=8)
-        self.assertEqual(result, {"attempted": 3, "succeeded": 0, "failed": 3})
+        self.assertEqual(result, self.counts(attempted=3, succeeded=0, failed=3))
         self.assertEqual([call.args[0]["id"] for call in calls["rewrite"].call_args_list], [1, 2, 3])
         self.assertEqual(calls["claim"].call_count, 4)
         self.assertTrue(all(self.row(raw_id)["processing_attempt_count"] == 1 for raw_id in (1, 2, 3)))
@@ -213,7 +222,7 @@ class ProcessingRetryInvocationTests(unittest.TestCase):
         self.seed(9, selected="2020-01-01 00:00:01")
         with self.processing(minimum=1, maximum=1) as calls:
             result = gpt_processor.process_news_with_gpt(batch_size=2)
-        self.assertEqual(result, {"attempted": 2, "succeeded": 2, "failed": 0})
+        self.assertEqual(result, self.counts(attempted=2, succeeded=2, failed=0))
         self.assertEqual([call.args[0]["id"] for call in calls["rewrite"].call_args_list], [9, 10])
         self.assertTrue(all(call.kwargs["lookahead_minutes"] is None
                             for call in calls["claim"].call_args_list))
@@ -229,7 +238,7 @@ class ProcessingRetryInvocationTests(unittest.TestCase):
         with self.processing(due=99, minimum=1, maximum=2,
                              cutoff="2026-01-01 00:00:00") as calls:
             result = gpt_processor.process_news_with_gpt()
-        self.assertEqual(result, {"attempted": 2, "succeeded": 2, "failed": 0})
+        self.assertEqual(result, self.counts(attempted=2, succeeded=2, failed=0))
         self.assertEqual([call.args[0]["id"] for call in calls["rewrite"].call_args_list], [1, 2])
         self.assertTrue(all(call.kwargs["lookahead_minutes"] == gpt_processor.PROCESS_LOOKAHEAD_MINUTES
                             for call in calls["claim"].call_args_list))
@@ -240,7 +249,7 @@ class ProcessingRetryInvocationTests(unittest.TestCase):
         for limit in (0, -1):
             with self.subTest(limit=limit), self.processing() as calls:
                 self.assertEqual(gpt_processor.process_news_with_gpt(batch_size=limit),
-                                 {"attempted": 0, "succeeded": 0, "failed": 0})
+                                 self.counts(attempted=0, succeeded=0, failed=0))
                 calls["claim"].assert_not_called()
                 calls["rewrite"].assert_not_called()
 
@@ -260,7 +269,7 @@ class ProcessingRetryInvocationTests(unittest.TestCase):
                 with self.processing(), patch.object(gpt_processor, "process_one", side_effect=process) as work:
                     with patch.object(self.repository, "complete", side_effect=complete):
                         result = gpt_processor.process_news_with_gpt(batch_size=5)
-                self.assertEqual(result, {"attempted": 2, "succeeded": 1, "failed": 1})
+                self.assertEqual(result, self.counts(attempted=2, succeeded=1, failed=1))
                 self.assertEqual([call.args[0]["id"] for call in work.call_args_list], [1, 2])
                 self.assertEqual(self.row(1)["processing_attempt_count"], 1)
                 self.assertEqual(self.row(1)["processing_status"], "retryable")

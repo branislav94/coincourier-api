@@ -6,9 +6,14 @@ import hashlib
 import json
 import logging
 from datetime import datetime, timezone
+from dataclasses import replace
 from typing import Any, Callable, Mapping
 
-from config import PIPELINE_FRESH_START_AFTER_UTC_SQL, PUBLISH_CLAIM_TIMEOUT_MINUTES
+from config import DUPLICATE_ENFORCEMENT_MODE, PIPELINE_FRESH_START_AFTER_UTC_SQL, PUBLISH_CLAIM_TIMEOUT_MINUTES
+from duplicate_detection.enforcement import DUPLICATE_COUNTER_NAMES, DuplicateDecision
+from duplicate_detection.publication import (
+    PublicationDuplicateGuard, PublicationDuplicateRejected, PublicationDuplicateUnavailable,
+)
 from repositories.publication import PublicationClaim, PublicationRepository
 from repositories.state import claim_prefix, safe_error_message
 
@@ -51,15 +56,43 @@ class PublishingService:
         *,
         claim_timeout_minutes: int = PUBLISH_CLAIM_TIMEOUT_MINUTES,
         fresh_start_after: str | None = PIPELINE_FRESH_START_AFTER_UTC_SQL,
+        duplicate_mode: str | None = None,
+        duplicate_guard_factory: Callable[[int | None], PublicationDuplicateGuard] | None = None,
     ) -> None:
         self.repository = repository
         self.publisher = publisher
         self.image_preparer = image_preparer
         self.claim_timeout_minutes = claim_timeout_minutes
         self.fresh_start_after = fresh_start_after
+        self.duplicate_mode = str(DUPLICATE_ENFORCEMENT_MODE if duplicate_mode is None else duplicate_mode).strip().lower()
+        if self.duplicate_mode not in {"off", "shadow", "enforce"}:
+            raise ValueError("invalid duplicate enforcement mode")
+        self.duplicate_guard_factory = duplicate_guard_factory
 
     def publish_due(self, limit: int) -> dict[str, int]:
+        if self.duplicate_mode == "off" or limit <= 0:
+            return self._publish_due_locked(limit)
+        guard = (self.duplicate_guard_factory or (
+            lambda raw_id: PublicationDuplicateGuard(raw_id, mode=self.duplicate_mode)
+        ))(None)
+        # Enforcement claims while holding the cluster mutex. Two fresh claims
+        # could mistake one another for an unresolved external CREATE attempt.
+        try:
+            with guard.hold():
+                return self._publish_due_locked(limit, duplicate_guard=guard)
+        except PublicationDuplicateUnavailable as exc:
+            logger.warning("[DUPLICATE-PUBLISH] stage=pre_publish decision=defer code=%s", exc.code)
+            return {
+                "attempted": 0, "succeeded": 0, "failed": 0,
+                "duplicates_rejected": 0, "duplicate_guard_deferred": 1,
+                **dict.fromkeys(DUPLICATE_COUNTER_NAMES, 0),
+            }
+
+    def _publish_due_locked(self, limit: int, *, duplicate_guard: PublicationDuplicateGuard | None = None) -> dict[str, int]:
         result = {"attempted": 0, "succeeded": 0, "failed": 0}
+        if self.duplicate_mode != "off":
+            result.update(duplicates_rejected=0, duplicate_guard_deferred=0)
+            result.update(dict.fromkeys(DUPLICATE_COUNTER_NAMES, 0))
         attempted_rich_ids: set[int] = set()
         for _ in range(max(0, limit)):
             claim = self.repository.claim_next(
@@ -72,13 +105,24 @@ class PublishingService:
             # A failed claim can become retryable immediately; reserve it for a later invocation.
             attempted_rich_ids.add(int(claim.article["id"]))
             result["attempted"] += 1
-            if self._publish_claim(claim):
+            if duplicate_guard is not None:
+                duplicate_guard.decision = None
+                raw_id = claim.article.get("raw_article_id") or claim.article.get("durable_raw_article_id")
+                duplicate_guard.raw_article_id = _optional_int(raw_id)
+            outcome = self._publish_claim(claim, duplicate_guard=duplicate_guard)
+            if duplicate_guard is not None and duplicate_guard.decision is not None:
+                for name, count in duplicate_guard.decision.counters.items():
+                    if name in DUPLICATE_COUNTER_NAMES:
+                        result[name] += count
+            if isinstance(outcome, DuplicateDecision):
+                result["duplicates_rejected" if outcome.reject else "duplicate_guard_deferred"] += 1
+            elif outcome:
                 result["succeeded"] += 1
             else:
                 result["failed"] += 1
         return result
 
-    def _publish_claim(self, claim: PublicationClaim) -> bool:
+    def _publish_claim(self, claim: PublicationClaim, *, duplicate_guard: PublicationDuplicateGuard | None = None) -> bool | DuplicateDecision:
         row = claim.article
         rich_id = int(row["id"])
         raw_id_value = row.get("raw_article_id") or row.get("durable_raw_article_id")
@@ -96,6 +140,7 @@ class PublishingService:
             "reclaimed-expired" if claim.recovered else "claimed",
         )
 
+        context = None
         try:
             if raw_id is None:
                 raise ValueError("durable raw article identity is unavailable")
@@ -135,9 +180,34 @@ class PublishingService:
             if reconciled is not None:
                 return self._complete_result(claim, reconciled)
 
+            if duplicate_guard is not None:
+                duplicate_guard.check()
+                context = replace(context, pre_create_duplicate_guard=duplicate_guard.check)
             image = self._prepare_image(claim, key)
             publish_result = self.publisher.publish(article, image, context)
             return self._complete_result(claim, publish_result)
+        except PublicationDuplicateRejected as exc:
+            try:
+                if raw_id is None or not self.repository.reject_duplicate(rich_id, raw_id, exc.decision, token=claim.token):
+                    raise RuntimeError("duplicate disposition ownership was lost")
+                logger.info("[DUPLICATE-PUBLISH] rich_article_id=%s raw_article_id=%s stage=pre_publish decision=reject_duplicate canonical_wp_id=%s",
+                            rich_id, raw_id, exc.decision.canonical_wp_id)
+                return exc.decision
+            except Exception as error:
+                self.repository.fail(rich_id, claim.token, safe_error_message(error, "duplicate disposition"))
+                return False
+        except PublicationDuplicateUnavailable as exc:
+            if exc.code == "prior_publication_unresolved":
+                saved = self.repository.require_manual_reconciliation(rich_id, claim.token, "duplicate_prior_publication_unresolved")
+            else:
+                saved = self.repository.defer_duplicate_guard(
+                    rich_id, claim.token, creation_is_fresh=bool(context and context.creation_is_fresh),
+                )
+            if not saved:
+                self.repository.fail(rich_id, claim.token, "duplicate guard deferral ownership was lost")
+                return False
+            logger.warning("[DUPLICATE-PUBLISH] rich_article_id=%s stage=pre_publish decision=defer code=%s", rich_id, exc.code)
+            return exc.decision or DuplicateDecision(mode="enforce", stage="pre_publish", article_id=raw_id or 0, available=False, error=exc.code)
         except Exception as exc:
             logger.exception(
                 "[WP-PUBLISH] rich_article_id=%s state=retryable error_type=%s",

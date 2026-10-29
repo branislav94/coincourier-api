@@ -52,6 +52,19 @@ def _clean_identifier(value: Any) -> str | None:
     return cleaned or None
 
 
+def valid_event_id(value: Any) -> bool:
+    """Accept a real upstream identity, never a missing-value sentinel."""
+    if value is None or isinstance(value, bool):
+        return False
+    cleaned = str(value).strip()
+    return bool(
+        cleaned
+        and len(cleaned) <= 255
+        and cleaned.casefold() not in {"0", "-1", "none", "null", "nil", "n/a", "na", "unknown", "undefined", "false"}
+        and not any(ord(character) < 32 for character in cleaned)
+    )
+
+
 def _is_tracking_parameter(name: str) -> bool:
     lowered = name.casefold()
     return lowered.startswith("utm_") or lowered in _TRACKING_PARAMETERS
@@ -145,7 +158,10 @@ def build_article_identity(article: Mapping[str, Any]) -> ArticleIdentity:
         provider_article_id=_clean_identifier(
             article.get("news_id") or article.get("provider_article_id")
         ),
-        event_id=_clean_identifier(article.get("event_id") or article.get("eventid")),
+        event_id=(
+            _clean_identifier(article.get("event_id") or article.get("eventid"))
+            if valid_event_id(article.get("event_id") or article.get("eventid")) else None
+        ),
         canonical_url=canonicalize_url(source_url),
         normalized_title=normalize_title(article.get("title")),
         title_fingerprint=title_fingerprint(article.get("title")),

@@ -13,6 +13,7 @@ if str(PROJECT_DIR) not in sys.path:
     sys.path.insert(0, str(PROJECT_DIR))
 
 import gpt_processor
+from duplicate_detection.enforcement import DUPLICATE_COUNTER_NAMES
 
 
 def response_with_text(text="- Fresh verified fact.", annotations=None):
@@ -219,7 +220,8 @@ class OpenAIEnrichmentTests(unittest.TestCase):
         self.client.responses.create.side_effect = RuntimeError("sk-enrichment-fake-only unsafe-response")
         with self.assertLogs(level="ERROR") as captured:
             result = gpt_processor._process_news_with_durable_claims(1, use_lookahead_filter=False)
-        self.assertEqual(result, {"attempted": 1, "succeeded": 0, "failed": 1})
+        self.assertEqual(result, {"attempted": 1, "succeeded": 0, "failed": 1,
+                                  "duplicates_rejected": 0, **dict.fromkeys(DUPLICATE_COUNTER_NAMES, 0)})
         repository.fail.assert_called_once()
         self.assertEqual(repository.fail.call_args.args[:2], (13, claim.token))
         self.assertIn("EnrichmentRequestError", repository.fail.call_args.args[2])

@@ -596,6 +596,21 @@ class ConfigurationValidationTests(unittest.TestCase):
             self.assertTrue(tasks.run_config_check("web"))
         self.assertIn("Configuration valid for profile: web", output.getvalue())
 
+    def test_duplicate_enforcement_mode_is_explicit_and_validated(self):
+        for value in ("off", "shadow", "enforce", " ENFORCE "):
+            with self.subTest(mode=value):
+                environment = minimal_web_environment()
+                environment["DUPLICATE_ENFORCEMENT_MODE"] = value
+                self.assertEqual(validate_runtime_config(environment), ())
+        for value in ("true", "false", "semantic", "enforce-all", ""):
+            with self.subTest(mode=value):
+                environment = minimal_web_environment()
+                environment["DUPLICATE_ENFORCEMENT_MODE"] = value
+                self.assertIn(
+                    "DUPLICATE_ENFORCEMENT_MODE: must be off, shadow or enforce",
+                    format_config_issues(validate_runtime_config(environment)),
+                )
+
     def test_config_check_reports_missing_core_configuration(self):
         environment = minimal_web_environment()
         environment.pop("DB_HOST")
