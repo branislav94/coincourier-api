@@ -33,6 +33,7 @@ class RawNewsRepository:
         lookahead_minutes: int | None,
         fresh_start_after: str | None,
         exclude_raw_article_ids: Collection[int] = (),
+        source_max_age_hours: int | None = None,
     ) -> ProcessingClaim | None:
         """Claim an eligible row, keeping caller exclusions fixed across deadlock retries."""
         excluded_ids = tuple(sorted(set(exclude_raw_article_ids)))
@@ -43,6 +44,7 @@ class RawNewsRepository:
                     lookahead_minutes=lookahead_minutes,
                     fresh_start_after=fresh_start_after,
                     exclude_raw_article_ids=excluded_ids,
+                    source_max_age_hours=source_max_age_hours,
                 )
             except mysql.connector.Error as error:
                 if not is_claim_deadlock(error):
@@ -58,6 +60,7 @@ class RawNewsRepository:
         lookahead_minutes: int | None,
         fresh_start_after: str | None,
         exclude_raw_article_ids: Collection[int] = (),
+        source_max_age_hours: int | None = None,
     ) -> ProcessingClaim | None:
         token = new_claim_token()
         clauses = [
@@ -82,10 +85,21 @@ class RawNewsRepository:
                 ]
             )
             params.append(lookahead_minutes)
+        if source_max_age_hours is not None:
+            clauses.append(
+                "COALESCE(publish_date, selected_at) >= "
+                "TIMESTAMPADD(HOUR, -%s, UTC_TIMESTAMP())"
+            )
+            params.append(source_max_age_hours)
         if exclude_raw_article_ids:
             placeholders = ", ".join("%s" for _ in exclude_raw_article_ids)
             clauses.append(f"id NOT IN ({placeholders})")
             params.extend(exclude_raw_article_ids)
+
+        ordering = (
+            'COALESCE(is_breaking, 0) DESC, scheduled_for ASC, selected_at ASC, id ASC'
+            if source_max_age_hours is not None else 'scheduled_for ASC, selected_at ASC, id ASC'
+        )
 
         conn = self._connect()
         cursor = None
@@ -97,7 +111,7 @@ class RawNewsRepository:
                 SELECT *
                 FROM cryptonewsapi
                 WHERE {' AND '.join(clauses)}
-                ORDER BY scheduled_for ASC, selected_at ASC, id ASC
+                ORDER BY {ordering}
                 LIMIT 1
                 FOR UPDATE
                 """,

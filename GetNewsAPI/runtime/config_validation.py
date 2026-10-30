@@ -308,10 +308,16 @@ def validate_runtime_config(
     for flag in (
         "PROCESS_DURABLE_CLAIMS_ENABLED",
         "PUBLISH_DURABLE_STATE_ENABLED",
+        "PUBLISH_DAILY_HARD_CAP_ENABLED",
         "DUPLICATE_SHADOW_ENABLED",
         "FILE_LOGGING_ENABLED",
     ):
         _boolean(env, flag, False, issues)
+    _positive_integer(env, "PUBLISH_DAILY_HARD_CAP", 30, issues, maximum=4294967295)
+    if "PUBLISH_DAILY_HARD_CAP_ENABLED" in env and not _value(env, "PUBLISH_DAILY_HARD_CAP_ENABLED"):
+        issues.append(ConfigIssue("PUBLISH_DAILY_HARD_CAP_ENABLED", "must be true or false"))
+    if "PUBLISH_DAILY_HARD_CAP" in env and not _value(env, "PUBLISH_DAILY_HARD_CAP"):
+        issues.append(ConfigIssue("PUBLISH_DAILY_HARD_CAP", "must be a positive integer"))
 
     if vector_enabled:
         _require(env, VECTOR_DB_FIELDS, issues)

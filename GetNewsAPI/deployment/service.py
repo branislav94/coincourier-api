@@ -522,6 +522,12 @@ class MigrationService:
             return bool(statuses) and all(statuses.get(item) == MigrationStatus.APPLIED for item in ids)
 
         durable = applied(app_statuses, "app-002", "app-004")
+        publication_capacity = applied(app_statuses, "app-002", "app-004", "app-008")
+        capacity_reasons: list[str] = []
+        if not publication_capacity:
+            capacity_reasons.append(app_error or "app-002/app-004/app-008 are not verified")
+        if not 1 <= self._positive_int("PUBLISH_DAILY_HARD_CAP", 30) <= 4294967295:
+            capacity_reasons.append("PUBLISH_DAILY_HARD_CAP must be a positive integer in range")
         duplicate = applied(app_statuses, "app-002", "app-004", "app-007")
         vector = applied(vector_statuses, "vector-001", "vector-002", "vector-003")
         embedding_reasons: list[str] = []
@@ -555,6 +561,7 @@ class MigrationService:
             FeatureStatus(
                 "durable_publishing", durable, () if durable else (app_error or "app-002/app-004 are not verified",)
             ),
+            FeatureStatus("daily_publication_cap", not capacity_reasons, tuple(capacity_reasons)),
             FeatureStatus(
                 "duplicate_shadow", duplicate, () if duplicate else (app_error or "app-007 is not verified",)
             ),

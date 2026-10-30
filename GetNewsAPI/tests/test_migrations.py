@@ -40,6 +40,8 @@ from deployment.verification import (
     APP_PHASE2_INDEXES,
     APP_PHASE2_RAW_COLUMNS,
     APP_PHASE2_RICH_COLUMNS,
+    APP_PUBLICATION_CAPACITY_COLUMNS,
+    APP_PUBLICATION_CAPACITY_INDEXES,
     SEMANTIC_COLUMNS,
     SEMANTIC_INDEXES,
     VECTOR_COLUMNS,
@@ -136,12 +138,17 @@ class ManifestTests(unittest.TestCase):
     def test_application_manifest_order_is_explicit(self):
         self.assertEqual(
             [item.id for item in execution_sequence(MigrationTarget.APP)],
-            ["app-001", "app-002", "app-003", "app-004", "app-006", "app-007"],
+            ["app-001", "app-002", "app-003", "app-004", "app-006", "app-007", "app-008"],
         )
 
     def test_rollback_utility_is_excluded_from_forward_apply(self):
         self.assertFalse(migration_by_id("app-005").include_in_apply)
         self.assertNotIn("app-005", [item.id for item in execution_sequence(MigrationTarget.APP)])
+
+    def test_capacity_migration_does_not_depend_on_duplicate_analysis(self):
+        migration = migration_by_id("app-008")
+        self.assertEqual(migration.dependencies, ("app-004",))
+        self.assertEqual(migration.verification_key, "app_publication_capacity")
 
     def test_fresh_start_scripts_are_excluded_from_existing_database_chain(self):
         ids = [item.id for item in execution_sequence(MigrationTarget.APP)]
@@ -237,9 +244,11 @@ class TargetGuardTests(unittest.TestCase):
 
 
 class _ContractInspector:
-    def __init__(self, *, include_semantic=True, missing_app_index=None):
+    def __init__(self, *, include_semantic=True, missing_app_index=None, include_capacity=True, capacity_engine="INNODB"):
         self.include_semantic = include_semantic
         self.missing_app_index = missing_app_index
+        self.include_capacity = include_capacity
+        self.capacity_engine = capacity_engine
 
     @staticmethod
     def _columns(expected):
@@ -259,7 +268,12 @@ class _ContractInspector:
         }
         if self.include_semantic:
             tables.add("semantic_shadow_assessments")
+        if self.include_capacity:
+            tables.update(APP_PUBLICATION_CAPACITY_COLUMNS)
         return tables
+
+    def engine(self, table):
+        return self.capacity_engine
 
     def columns(self, table):
         maps = {
@@ -268,12 +282,13 @@ class _ContractInspector:
             "duplicate_assessments": APP_DUPLICATE_COLUMNS,
             **VECTOR_COLUMNS,
             "semantic_shadow_assessments": SEMANTIC_COLUMNS,
+            **APP_PUBLICATION_CAPACITY_COLUMNS,
         }
         return self._columns(maps.get(table, {}))
 
     def indexes(self, table):
         result = {}
-        for (expected_table, name), contract in {**APP_PHASE2_INDEXES, **VECTOR_INDEXES}.items():
+        for (expected_table, name), contract in {**APP_PHASE2_INDEXES, **VECTOR_INDEXES, **APP_PUBLICATION_CAPACITY_INDEXES}.items():
             if expected_table == table and name != self.missing_app_index:
                 result[name] = contract
         if table == "duplicate_assessments":
@@ -330,6 +345,20 @@ class VerificationTests(unittest.TestCase):
             MigrationTarget.APP,
         )
         self.assertTrue(any("uq_rich_crpytonews_wp_post_id" in issue for issue in issues))
+
+    def test_missing_capacity_schema_is_not_ready(self):
+        issues = verify_artifact(_ContractInspector(include_capacity=False), "app_publication_capacity")
+        self.assertTrue(any("publication_capacity_days table is missing" in issue for issue in issues))
+
+    def test_nontransactional_capacity_tables_fail_verification(self):
+        issues = verify_artifact(_ContractInspector(capacity_engine="MYISAM"), "app_publication_capacity")
+        self.assertTrue(any("must use InnoDB" in issue for issue in issues))
+
+    def test_missing_capacity_unique_identity_fails_verification(self):
+        issues = verify_artifact(
+            _ContractInspector(missing_app_index="uq_publication_capacity_key"), "app_publication_capacity"
+        )
+        self.assertTrue(any("uq_publication_capacity_key" in issue for issue in issues))
 
     def test_vector_verification_covers_migration_003(self):
         self.assertEqual(verify_target_schema(_ContractInspector(), MigrationTarget.VECTOR), [])
@@ -427,7 +456,7 @@ class ServiceCommandTests(unittest.TestCase):
         with guard_patch, inspect_patch:
             result = service.plan(MigrationTarget.APP)
         self.assertTrue(result.success)
-        self.assertTrue(any("pending=3" in line for line in result.lines))
+        self.assertTrue(any("pending=4" in line for line in result.lines))
         self.assertEqual(connection.statements, [])
 
     def test_failed_preflight_blocks_apply_before_sql(self):
@@ -521,7 +550,7 @@ class ServiceCommandTests(unittest.TestCase):
             result = service.apply(MigrationTarget.APP, allow_disposable=True)
         self.assertEqual(result.outcome, "APPLIED_AND_VERIFIED")
         sql_ids = [event.removeprefix("sql:") for event in events if event.startswith("sql:")]
-        self.assertEqual(sql_ids, ["app-002", "app-004", "app-007"])
+        self.assertEqual(sql_ids, ["app-002", "app-004", "app-007", "app-008"])
         self.assertNotIn("sql:app-005", events)
         self.assertNotIn("sql:app-fresh-apply", events)
         for migration_id in sql_ids:
@@ -610,6 +639,23 @@ class LockTests(unittest.TestCase):
 
 
 class ReadinessAndTaskTests(unittest.TestCase):
+    def test_capacity_readiness_requires_008_but_not_duplicate_schema(self):
+        service = MigrationService(environment=environment(), root=REPOSITORY_DIR)
+        app = {item: MigrationStatus.APPLIED for item in ("app-002", "app-004", "app-008")}
+        with patch.object(service, "_read_statuses", side_effect=[(app, None), ({}, "not verified")]):
+            statuses = {status.name: status for status in service.feature_readiness()}
+        self.assertTrue(statuses["daily_publication_cap"].ready)
+        self.assertFalse(statuses["duplicate_shadow"].ready)
+
+    def test_capacity_readiness_rejects_invalid_config(self):
+        values = environment()
+        values["PUBLISH_DAILY_HARD_CAP"] = "0"
+        service = MigrationService(environment=values, root=REPOSITORY_DIR)
+        app = {item: MigrationStatus.APPLIED for item in ("app-002", "app-004", "app-008")}
+        with patch.object(service, "_read_statuses", side_effect=[(app, None), ({}, "not verified")]):
+            statuses = {status.name: status for status in service.feature_readiness()}
+        self.assertFalse(statuses["daily_publication_cap"].ready)
+
     def test_readiness_requires_schema_and_embedding_configuration(self):
         service = MigrationService(environment=environment(), root=REPOSITORY_DIR)
         app = {item.id: MigrationStatus.APPLIED for item in forward_migrations(MigrationTarget.APP)}

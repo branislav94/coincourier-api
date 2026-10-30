@@ -12,7 +12,13 @@ import logging
 from apscheduler.schedulers.background import BackgroundScheduler
 from decimal import Decimal
 from db import get_db_connection
-from config import CRYPTO_NEWS_TOKEN, OPENAI_API_KEY
+from config import (
+    CRYPTO_NEWS_TOKEN,
+    OPENAI_API_KEY,
+    PUBLISH_DAILY_HARD_CAP,
+    PUBLISH_DAILY_HARD_CAP_ENABLED,
+)
+from repositories.publication_capacity import CapacityRepository
 
 # ========================= Tunables ==========================================
 
@@ -964,6 +970,41 @@ def _plan_today_schedule():
     Returns:
         None
     """
+    # Advisory admission guard only; the publisher owns the atomic reservation.
+    admission_remaining = None
+    if PUBLISH_DAILY_HARD_CAP_ENABLED:
+        try:
+            snapshot = CapacityRepository(PUBLISH_DAILY_HARD_CAP).snapshot()
+            if snapshot.remaining <= 0:
+                logging.info(
+                    "[PUBLICATION-CAPACITY] phase=schedule decision=deferred "
+                    "reason=daily-capacity-full utc_date=%s",
+                    snapshot.utc_date,
+                )
+                return
+            admission_remaining = max(
+                0,
+                snapshot.remaining - _pending_publication_commitments(),
+            )
+        except Exception as exc:
+            logging.warning(
+                "[PUBLICATION-CAPACITY] phase=schedule decision=deferred "
+                "reason=capacity-unavailable error_type=%s",
+                type(exc).__name__,
+            )
+            return
+        if admission_remaining == 0:
+            logging.info(
+                "[PUBLICATION-CAPACITY] phase=schedule decision=deferred "
+                "reason=no-uncommitted-capacity utc_date=%s",
+                snapshot.utc_date,
+            )
+            return
+        total_today, _ = _today_published_counts()
+        admission_remaining = min(admission_remaining, max(0, DAILY_TARGET - total_today))
+        if admission_remaining == 0:
+            return
+
     # 1) Breaking now (staggered times so all get a slot)
     conn = get_db_connection(); cur = conn.cursor(dictionary=True)
     cur.execute("""
@@ -977,14 +1018,20 @@ def _plan_today_schedule():
     """, (THRESH_BREAKING_NOW, COMPARISON_LOOKBACK_HOURS))
     breaking_ids = [r["id"] for r in cur.fetchall()]
     cur.close(); conn.close()
+    if admission_remaining is not None:
+        breaking_ids = breaking_ids[:admission_remaining]
     if breaking_ids:
         now = datetime.utcnow().replace(tzinfo=timezone.utc)
         times = [(now + timedelta(seconds=5*i)).replace(microsecond=0) for i in range(len(breaking_ids))]
         _assign_schedule(breaking_ids, times)
+        if admission_remaining is not None:
+            admission_remaining -= len(breaking_ids)
 
     # 2) Respect remaining daily capacity (UTC day)
     total_today, _ = _today_published_counts()  # make sure this counts the UTC day
     remaining_today = max(0, DAILY_TARGET - total_today)
+    if admission_remaining is not None:
+        remaining_today = min(remaining_today, admission_remaining)
     if remaining_today == 0:
         return
 
@@ -1060,6 +1107,43 @@ def _plan_today_schedule():
     assign_ids   = cand_ids[:len(slots)]
     assign_times = [ts for _, ts in slots[:len(assign_ids)]]
     _assign_schedule(assign_ids, assign_times)
+
+
+def _pending_publication_commitments() -> int:
+    """Conservatively account for selected work, including previous UTC days.
+
+    This read never reserves a slot. Reservations already reduce the snapshot,
+    so they are excluded here. Stale sources, manual-review work and known
+    WordPress posts need no new admission slot.
+    """
+    conn = get_db_connection()
+    cur = None
+    try:
+        cur = conn.cursor()
+        cur.execute("""
+            SELECT COUNT(DISTINCT c.id)
+            FROM cryptonewsapi c
+            LEFT JOIN rich_crpytonews r ON r.news_url = c.news_url
+            WHERE c.chosen_for_publish = 1
+              AND COALESCE(c.publish_date, c.selected_at) >=
+                  DATE_SUB(UTC_TIMESTAMP(), INTERVAL %s HOUR)
+              AND (r.id IS NULL OR (
+                  COALESCE(r.published, 0) = 0
+                  AND COALESCE(r.wp_post_id, 0) = 0
+                  AND COALESCE(r.publish_status, '') <> 'manual_review'
+                  AND NOT EXISTS (
+                      SELECT 1 FROM publication_capacity_reservations pcr
+                      WHERE pcr.rich_article_id = r.id
+                        AND pcr.utc_date = UTC_DATE()
+                  )
+              ))
+        """, (SCHEDULE_MAX_AGE_HOURS,))
+        row = cur.fetchone()
+        return int(row[0] or 0) if row else 0
+    finally:
+        if cur is not None:
+            cur.close()
+        conn.close()
 
 
 

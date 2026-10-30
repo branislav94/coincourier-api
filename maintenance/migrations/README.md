@@ -41,3 +41,24 @@ Phase 5 does not alter raw identity columns: the deployed runtime already owns
 content hashes are computed from bounded candidate source text and only the
 pairwise equality signal is persisted. Rollback is therefore just disabling
 `DUPLICATE_SHADOW_ENABLED`; retain assessment rows for audit analysis.
+
+Daily publication capacity order:
+
+1. Keep `PUBLISH_DAILY_HARD_CAP_ENABLED=false` and stop all publishers before
+   migration/activation work. Preserve existing durable-state flags.
+2. Confirm Phase 2 `app-004` is verified, then apply
+   `008_publication_daily_capacity.sql` to the application database. Duplicate
+   shadow migration `007` is not a prerequisite for this schema.
+3. Verify both `publication_capacity_days` and
+   `publication_capacity_reservations` are InnoDB and match their column,
+   primary-key, publication-key uniqueness, and date-index contracts.
+4. Follow [the daily-cap activation procedure](../../docs/GETNEWSAPI_DAILY_PUBLICATION_CAP.md)
+   before enabling the flag. Prefer a controlled UTC midnight with every
+   producer quiescent. Midday activation requires a verified WordPress baseline
+   that includes already-created posts awaiting application completion.
+
+The migration is additive and does not initialize historical capacity. An empty
+table is not evidence that the current UTC day has no publications. Schema
+readiness does not establish a correct activation baseline. Missing/incompatible
+schema must block new CREATEs when enabled. Rollback retains both tables;
+disabling enforcement permits additional CREATEs, so stop publishers first.

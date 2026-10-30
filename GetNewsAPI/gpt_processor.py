@@ -24,6 +24,8 @@ from config import (
     PIPELINE_FRESH_START_AFTER_UTC_SQL,
     PROCESS_CLAIM_TIMEOUT_MINUTES,
     PROCESS_DURABLE_CLAIMS_ENABLED,
+    PUBLISH_DAILY_HARD_CAP,
+    PUBLISH_DAILY_HARD_CAP_ENABLED,
     PRIMARY_LLM_PROVIDER,
     get_grok_reasoning_effort,
 )
@@ -31,6 +33,7 @@ from duplicate_detection.shadow import analyze_duplicates_in_shadow
 from duplicate_detection.enforcement import DUPLICATE_COUNTER_NAMES, assess_duplicate_enforcement
 from semantic_retrieval.shadow import run_semantic_shadow
 from repositories.raw_news import RawNewsRepository
+from repositories.publication_capacity import CapacityRepository
 from repositories.state import claim_prefix, safe_error_message
 import time, random
 import requests
@@ -109,6 +112,7 @@ REWRITE_VERBOSITY   = "low"
 PROCESS_LOOKAHEAD_MINUTES = int(os.getenv("PROCESS_LOOKAHEAD_MINUTES", "40"))
 PROCESS_BATCH_MIN = int(os.getenv("PROCESS_BATCH_MIN", "3"))
 PROCESS_BATCH_MAX = int(os.getenv("PROCESS_BATCH_MAX", "12"))
+SCHEDULE_MAX_AGE_HOURS = int(os.getenv("SCHEDULE_MAX_AGE_HOURS", "36"))
 
 # Keep search context small when passing it to the existing article writer.
 ENRICHMENT_MAX_CONTEXT_CHARACTERS = 6000
@@ -2402,6 +2406,64 @@ def process_one(raw, *, mark_complete=True, on_error=None, duplicate_counters=No
 
 
 
+def _generation_capacity_remaining() -> int:
+    """Avoid new paid processing when current capacity is already committed.
+
+    This is advisory; only the publisher's atomic reservation authorizes CREATE.
+    Fail closed without touching claims when capacity information is unavailable.
+    """
+    try:
+        snapshot = CapacityRepository(PUBLISH_DAILY_HARD_CAP).snapshot()
+        if snapshot.remaining <= 0:
+            logging.info(
+                "[PUBLICATION-CAPACITY] phase=process decision=deferred "
+                "reason=daily-capacity-full utc_date=%s",
+                snapshot.utc_date,
+            )
+            return 0
+        conn = get_db_connection()
+        cur = None
+        try:
+            cur = conn.cursor()
+            cur.execute("""
+                SELECT COUNT(DISTINCT r.id)
+                FROM rich_crpytonews r
+                JOIN cryptonewsapi c ON c.news_url = r.news_url
+                WHERE c.chosen_for_publish = 1
+                  AND COALESCE(r.published, 0) = 0
+                  AND COALESCE(r.wp_post_id, 0) = 0
+                  AND COALESCE(r.publish_status, '') <> 'manual_review'
+                  AND COALESCE(c.publish_date, c.selected_at) >=
+                      DATE_SUB(UTC_TIMESTAMP(), INTERVAL %s HOUR)
+                  AND NOT EXISTS (
+                      SELECT 1 FROM publication_capacity_reservations pcr
+                      WHERE pcr.rich_article_id = r.id
+                        AND pcr.utc_date = UTC_DATE()
+                  )
+            """, (SCHEDULE_MAX_AGE_HOURS,))
+            row = cur.fetchone()
+            pending = int(row[0] or 0) if row else 0
+        finally:
+            if cur is not None:
+                cur.close()
+            conn.close()
+        remaining = max(0, snapshot.remaining - pending)
+        if not remaining:
+            logging.info(
+                "[PUBLICATION-CAPACITY] phase=process decision=deferred "
+                "reason=generated-work-awaiting-publication utc_date=%s",
+                snapshot.utc_date,
+            )
+        return remaining
+    except Exception as exc:
+        logging.warning(
+            "[PUBLICATION-CAPACITY] phase=process decision=deferred "
+            "reason=capacity-unavailable error_type=%s",
+            type(exc).__name__,
+        )
+        return 0
+
+
 def process_news_with_gpt(batch_size: int | None = None):
     """
     Process a batch of due articles from cryptonewsapi into rich_crpytonews.
@@ -2427,12 +2489,30 @@ def process_news_with_gpt(batch_size: int | None = None):
             Processing counters with attempted, succeeded, and failed counts.
     """
     
+    capacity_limit = None
+    if PUBLISH_DAILY_HARD_CAP_ENABLED:
+        capacity_limit = _generation_capacity_remaining()
+        if capacity_limit == 0:
+            result = {"attempted": 0, "succeeded": 0, "failed": 0, "quota_deferred": 1}
+            if DUPLICATE_ENFORCEMENT_MODE in {"shadow", "enforce"}:
+                result["duplicates_rejected"] = 0
+                result.update(dict.fromkeys(DUPLICATE_COUNTER_NAMES, 0))
+            return result
+        logging.info(
+            "[PUBLICATION-CAPACITY] phase=process decision=freshness-filter "
+            "reason=stale_backlog_review_required max_source_age_hours=%s; "
+            "older selected sources retained unprocessed",
+            SCHEDULE_MAX_AGE_HOURS,
+        )
+
     use_lookahead_filter = batch_size is None
     if use_lookahead_filter:
         batch_size = max(
             PROCESS_BATCH_MIN,
             min(PROCESS_BATCH_MAX, _count_due_within(PROCESS_LOOKAHEAD_MINUTES)),
         )
+    if capacity_limit is not None:
+        batch_size = min(int(batch_size), capacity_limit)
 
     if PROCESS_DURABLE_CLAIMS_ENABLED:
         return _process_news_with_durable_claims(
@@ -2441,6 +2521,7 @@ def process_news_with_gpt(batch_size: int | None = None):
         )
 
     fresh_start_clause = ""
+    source_freshness_clause = ""
     lookahead_clause = ""
     params: list[Any] = []
     if PIPELINE_FRESH_START_AFTER_UTC_SQL:
@@ -2456,10 +2537,19 @@ def process_news_with_gpt(batch_size: int | None = None):
           AND scheduled_for <= DATE_ADD(UTC_TIMESTAMP(), INTERVAL %s MINUTE)
         """
         params.append(PROCESS_LOOKAHEAD_MINUTES)
+    if PUBLISH_DAILY_HARD_CAP_ENABLED:
+        source_freshness_clause = """
+          AND COALESCE(publish_date, selected_at) >= DATE_SUB(UTC_TIMESTAMP(), INTERVAL %s HOUR)
+        """
+        params.append(SCHEDULE_MAX_AGE_HOURS)
     params.append(batch_size)
 
     conn = get_db_connection()
     cur  = conn.cursor(dictionary=True)
+    ordering = (
+        'COALESCE(is_breaking, 0) DESC, scheduled_for ASC, selected_at ASC'
+        if PUBLISH_DAILY_HARD_CAP_ENABLED else 'scheduled_for ASC, selected_at ASC'
+    )
     cur.execute(f"""
         SELECT *
         FROM cryptonewsapi
@@ -2467,19 +2557,24 @@ def process_news_with_gpt(batch_size: int | None = None):
           AND chosen_for_publish = 1
           {fresh_start_clause}
           {lookahead_clause}
-        ORDER BY scheduled_for ASC, selected_at ASC
+          {source_freshness_clause}
+        ORDER BY {ordering}
         LIMIT %s
     """, tuple(params))
     articles = cur.fetchall()
     cur.close(); conn.close()
 
-    attempted = len(articles)
+    attempted = 0
     succeeded = 0
     failed = 0
     duplicates_rejected = 0
 
     enforcement_counts = dict.fromkeys(DUPLICATE_COUNTER_NAMES, 0)
     for art in articles:
+        if PUBLISH_DAILY_HARD_CAP_ENABLED and _generation_capacity_remaining() == 0:
+            # A changed snapshot must defer the remaining rows before paid work.
+            break
+        attempted += 1
         article_counts: dict[str, int] = {}
         if DUPLICATE_ENFORCEMENT_MODE in {"shadow", "enforce"}:
             outcome = process_one(art, duplicate_counters=article_counts)
@@ -2498,6 +2593,8 @@ def process_news_with_gpt(batch_size: int | None = None):
     if DUPLICATE_ENFORCEMENT_MODE in {"shadow", "enforce"}:
         result["duplicates_rejected"] = duplicates_rejected
         result.update(enforcement_counts)
+    if PUBLISH_DAILY_HARD_CAP_ENABLED and attempted < len(articles):
+        result["quota_deferred"] = 1
     if failed:
         logging.warning("GPT processing completed with failures: %s", result)
     else:
@@ -2519,11 +2616,16 @@ def _process_news_with_durable_claims(
     attempted_raw_ids: set[int] = set()
 
     for _ in range(max(0, batch_size)):
+        if PUBLISH_DAILY_HARD_CAP_ENABLED and _generation_capacity_remaining() == 0:
+            result["quota_deferred"] = 1
+            break
         claim = repository.claim_next(
             timeout_minutes=PROCESS_CLAIM_TIMEOUT_MINUTES,
             lookahead_minutes=(PROCESS_LOOKAHEAD_MINUTES if use_lookahead_filter else None),
             fresh_start_after=PIPELINE_FRESH_START_AFTER_UTC_SQL,
             exclude_raw_article_ids=tuple(sorted(attempted_raw_ids)),
+            **({"source_max_age_hours": SCHEDULE_MAX_AGE_HOURS}
+               if PUBLISH_DAILY_HARD_CAP_ENABLED else {}),
         )
         if claim is None:
             break

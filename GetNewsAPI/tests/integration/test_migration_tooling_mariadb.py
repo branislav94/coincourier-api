@@ -121,19 +121,27 @@ class MigrationToolingMariaDBTests(unittest.TestCase):
         baseline = (REPOSITORY_DIR / "maintenance/testing/mariadb_phase2_baseline.sql").read_text(
             encoding="utf-8"
         )
-        _execute(MigrationTarget.APP, f"DROP TABLE IF EXISTS {LEDGER_TABLE};\n{baseline}")
-        _execute(
-            MigrationTarget.VECTOR,
-            f"""
-            SET FOREIGN_KEY_CHECKS=0;
-            DROP TABLE IF EXISTS semantic_shadow_assessments;
-            DROP TABLE IF EXISTS embedding_jobs;
-            DROP TABLE IF EXISTS vector_chunks;
-            DROP TABLE IF EXISTS vector_documents;
+        _execute(MigrationTarget.APP, f"""
+            DROP TABLE IF EXISTS publication_capacity_reservations;
+            DROP TABLE IF EXISTS publication_capacity_days;
             DROP TABLE IF EXISTS {LEDGER_TABLE};
-            SET FOREIGN_KEY_CHECKS=1;
-            """,
-        )
+            {baseline}
+            """)
+        # Application migration coverage does not require a vector server.
+        # The vector-only cases still reset and exercise their own database.
+        if self._testMethodName.startswith("test_vector_"):
+            _execute(
+                MigrationTarget.VECTOR,
+                f"""
+                SET FOREIGN_KEY_CHECKS=0;
+                DROP TABLE IF EXISTS semantic_shadow_assessments;
+                DROP TABLE IF EXISTS embedding_jobs;
+                DROP TABLE IF EXISTS vector_chunks;
+                DROP TABLE IF EXISTS vector_documents;
+                DROP TABLE IF EXISTS {LEDGER_TABLE};
+                SET FOREIGN_KEY_CHECKS=1;
+                """,
+            )
         self.service = MigrationService(
             connection_factory=lambda target: _connect(target),
             environment=_environment(),
@@ -170,7 +178,7 @@ class MigrationToolingMariaDBTests(unittest.TestCase):
         second = self.service.apply(MigrationTarget.APP, allow_disposable=True)
         self.assertEqual(second.outcome, "NO_PENDING_MIGRATIONS", "\n".join(second.lines))
         self.assertEqual(
-            _scalar(MigrationTarget.APP, f"SELECT COUNT(*) FROM {LEDGER_TABLE}"), 3
+            _scalar(MigrationTarget.APP, f"SELECT COUNT(*) FROM {LEDGER_TABLE}"), 4
         )
 
     def test_application_identity_collision_blocks_before_mutation(self):

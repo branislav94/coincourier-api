@@ -78,6 +78,17 @@ class SchemaInspector:
             for name, column_type, nullable, default, extra, generation in rows
         }
 
+    def engine(self, table: str) -> str | None:
+        rows = self._rows(
+            """
+            SELECT ENGINE FROM information_schema.TABLES
+            WHERE TABLE_SCHEMA = %s AND TABLE_NAME = %s
+              AND TABLE_TYPE = 'BASE TABLE'
+            """,
+            (self.database, table),
+        )
+        return str(rows[0][0]).upper() if rows else None
+
     def indexes(self, table: str) -> dict[str, tuple[bool, str, tuple[str, ...]]]:
         rows = self._rows(
             """
@@ -188,6 +199,35 @@ APP_PHASE2_INDEXES = {
         True,
         "BTREE",
         ("wp_post_id",),
+    ),
+}
+
+# Capacity row locks require transactional tables. These additive tables are
+# independent of duplicate/semantic analysis and retain attempted reservations.
+APP_PUBLICATION_CAPACITY_COLUMNS = {
+    "publication_capacity_days": {
+        "utc_date": ExpectedColumn("date", False),
+        "hard_cap": ExpectedColumn("int unsigned", False),
+        "baseline_count": ExpectedColumn("int unsigned", False, "0"),
+    },
+    "publication_capacity_reservations": {
+        "rich_article_id": ExpectedColumn("int", False),
+        "publication_key": ExpectedColumn("varchar(191)", False),
+        "utc_date": ExpectedColumn("date", False),
+        "publication_at": ExpectedColumn("datetime", True, None),
+        "create_started_at": ExpectedColumn("datetime", True, None),
+        "wp_post_id": ExpectedColumn("bigint unsigned", True, None),
+    },
+}
+
+APP_PUBLICATION_CAPACITY_INDEXES = {
+    ("publication_capacity_days", "PRIMARY"): (True, "BTREE", ("utc_date",)),
+    ("publication_capacity_reservations", "PRIMARY"): (True, "BTREE", ("rich_article_id",)),
+    ("publication_capacity_reservations", "uq_publication_capacity_key"): (
+        True, "BTREE", ("publication_key",)
+    ),
+    ("publication_capacity_reservations", "idx_publication_capacity_date"): (
+        False, "BTREE", ("utc_date",)
     ),
 }
 
@@ -431,6 +471,18 @@ def verify_artifact(inspector: SchemaInspector, verification_key: str) -> list[s
     if verification_key == "app_phase2_indexes":
         return _check_indexes(inspector, APP_PHASE2_INDEXES)
 
+    if verification_key == "app_publication_capacity":
+        issues = []
+        for table, columns in APP_PUBLICATION_CAPACITY_COLUMNS.items():
+            if table not in tables:
+                issues.append(f"{table} table is missing")
+            else:
+                issues += _check_columns(inspector, table, columns)
+                if inspector.engine(table) != "INNODB":
+                    issues.append(f"{table} must use InnoDB for atomic capacity reservations")
+        issues += _check_indexes(inspector, APP_PUBLICATION_CAPACITY_INDEXES)
+        return issues
+
     if verification_key == "app_phase5_duplicate":
         if "duplicate_assessments" not in tables:
             return ["duplicate_assessments table is missing"]
@@ -529,6 +581,8 @@ def artifact_state(inspector: SchemaInspector, verification_key: str) -> Artifac
         }
     elif verification_key == "app_phase5_duplicate":
         present = {"duplicate_assessments"} if "duplicate_assessments" in tables else set()
+    elif verification_key == "app_publication_capacity":
+        present = set(APP_PUBLICATION_CAPACITY_COLUMNS) & tables
     elif verification_key == "vector_core":
         present = set(VECTOR_COLUMNS) & tables
     elif verification_key == "vector_index":
@@ -549,7 +603,7 @@ def artifact_state(inspector: SchemaInspector, verification_key: str) -> Artifac
 def verify_target_schema(inspector: SchemaInspector, target: MigrationTarget) -> list[str]:
     keys: Iterable[str]
     if target == MigrationTarget.APP:
-        keys = ("app_phase2_state", "app_phase2_indexes", "app_phase5_duplicate")
+        keys = ("app_phase2_state", "app_phase2_indexes", "app_phase5_duplicate", "app_publication_capacity")
     else:
         keys = ("vector_core", "vector_index", "vector_semantic")
     issues: list[str] = []

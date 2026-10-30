@@ -38,6 +38,8 @@ from config import (
     PRIMARY_IMAGE_PROVIDER,
     PUBLISH_CLAIM_TIMEOUT_MINUTES,
     PUBLISH_DURABLE_STATE_ENABLED,
+    PUBLISH_DAILY_HARD_CAP_ENABLED,
+    PUBLISH_DAILY_HARD_CAP,
     STOCK_IMAGE_TIMEOUT_SECONDS,
     USE_API_IMAGES,
     USE_SOURCE_IMAGES,
@@ -64,6 +66,8 @@ from publishing.models import (
 )
 from publishing.service import PublishingService, build_publication_key, publication_key_prefix
 from repositories.publication import PublicationRepository
+from repositories.publication_capacity import CapacityRepository, CapacityUnavailable, CapacityAlreadyAttempted
+from publishing.capacity import CAPACITY_UNAVAILABLE, QUOTA_EXHAUSTED, STALE_BACKLOG, needs_freshness_review
 from publishing.wordpress import client as wordpress_client
 from publishing.wordpress import media as wordpress_media
 from publishing.wordpress import persistence as wordpress_persistence
@@ -758,7 +762,10 @@ def _today_bounds_utc():
     end_local   = start_local + timedelta(days=1)
     return start_local, end_local
 
-def fetch_unpublished(limit: int = 10) -> list[dict]:
+def fetch_unpublished(
+    limit: int = 10, *, capacity_guard: bool = False, existing_posts_only: bool = False,
+    reserved_posts_allowed: bool = False,
+) -> list[dict]:
     """
     Fetch unpublished rich items that are due now.
 
@@ -777,10 +784,21 @@ def fetch_unpublished(limit: int = 10) -> list[dict]:
     """
 
     fresh_start_clause, fresh_start_params = _fresh_start_filter("c")
+    source_columns = ', c.publish_date AS source_publish_date, c.selected_at' if capacity_guard else ''
+    identity_clause = ' AND r.wp_post_id IS NOT NULL' if existing_posts_only else ''
+    if existing_posts_only and reserved_posts_allowed:
+        identity_clause = ''' AND (r.wp_post_id IS NOT NULL OR EXISTS (
+            SELECT 1 FROM publication_capacity_reservations pcr
+            WHERE pcr.rich_article_id = r.id AND pcr.utc_date = UTC_DATE()
+              AND pcr.create_started_at IS NULL))'''
+    ordering = (
+        '(r.wp_post_id IS NOT NULL) DESC, COALESCE(c.is_breaking, 0) DESC, c.scheduled_for ASC'
+        if capacity_guard else 'c.scheduled_for ASC'
+    )
     with mysql.connector.connect(**DB_CONFIG) as conn, conn.cursor(dictionary=True) as cur:
         cur.execute(
             f"""
-            SELECT r.*, c.id AS durable_raw_article_id, c.scheduled_for, c.is_breaking
+            SELECT r.*, c.id AS durable_raw_article_id, c.scheduled_for, c.is_breaking {source_columns}
             FROM rich_crpytonews r
             JOIN cryptonewsapi c ON c.news_url = r.news_url
             WHERE r.published = 0
@@ -790,7 +808,8 @@ def fetch_unpublished(limit: int = 10) -> list[dict]:
               AND c.scheduled_for IS NOT NULL
               AND c.scheduled_for <= UTC_TIMESTAMP()
               {fresh_start_clause}
-            ORDER BY c.scheduled_for ASC
+              {identity_clause}
+            ORDER BY {ordering}
             LIMIT %s
             """,
             (*fresh_start_params, limit),
@@ -1961,11 +1980,6 @@ class WordPressPublisher:
         )
 
         schedule_at_utc = context.published_at_utc
-        local_when = schedule_at_utc.astimezone(timezone(timedelta(hours=2)))
-        print(
-            f"Publishing: {article.title!r} — UTC {schedule_at_utc:%Y-%m-%d %H:%M:%S} "
-            f"(Local {local_when:%Y-%m-%d %H:%M:%S})"
-        )
 
         if article.schema_jsonld:
             with_links_content += (
@@ -1994,6 +2008,29 @@ class WordPressPublisher:
         if context.pre_create_duplicate_guard is not None:
             context.pre_create_duplicate_guard()
 
+        capacity_repository = None
+        if PUBLISH_DAILY_HARD_CAP_ENABLED or context.authorize_capacity_create is not None:
+            try:
+                if context.authorize_capacity_create is not None:
+                    publication_at = context.authorize_capacity_create()
+                else:
+                    capacity_repository = CapacityRepository(PUBLISH_DAILY_HARD_CAP)
+                    publication_at = capacity_repository.begin_create(
+                        context.rich_article_id, context.publication_key,
+                    )
+            except CapacityAlreadyAttempted:
+                return PublicationResult(
+                    success=False, error='post_identity_manual_reconciliation_required',
+                )
+            except (CapacityUnavailable, ValueError, TypeError):
+                logger.error('[PUBLICATION-CAPACITY] phase=create decision=deferred reason=%s', CAPACITY_UNAVAILABLE)
+                return PublicationResult(success=False, deferred=True, error=CAPACITY_UNAVAILABLE)
+            if publication_at is None:
+                logger.info('[PUBLICATION-CAPACITY] phase=create decision=deferred reason=%s', QUOTA_EXHAUSTED)
+                return PublicationResult(success=False, deferred=True, error=QUOTA_EXHAUSTED)
+            schedule_at_utc = publication_at
+            post_data['date_gmt'] = publication_at.strftime('%Y-%m-%dT%H:%M:%S')
+
         if context.persist_creation_intent is not None:
             try:
                 context.persist_creation_intent()
@@ -2002,6 +2039,11 @@ class WordPressPublisher:
                 logger.error('[WP-IDEMPOTENCY] decision=creation-blocked code=%s', code)
                 return PublicationResult(success=False, error=code)
 
+        local_when = schedule_at_utc.astimezone(timezone(timedelta(hours=2)))
+        print(
+            f"Publishing: {article.title!r} — UTC {schedule_at_utc:%Y-%m-%d %H:%M:%S} "
+            f"(Local {local_when:%Y-%m-%d %H:%M:%S})"
+        )
         response = session.post(
             f"{WP_API_URL}/wp-json/wp/v2/posts",
             json=post_data,
@@ -2034,6 +2076,12 @@ class WordPressPublisher:
                     created=True,
                     error=f'post_identity_persist:{type(exc).__name__}',
                 )
+
+        if capacity_repository is not None:
+            try:
+                capacity_repository.record_created(context.rich_article_id, context.publication_key, post_id)
+            except CapacityUnavailable:
+                logger.error('[PUBLICATION-CAPACITY] wp_post_id=%s decision=identity-record-pending', post_id)
 
         if image:
             record_image_usage(image.metadata, post_id, article.title)
@@ -2145,26 +2193,46 @@ def publish_news_to_wp() -> dict[str, int | str]:
                 claim_timeout_minutes=PUBLISH_CLAIM_TIMEOUT_MINUTES,
                 fresh_start_after=PIPELINE_FRESH_START_AFTER_UTC_SQL,
                 duplicate_mode=DUPLICATE_ENFORCEMENT_MODE,
+                capacity_enabled=PUBLISH_DAILY_HARD_CAP_ENABLED,
             )
             durable_result = service.publish_due(min(due, batch_cap))
             if durable_result["attempted"] == 0:
                 print("No new news items to publish.")
             return {
                 "status": (
-                    "no_work"
-                    if durable_result["attempted"] == 0
+                    "capacity_unavailable" if durable_result.get('capacity_unavailable')
                     else "failed"
                     if durable_result["failed"]
+                    else "quota_deferred" if durable_result.get('quota_exhausted') or durable_result.get('quota_deferred')
+                    else "no_work" if durable_result["attempted"] == 0
                     else "success"
                 ),
                 **durable_result,
             }
 
-        news_items = fetch_unpublished(limit=min(due, batch_cap))
+        capacity_repository = CapacityRepository(PUBLISH_DAILY_HARD_CAP) if PUBLISH_DAILY_HARD_CAP_ENABLED else None
+        quota_exhausted = False
+        capacity_unavailable = False
+        fetch_options = {}
+        if capacity_repository is not None:
+            try:
+                quota_exhausted = capacity_repository.snapshot().remaining <= 0
+            except CapacityUnavailable:
+                capacity_unavailable = True
+            fetch_options.update(
+                capacity_guard=True, existing_posts_only=quota_exhausted or capacity_unavailable,
+                reserved_posts_allowed=quota_exhausted and not capacity_unavailable,
+            )
+            if quota_exhausted or capacity_unavailable:
+                logger.info(
+                    '[PUBLICATION-CAPACITY] phase=publish decision=deferred reason=%s existing_posts_only=true',
+                    CAPACITY_UNAVAILABLE if capacity_unavailable else QUOTA_EXHAUSTED,
+                )
+        news_items = fetch_unpublished(limit=min(due, batch_cap), **fetch_options)
         if not news_items:
             print("No new news items to publish.")
             return {
-                "status": "no_work",
+                "status": 'capacity_unavailable' if capacity_unavailable else 'quota_deferred' if quota_exhausted else "no_work",
                 "attempted": 0,
                 "succeeded": 0,
                 "failed": 0,
@@ -2181,6 +2249,8 @@ def publish_news_to_wp() -> dict[str, int | str]:
                 "duplicates_rejected": 0, "duplicate_guard_deferred": 0,
                 **dict.fromkeys(DUPLICATE_COUNTER_NAMES, 0),
             }
+        quota_deferred = 0
+        freshness_deferred = 0
 
         for item in news_items:
             rich_id = int(item['id'])
@@ -2201,21 +2271,34 @@ def publish_news_to_wp() -> dict[str, int | str]:
                 post_id: int,
                 post_url: str | None,
                 article_id: int = rich_id,
+                publication_key: str = item.get('publication_key') or build_publication_key(rich_id, raw_id, item.get('news_url')),
             ) -> None:
                 '''Save legacy post identity before exposing metadata failures.'''
                 if not publication_repository.save_legacy_external_post(article_id, post_id, post_url):
                     raise RuntimeError('publication identity could not be saved')
+                if capacity_repository is not None:
+                    try:
+                        capacity_repository.record_created(article_id, publication_key, post_id)
+                    except CapacityUnavailable:
+                        # Existing pre-activation posts legitimately have no reservation.
+                        logger.info('[PUBLICATION-CAPACITY] rich_article_id=%s decision=identity-record-pending', article_id)
 
             def persist_creation_intent(article_id: int = rich_id) -> None:
                 '''Consume explicit fresh provenance before the first remote CREATE.'''
-                if not publication_repository.begin_legacy_creation(article_id):
+                intent_options = {'allow_quota_deferred': True} if capacity_repository is not None else {}
+                if not publication_repository.begin_legacy_creation(article_id, **intent_options):
                     raise RuntimeError('fresh publication permission is unavailable')
+
+            key = item.get('publication_key') or build_publication_key(
+                rich_id, raw_id, item.get('news_url'),
+            )
+
+            def authorize_capacity_create(article_id=rich_id, publication_key=key):
+                return capacity_repository.begin_create(article_id, publication_key)
 
             context = PublicationContext(
                 published_at_utc=now_utc,
-                publication_key=item.get('publication_key') or build_publication_key(
-                    rich_id, raw_id, item.get('news_url'),
-                ),
+                publication_key=key,
                 raw_article_id=raw_id,
                 rich_article_id=rich_id,
                 source_url=item.get('news_url'),
@@ -2224,9 +2307,12 @@ def publish_news_to_wp() -> dict[str, int | str]:
                 persist_external_state=persist_external,
                 creation_is_fresh=is_fresh_publication_state(saved_state),
                 persist_creation_intent=persist_creation_intent,
+                authorize_capacity_create=authorize_capacity_create if capacity_repository is not None else None,
             )
             article = PublicationArticle.from_mapping(item)
             result = wordpress_publisher.reconcile(article, context)
+            if result is None and capacity_repository is not None and needs_freshness_review(item):
+                result = PublicationResult(success=False, deferred=True, error=STALE_BACKLOG)
             if result is None:
                 try:
                     wordpress_publisher._validate_yoast(article)
@@ -2239,16 +2325,26 @@ def publish_news_to_wp() -> dict[str, int | str]:
                             guard.check()
                             if guard.mode != "off":
                                 context = replace(context, pre_create_duplicate_guard=guard.check)
-                            featured_id, image_meta = upload_image(
-                                item.get('image_url'),
-                                title=item['title'],
-                                hashtags=item.get('hashtags', ''),
-                                article=item,
-                            )
-                            image = None
-                            if featured_id:
-                                image = PublicationImage(external_id=featured_id, metadata=image_meta)
-                            result = wordpress_publisher.publish(article, image, context)
+                            if capacity_repository is not None:
+                                try:
+                                    reservation = capacity_repository.reserve(rich_id, key)
+                                    if reservation is None:
+                                        result = PublicationResult(success=False, deferred=True, error=QUOTA_EXHAUSTED)
+                                except CapacityAlreadyAttempted:
+                                    result = PublicationResult(success=False, error='post_identity_manual_reconciliation_required')
+                                except CapacityUnavailable:
+                                    result = PublicationResult(success=False, deferred=True, error=CAPACITY_UNAVAILABLE)
+                            if result is None:
+                                featured_id, image_meta = upload_image(
+                                    item.get('image_url'),
+                                    title=item['title'],
+                                    hashtags=item.get('hashtags', ''),
+                                    article=item,
+                                )
+                                image = None
+                                if featured_id:
+                                    image = PublicationImage(external_id=featured_id, metadata=image_meta)
+                                result = wordpress_publisher.publish(article, image, context)
                     except PublicationDuplicateRejected as exc:
                         try:
                             if raw_id is None or not publication_repository.reject_duplicate(rich_id, raw_id, exc.decision):
@@ -2277,6 +2373,17 @@ def publish_news_to_wp() -> dict[str, int | str]:
             if result.success:
                 mark_news_as_published(item['news_url'])
                 succeeded += 1
+            elif result.deferred:
+                if result.error == STALE_BACKLOG:
+                    publication_repository.defer_legacy_freshness(rich_id)
+                    freshness_deferred += 1
+                else:
+                    publication_repository.defer_legacy_capacity(rich_id, result.error)
+                    quota_deferred += 1
+                    capacity_unavailable = capacity_unavailable or result.error == CAPACITY_UNAVAILABLE
+                logger.info(
+                    '[PUBLICATION-CAPACITY] rich_article_id=%s decision=deferred reason=%s', rich_id, result.error,
+                )
             else:
                 if result.error == 'post_identity_manual_reconciliation_required':
                     try:
@@ -2290,11 +2397,12 @@ def publish_news_to_wp() -> dict[str, int | str]:
                 failed += 1
 
         return {
-            "status": "failed" if failed else "success",
+            "status": 'capacity_unavailable' if capacity_unavailable else "failed" if failed else 'quota_deferred' if quota_deferred or quota_exhausted else "success",
             "attempted": len(news_items),
             "succeeded": succeeded,
             "failed": failed,
             **duplicate_counts,
+            **({'quota_deferred': quota_deferred, 'freshness_deferred': freshness_deferred} if capacity_repository is not None else {}),
         }
 
     finally:

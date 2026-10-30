@@ -265,6 +265,18 @@ PROCESS_CLAIM_TIMEOUT_MINUTES = int(os.getenv("PROCESS_CLAIM_TIMEOUT_MINUTES", "
 PUBLISH_DURABLE_STATE_ENABLED = _env_bool("PUBLISH_DURABLE_STATE_ENABLED", False)
 PUBLISH_CLAIM_TIMEOUT_MINUTES = int(os.getenv("PUBLISH_CLAIM_TIMEOUT_MINUTES", "30"))
 
+# Keep disabled until the additive daily-capacity migration and controlled
+# activation procedure have been completed for every publisher instance.
+if "PUBLISH_DAILY_HARD_CAP_ENABLED" in os.environ and not os.environ["PUBLISH_DAILY_HARD_CAP_ENABLED"].strip():
+    raise ValueError("PUBLISH_DAILY_HARD_CAP_ENABLED must be a boolean value such as true or false")
+PUBLISH_DAILY_HARD_CAP_ENABLED = _env_bool("PUBLISH_DAILY_HARD_CAP_ENABLED", False)
+try:
+    PUBLISH_DAILY_HARD_CAP = int(os.getenv("PUBLISH_DAILY_HARD_CAP", "30"))
+except ValueError:
+    raise ValueError("PUBLISH_DAILY_HARD_CAP must be a positive integer") from None
+if not 1 <= PUBLISH_DAILY_HARD_CAP <= 4294967295:
+    raise ValueError("PUBLISH_DAILY_HARD_CAP must be a positive integer no greater than 4294967295")
+
 # Apply the existing Phase 2/5 schema before enabling assessment persistence.
 # Shadow remains the rollout/rollback default; enforcement is explicit.
 DUPLICATE_SHADOW_ENABLED = _env_bool("DUPLICATE_SHADOW_ENABLED", False)

@@ -58,6 +58,8 @@ class PublicationContext:
     creation_is_fresh: bool = False
     persist_creation_intent: Callable[[], None] | None = None
     pre_create_duplicate_guard: Callable[[], None] | None = None
+    # The callback commits capacity/creation intent and supplies the exact GMT date.
+    authorize_capacity_create: Callable[[], datetime | None] | None = None
 
 
 @dataclass(frozen=True)
@@ -69,6 +71,7 @@ class PublicationResult:
     created: bool = False
     reconciled: bool = False
     error: str | None = None
+    deferred: bool = False
 
 
 def is_fresh_publication_state(row: Mapping[str, Any]) -> bool:
@@ -81,7 +84,7 @@ def is_fresh_publication_state(row: Mapping[str, Any]) -> bool:
         return False
     return (
         row['published'] == 0
-        and row['publish_status'] == 'fresh'
+        and row['publish_status'] in ('fresh', 'quota_deferred')
         and type(row['publish_attempt_count']) is int
         and row['publish_attempt_count'] == 0
         and all(row[name] is None for name in (
