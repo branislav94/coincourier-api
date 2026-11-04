@@ -216,15 +216,20 @@ class DuplicateProcessingEnforcementTests(unittest.TestCase):
                 durable=durable, semantic=SimpleNamespace(candidates=(candidate,)),
             ) as calls:
                 calls["assess"].side_effect = [
-                    DuplicateDecision(mode="enforce", article_id=101, counters={"related_events_allowed": 1}),
+                    DuplicateDecision(mode="enforce", article_id=101, counters={
+                        "related_events_allowed": 1, "same_event_classifications": 5,
+                        "same_event_unconfirmed": 5,
+                    }),
                     DuplicateDecision(mode="enforce", article_id=101, counters={
                         "related_events_allowed": 1, "semantic_candidates_evaluated": 1,
+                        "same_event_classifications": 2, "same_event_unconfirmed": 2,
                     }),
                 ]
                 result = gpt_processor.process_news_with_gpt(batch_size=1)
             self.assertEqual(result, self.counts(
                 attempted=1, succeeded=1, failed=0, duplicates_rejected=0,
                 related_events_allowed=1, semantic_candidates_evaluated=1,
+                same_event_classifications=2, same_event_unconfirmed=2,
             ))
             self.database.execute("""UPDATE cryptonewsapi SET processed = 0,
                 processing_status = 'pending', processing_claim_token = NULL,
@@ -313,6 +318,9 @@ class DuplicateProcessingEnforcementTests(unittest.TestCase):
             self.assertEqual(len(repository.saved), 1)
             self.assertEqual(repository.saved[0][2]["decision"],
                              "would_reject_duplicate" if mode == "shadow" else "reject_duplicate")
+            self.assertTrue(repository.saved[0][2]["candidate_audits"][17]["confirmed_duplicate"])
+            self.assertEqual(counters["same_event_classifications"], 1)
+            self.assertEqual(counters["same_event_unconfirmed"], 0)
             if mode == "shadow":
                 self.assertIs(result, True)
                 for name in ("enrich", "rewrite", "repair", "store", "mark"):
@@ -321,6 +329,7 @@ class DuplicateProcessingEnforcementTests(unittest.TestCase):
                 self.assertIn("would_reject_duplicate", str(calls["log_info"].call_args_list))
                 self.assertEqual(self.row()["processing_status"], "pending")
                 self.assertEqual(counters["shadow_would_reject_duplicates"], 1)
+                self.assertEqual(counters["same_event_blocks"], 0)
                 self.assertEqual(counters["fail_open_unavailable_embeddings"], 1)
                 calls["semantic"].assert_called_once()
             else:
@@ -332,15 +341,50 @@ class DuplicateProcessingEnforcementTests(unittest.TestCase):
         self.assertFalse(decisions[0].reject)
         self.assertTrue(decisions[1].reject)
 
+    def test_sparse_equal_event_observation_continues_shadow_processing(self):
+        raw = {**self.row(), "news_id": "synthetic-current", "event_id": "synthetic-sparse-event",
+               "title": "Bitcoin market discussion", "full_text": "Brief source summary."}
+        prior = {**raw, "id": 17, "news_id": "synthetic-prior",
+                 "news_url": "https://other.example.invalid/sparse", "processed": 1,
+                 "processing_status": "completed", "canonical_rich_id": 27,
+                 "canonical_wp_id": 37, "canonical_published": 1,
+                 "canonical_publish_status": "published"}
+        repository = PolicyMemoryRepository(raw, [prior])
+        with self.processing(
+            mode="shadow", durable=False, semantic=SimpleNamespace(status="no_candidates", candidates=()),
+        ) as calls:
+            calls["assess"].side_effect = lambda selected, **kwargs: assess_duplicate_enforcement(
+                selected, repository=repository, **kwargs,
+            )
+            counters = {}
+            self.assertIs(gpt_processor.process_one(raw, duplicate_counters=counters), True)
+        self.assertEqual(len(repository.saved), 1)
+        evidence = repository.saved[0][2]["candidate_audits"][17]
+        self.assertEqual(evidence["classification"], "same_event_duplicate")
+        self.assertFalse(evidence["confirmed_duplicate"])
+        self.assertEqual(evidence["decision_reason"], "insufficient_structured_evidence")
+        self.assertEqual(counters, self.counts(same_event_classifications=1, same_event_unconfirmed=1))
+        self.assertEqual(self.row()["processing_status"], "pending")
+        for name in ("enrich", "rewrite", "repair", "store", "mark"):
+            calls[name].assert_called_once()
+        calls["assess"].assert_called_once()
+        calls["semantic"].assert_called_once()
+        calls["reject"].assert_not_called()
+        calls["complete"].assert_not_called()
+
     def test_shadow_semantic_candidates_reach_same_policy_without_any_disposition(self):
         candidate = SimpleNamespace(candidate_source_article_id=17, native_distance=0.001)
         semantic = SimpleNamespace(candidates=(candidate,))
         with self.processing(mode="shadow", durable=False, semantic=semantic) as calls:
             calls["assess"].side_effect = [
-                DuplicateDecision(mode="shadow", article_id=101, counters={"related_events_allowed": 1}),
+                DuplicateDecision(mode="shadow", article_id=101, counters={
+                    "related_events_allowed": 1, "same_event_classifications": 3,
+                    "same_event_unconfirmed": 3,
+                }),
                 DuplicateDecision(mode="shadow", article_id=101, counters={
                     "shadow_would_reject_duplicates": 1, "semantic_candidates_evaluated": 1,
                     "cross_source_duplicates_confirmed": 1,
+                    "same_event_classifications": 1, "same_event_unconfirmed": 0,
                 }),
             ]
             result = gpt_processor.process_news_with_gpt(batch_size=1)
@@ -351,6 +395,7 @@ class DuplicateProcessingEnforcementTests(unittest.TestCase):
             attempted=1, succeeded=1, failed=0, duplicates_rejected=0,
             shadow_would_reject_duplicates=1, semantic_candidates_evaluated=1,
             cross_source_duplicates_confirmed=1,
+            same_event_classifications=1, same_event_unconfirmed=0,
         ))
         calls["rewrite"].assert_called_once()
         calls["reject"].assert_not_called()

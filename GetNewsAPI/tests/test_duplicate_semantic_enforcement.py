@@ -90,6 +90,8 @@ class SemanticConfirmationIntegrationTests(unittest.TestCase):
         self.assertFalse(result.reject)
         self.assertEqual(result.counters["semantic_candidates_evaluated"], 1)
         self.assertEqual(result.counters["semantic_candidates_promoted"], 0)
+        self.assertEqual(result.counters["same_event_classifications"], 0)
+        self.assertEqual(result.counters["same_event_unconfirmed"], 0)
         self.assertEqual(repo.candidate_requests, [(100, "raw", (201,))])
         self.assertEqual(result.audit["candidate_audits"][201]["semantic_distance"], 0.000001)
 
@@ -104,6 +106,8 @@ class SemanticConfirmationIntegrationTests(unittest.TestCase):
         self.assertEqual(result.canonical_rich_id, 301)
         self.assertEqual(result.canonical_wp_id, 501)
         self.assertEqual(result.counters["semantic_candidates_promoted"], 1)
+        self.assertEqual(result.counters["same_event_classifications"], 1)
+        self.assertEqual(result.counters["same_event_unconfirmed"], 0)
         self.assertEqual(repo.saved[0][0], 100)
 
     def test_fresh_numeric_update_remains_allowed_despite_same_event_near_vector(self):
@@ -113,7 +117,40 @@ class SemanticConfirmationIntegrationTests(unittest.TestCase):
         self.assertFalse(result.reject)
         self.assertEqual(result.counters["material_updates_allowed"], 1)
         self.assertEqual(result.counters["semantic_candidates_promoted"], 0)
+        self.assertEqual(result.counters["same_event_classifications"], 0)
+        self.assertEqual(result.counters["same_event_unconfirmed"], 0)
         self.assertIn("new_numeric_value", result.audit["candidate_audits"][201]["new_fact_codes"])
+
+    def test_sparse_same_event_vector_distance_does_not_supply_confirmation_in_shadow(self):
+        current, prior = source(100), source(201, prior=True)
+        for article in (current, prior):
+            article.update(title="Bitcoin market discussion", full_text="Brief source summary.",
+                           event_id="synthetic-sparse-event")
+        for distance in (0.000001, 0.999):
+            with self.subTest(distance=distance):
+                repo = SourceRepository(current, prior)
+                with patch("embeddings.provider.OpenAIEmbeddingProvider") as provider:
+                    result = assess_duplicate_enforcement(
+                        current, stage="raw", mode="shadow", repository=repo,
+                        semantic_candidates=(semantic_candidate(distance=distance),),
+                    )
+                provider.assert_not_called()
+                self.assertTrue(result.available)
+                self.assertFalse(result.reject)
+                self.assertEqual(repo.source_reads, [100])
+                evidence = result.audit["candidate_audits"][201]
+                self.assertEqual(evidence["classification"], "same_event_duplicate")
+                self.assertTrue(evidence["same_event_id"])
+                self.assertFalse(evidence["confirmed_duplicate"])
+                self.assertEqual(evidence["decision_reason"], "insufficient_structured_evidence")
+                self.assertEqual(evidence["semantic_distance"], distance)
+                self.assertEqual(result.counters["same_event_classifications"], 1)
+                self.assertEqual(result.counters["same_event_unconfirmed"], 1)
+                self.assertEqual(result.counters["shadow_would_reject_duplicates"], 0)
+                self.assertEqual(result.counters["same_event_blocks"], 0)
+                self.assertEqual(result.counters["exact_blocks"], 0)
+                self.assertEqual(result.counters["semantic_candidates_evaluated"], 1)
+                self.assertEqual(result.counters["semantic_candidates_promoted"], 0)
 
     def test_strong_structured_same_event_without_provider_id_is_confirmed_after_vector_retrieval(self):
         current, prior = source(100, event_id=None), source(201, prior=True, event_id=None)
@@ -140,6 +177,8 @@ class SemanticConfirmationIntegrationTests(unittest.TestCase):
         result, _repo = self.assess(current, prior, candidates=(semantic_candidate(),))
         self.assertFalse(result.reject)
         self.assertEqual(result.counters["semantic_candidates_evaluated"], 0)
+        self.assertEqual(result.counters["same_event_classifications"], 0)
+        self.assertEqual(result.counters["same_event_unconfirmed"], 0)
 
     def test_valid_retrieval_survives_vector_audit_failure_then_uses_fresh_raw_policy(self):
         selected = semantic_candidate()

@@ -159,11 +159,28 @@ Per-article counters include `exact_blocks`, `same_event_blocks`,
 `broad_topic_overlaps_allowed`, `semantic_candidates_evaluated`,
 `semantic_candidates_promoted`, `fail_open_unavailable_embeddings`,
 `shadow_would_reject_duplicates` and `cross_source_duplicates_confirmed`.
-The last counts actual unavailable retrieval, not disabled retrieval or an empty
-successful search. Pair classifications count assessed pairs; block counters
+`fail_open_unavailable_embeddings` counts actual unavailable retrieval, not
+disabled retrieval or an empty successful search. Pair classifications
+count assessed pairs; block counters
 count the final article decision. Shadow summaries keep actual block/rejection
 counters at zero; would-reject and cross-source confirmation counts remain
 separately observable.
+
+`same_event_classifications` counts distinct credible assessed pairs classified
+as `same_event_duplicate`; `same_event_unconfirmed` counts the subset whose
+deterministic confirmation remains false. These are pair-level observations in
+the final returned assessment snapshot, not article-level flags. Semantic
+reassessment replaces the earlier snapshot rather than adding both passes.
+`same_event_unconfirmed` does not imply a false negative, and a same-event
+classification does not imply enforcement eligibility.
+
+Provider-event confirmation and structured-cross-source confirmation are
+separate paths. `cross_source_duplicates_confirmed` counts only confirmed
+`structured_cross_source` identities, not provider-event confirmations across
+different outlets or URLs. The new counts do not alter either path, existing
+block/hypothetical-rejection counters or canonical selection. Like existing
+pair counters they record computed observations, not proof of successful audit
+persistence or disposition; existing unavailable/audit-failure handling remains.
 
 ## Final publication boundary
 

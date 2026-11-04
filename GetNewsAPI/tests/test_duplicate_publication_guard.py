@@ -428,6 +428,9 @@ class PublicationGuardTests(unittest.TestCase):
         self.assertEqual(result["duplicates_rejected"], 0)
         self.assertEqual(result["duplicate_guard_deferred"], 0)
         self.assertEqual(result["shadow_would_reject_duplicates"], 1)
+        self.assertEqual(result["same_event_classifications"], 1)
+        self.assertEqual(result["same_event_unconfirmed"], 0)
+        self.assertEqual(result["same_event_blocks"], 0)
         self.assertEqual(len(store.media_calls), 1)
         self.assertEqual(len(store.requests), 1)
         self.assertEqual(repo.rejections, [])
@@ -439,6 +442,86 @@ class PublicationGuardTests(unittest.TestCase):
         self.assertIn("stage=pre_publish", " ".join(logs.output))
         self.assertIn("decision=would_reject_duplicate", " ".join(logs.output))
         lock.assert_not_called()
+
+    def test_shadow_sparse_pre_publish_counts_unconfirmed_without_duplicate_disposition(self):
+        store = SharedStore()
+        store.require_mutex = False
+        for row in store.raw.values():
+            row.update(title="Bitcoin market discussion", full_text="Brief source summary.")
+        store.rich[120].update(publish_status="published", published=1, wp_post_id=800)
+        guard = store.guard(10, "shadow")
+        service, repo = self.service(store, 110, mode="shadow", guard_factory=lambda _raw_id: guard)
+
+        with self.wordpress(store):
+            result = service.publish_due(1)
+
+        self.assertEqual(len(store.audits), 2)
+        for _raw_id, pairs, audit in store.audits:
+            self.assertEqual(audit["stage"], "pre_publish")
+            self.assertEqual(audit["mode"], "shadow")
+            self.assertEqual(audit["decision"], "would_continue")
+            self.assertEqual(len(pairs), 1)
+            self.assertEqual(audit["candidate_audits"][20]["classification"], "same_event_duplicate")
+            self.assertFalse(audit["candidate_audits"][20]["confirmed_duplicate"])
+            self.assertEqual(audit["counters"]["same_event_classifications"], 1)
+            self.assertEqual(audit["counters"]["same_event_unconfirmed"], 1)
+            self.assertEqual(audit["counters"]["shadow_would_reject_duplicates"], 0)
+            self.assertEqual(audit["counters"]["same_event_blocks"], 0)
+        self.assertTrue(guard.decision.available)
+        self.assertFalse(guard.decision.reject)
+        self.assertEqual(result["same_event_classifications"], 1)
+        self.assertEqual(result["same_event_unconfirmed"], 1)
+        self.assertEqual(result["shadow_would_reject_duplicates"], 0)
+        self.assertEqual(result["same_event_blocks"], 0)
+        self.assertEqual(result["duplicates_rejected"], 0)
+        self.assertEqual(result["duplicate_guard_deferred"], 0)
+        self.assertEqual(result["succeeded"], 1)
+        self.assertEqual(result["failed"], 0)
+        self.assertEqual(len(store.media_calls), 1)
+        self.assertEqual(len(store.requests), 1)
+        self.assertEqual(repo.rejections, [])
+        self.assertEqual(repo.manual, [])
+        self.assertEqual(repo.failures, [])
+        self.assertEqual(store.rich[110]["publish_status"], "published")
+
+    def test_shadow_publication_reports_only_last_pair_counter_snapshot(self):
+        store = SharedStore()
+        store.require_mutex = False
+        store.rich[120].update(publish_status="published", published=1, wp_post_id=800)
+        service, repo = self.service(store, 110, mode="shadow")
+
+        def image(row):
+            result = store.image(row)
+            store.raw[30] = raw_article(30)
+            store.rich[130] = {
+                **deepcopy(store.rich[120]), "id": 130, "raw_article_id": 30,
+                "news_url": store.raw[30]["news_url"], "wp_post_id": 801,
+            }
+            return result
+
+        service.image_preparer = image
+        with self.wordpress(store):
+            result = service.publish_due(1)
+
+        self.assertEqual(
+            [(audit[2]["counters"]["same_event_classifications"],
+              audit[2]["counters"]["same_event_unconfirmed"])
+             for audit in store.audits],
+            [(1, 0), (2, 0)],
+        )
+        self.assertEqual(result["same_event_classifications"], 2)
+        self.assertEqual(result["same_event_unconfirmed"], 0)
+        self.assertEqual(result["shadow_would_reject_duplicates"], 1)
+        self.assertEqual(result["same_event_blocks"], 0)
+        self.assertEqual(result["duplicates_rejected"], 0)
+        self.assertEqual(result["duplicate_guard_deferred"], 0)
+        self.assertEqual(result["succeeded"], 1)
+        self.assertEqual(result["failed"], 0)
+        self.assertEqual(len(store.media_calls), 1)
+        self.assertEqual(len(store.requests), 1)
+        self.assertEqual(repo.rejections, [])
+        self.assertEqual(repo.manual, [])
+        self.assertEqual(store.rich[110]["publish_status"], "published")
 
     def test_shadow_assessment_errors_are_sanitized_and_never_block_publication(self):
         store = SharedStore()
@@ -453,6 +536,8 @@ class PublicationGuardTests(unittest.TestCase):
         self.assertEqual(result["duplicates_rejected"], 0)
         self.assertEqual(result["duplicate_guard_deferred"], 0)
         self.assertEqual(result["shadow_would_reject_duplicates"], 0)
+        self.assertEqual(result["same_event_classifications"], 0)
+        self.assertEqual(result["same_event_unconfirmed"], 0)
         self.assertEqual(len(store.media_calls), 1)
         self.assertEqual(len(store.requests), 1)
         self.assertEqual(assess.call_count, 2)
@@ -512,6 +597,9 @@ class PublicationGuardTests(unittest.TestCase):
         self.assertEqual(result["failed"], 0)
         self.assertEqual(result["duplicates_rejected"], 0)
         self.assertEqual(result["shadow_would_reject_duplicates"], 1)
+        self.assertEqual(result["same_event_classifications"], 1)
+        self.assertEqual(result["same_event_unconfirmed"], 0)
+        self.assertEqual(result["same_event_blocks"], 0)
         self.assertEqual(len(store.requests), 1)
         self.assertEqual(len(store.audits), 2)
         upload.assert_called_once()

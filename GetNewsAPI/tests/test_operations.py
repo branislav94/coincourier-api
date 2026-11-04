@@ -443,6 +443,55 @@ class PipelineTests(unittest.TestCase):
         self.assertEqual(events, ["process", "publish"])
         self.assertEqual(result.status, JobStatus.SUCCESS)
 
+    def test_same_event_observations_preserve_pipeline_namespaces_and_format(self):
+        environment = pipeline_environment()
+        connection = FakeConnection(environment["DB_NAME"])
+        with (
+            patch.object(jobs, "_execute_process", return_value=WorkResult(
+                JobStatus.SUCCESS, "process", {
+                    "attempted": 2, "succeeded": 2, "duplicates_rejected": 0,
+                    "same_event_classifications": 3, "same_event_unconfirmed": 2,
+                    "shadow_would_reject_duplicates": 1, "same_event_blocks": 0,
+                },
+            )) as process,
+            patch.object(jobs, "_execute_publish", return_value=WorkResult(
+                JobStatus.SUCCESS, "publish", {
+                    "attempted": 2, "succeeded": 2, "duplicates_rejected": 0,
+                    "same_event_classifications": 5, "same_event_unconfirmed": 1,
+                    "shadow_would_reject_duplicates": 1, "same_event_blocks": 0,
+                },
+            )) as publish,
+        ):
+            result = jobs.run_job(
+                "pipeline_once", environment=environment,
+                connection_factory=lambda _target: connection,
+            )
+
+        expected = {
+            "process_attempted": 2, "process_succeeded": 2,
+            "process_duplicates_rejected": 0,
+            "process_same_event_classifications": 3, "process_same_event_unconfirmed": 2,
+            "process_shadow_would_reject_duplicates": 1, "process_same_event_blocks": 0,
+            "publish_attempted": 2, "publish_succeeded": 2,
+            "publish_duplicates_rejected": 0,
+            "publish_same_event_classifications": 5, "publish_same_event_unconfirmed": 1,
+            "publish_shadow_would_reject_duplicates": 1, "publish_same_event_blocks": 0,
+        }
+        self.assertEqual(result.status, JobStatus.SUCCESS)
+        self.assertEqual(result.counts, expected)
+        rendered = jobs.render_job_result(result)
+        payload = json.loads(rendered)
+        self.assertEqual(payload["counts"], expected)
+        self.assertEqual(payload["job"], "pipeline_once")
+        self.assertEqual(payload["stage"], "pipeline")
+        self.assertEqual(payload["status"], "SUCCESS")
+        self.assertIsInstance(payload["duration_ms"], int)
+        self.assertNotIn(environment["DB_PASSWORD"], rendered)
+        self.assertNotIn(environment["WP_APP_PASSWORD"], rendered)
+        process.assert_called_once()
+        publish.assert_called_once()
+        self.assertTrue(connection.closed)
+
     def test_no_processing_work_still_attempts_publish(self):
         publish = Mock(return_value=WorkResult(JobStatus.SUCCESS, "publish", {"attempted": 1}))
         with (
