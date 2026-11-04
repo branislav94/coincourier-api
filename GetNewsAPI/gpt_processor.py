@@ -27,6 +27,7 @@ from config import (
     PUBLISH_DAILY_HARD_CAP,
     PUBLISH_DAILY_HARD_CAP_ENABLED,
     PRIMARY_LLM_PROVIDER,
+    PUBLIC_COPY_GATE_MODE,
     get_grok_reasoning_effort,
 )
 from duplicate_detection.shadow import analyze_duplicates_in_shadow
@@ -59,6 +60,7 @@ from research_citations import (
     ResearchCitation, current_research_citations, research_citation_scope,
     retain_response_citations,
 )
+from public_copy_gate import observe_public_copy
 
 configure_logging()
 
@@ -2386,6 +2388,14 @@ def process_one(raw, *, mark_complete=True, on_error=None, duplicate_counters=No
             model=_provider_model(text_provider, REWRITE_MODEL), document=final_doc,
             validation_status='passed',
         )
+        try:
+            observe_public_copy(
+                final_doc.get('full_text'), mode=PUBLIC_COPY_GATE_MODE,
+                stage='pre_storage', raw_article_id=raw.get('id'),
+            )
+        except Exception:
+            # Shadow observation must not enter provider fallback or retry paths.
+            pass
         logging.info("SEO dump: %s", {k: final_doc[k] for k in ("seo_focus","seo_slug","seo_meta")})
         store_rich_news(final_doc, raw)     # ✅ store first
         if mark_complete:

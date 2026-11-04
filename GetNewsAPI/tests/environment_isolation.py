@@ -49,6 +49,7 @@ SAFE_TEST_ENVIRONMENT = {
     "PUBLISH_DAILY_HARD_CAP": "30",
     "DUPLICATE_SHADOW_ENABLED": "false",
     "DUPLICATE_ENFORCEMENT_MODE": "shadow",
+    "PUBLIC_COPY_GATE_MODE": "shadow",
     "VECTOR_ENABLED": "false",
     "EMBEDDING_ENABLED": "false",
     "EMBEDDING_FRESH_START_AFTER_UTC": "",
@@ -96,6 +97,7 @@ def install_test_environment() -> None:
     """Override connectivity settings and prevent dotenv reads in this test process."""
 
     os.environ.update(SAFE_TEST_ENVIRONMENT)
+    os.environ.pop("DUPLICATE_ENFORCE_MODE", None)
     dotenv.load_dotenv = _disabled_test_dotenv
 
 

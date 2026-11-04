@@ -3,13 +3,122 @@
 from __future__ import annotations
 
 import json
+import logging
 import math
+import re
 from dataclasses import dataclass
 from datetime import datetime
 from enum import Enum
 from typing import Any, Callable
 
+from mysql.connector import Error as ConnectorError
+
 from .db import connect_vector_db
+
+
+logger = logging.getLogger(__name__)
+_PERSISTENCE_OPERATIONS = frozenset({
+    "serialize", "connect", "cursor", "begin", "select_provisional",
+    "delete_resolved", "promote_provisional", "upsert", "read_insert_id",
+    "commit", "cursor_close", "connection_close",
+})
+_TRANSACTION_OUTCOMES = frozenset({
+    "not_started", "rolled_back", "rollback_failed", "commit_unknown", "committed",
+})
+_CONNECTOR_ERROR_TYPES = frozenset({
+    "Error", "Warning", "InterfaceError", "DatabaseError", "DataError",
+    "OperationalError", "IntegrityError", "InternalError", "ProgrammingError",
+    "NotSupportedError", "PoolError",
+})
+
+
+def _error_fields(error: BaseException) -> tuple[str, int | None, str | None]:
+    """Project fixed exception classes and primitive driver codes, never error text."""
+    error_type = "OtherError"
+    errno = None
+    sqlstate = None
+    if isinstance(error, ConnectorError):
+        for error_class in type(error).__mro__:
+            if (error_class.__module__ == "mysql.connector.errors"
+                    and error_class.__name__ in _CONNECTOR_ERROR_TYPES):
+                error_type = error_class.__name__
+                break
+        # Driver attributes are optional; do not convert arbitrary values or args.
+        try:
+            candidate_errno = error.errno
+            candidate_sqlstate = error.sqlstate
+        except Exception:
+            candidate_errno = candidate_sqlstate = None
+        if type(candidate_errno) is int and 0 <= candidate_errno <= 99999:
+            errno = candidate_errno
+        if (type(candidate_sqlstate) is str
+                and re.fullmatch(r"[0-9A-Z]{5}", candidate_sqlstate)):
+            sqlstate = candidate_sqlstate
+    else:
+        for error_class in (ValueError, TypeError, RuntimeError, TimeoutError, OSError):
+            if isinstance(error, error_class):
+                error_type = error_class.__name__
+                break
+    return error_type, errno, sqlstate
+
+
+@dataclass(frozen=True)
+class SemanticPersistenceDiagnostic:
+    """Controlled persistence metadata safe for the advisory result and logs."""
+
+    operation: str
+    error_type: str
+    errno: int | None
+    sqlstate: str | None
+    transaction_outcome: str
+    rollback_failed: bool = False
+    cursor_close_failed: bool = False
+    connection_close_failed: bool = False
+
+    def __post_init__(self) -> None:
+        if type(self.operation) is not str or self.operation not in _PERSISTENCE_OPERATIONS:
+            raise ValueError("unknown semantic persistence operation")
+        if (type(self.transaction_outcome) is not str
+                or self.transaction_outcome not in _TRANSACTION_OUTCOMES):
+            raise ValueError("unknown semantic transaction outcome")
+        if type(self.error_type) is not str or self.error_type not in (
+            _CONNECTOR_ERROR_TYPES | {"OtherError", "ValueError", "TypeError", "RuntimeError", "TimeoutError", "OSError"}
+        ):
+            raise ValueError("unknown semantic persistence error type")
+        if self.errno is not None and (type(self.errno) is not int or not 0 <= self.errno <= 99999):
+            raise ValueError("invalid semantic persistence errno")
+        if self.sqlstate is not None and (
+            type(self.sqlstate) is not str or not re.fullmatch(r"[0-9A-Z]{5}", self.sqlstate)
+        ):
+            raise ValueError("invalid semantic persistence SQLSTATE")
+        if any(type(value) is not bool for value in (
+            self.rollback_failed, self.cursor_close_failed, self.connection_close_failed,
+        )):
+            raise ValueError("invalid semantic persistence cleanup flag")
+
+
+class SemanticAssessmentPersistenceError(RuntimeError):
+    """A fixed message plus safe codes; original messages/args are never copied."""
+
+    def __init__(self, diagnostic: SemanticPersistenceDiagnostic) -> None:
+        super().__init__("semantic assessment persistence failed")
+        self.diagnostic = diagnostic
+
+
+def _log_cleanup_failure(
+    error: BaseException, operation: str, transaction_outcome: str,
+) -> None:
+    error_type, errno, sqlstate = _error_fields(error)
+    try:
+        logger.warning(
+            "[SEMANTIC-PERSISTENCE] operation=%s error_type=%s db_errno=%s "
+            "db_sqlstate=%s transaction_outcome=%s decision=continue",
+            operation, error_type, errno, sqlstate, transaction_outcome,
+        )
+    except Exception:
+        # Diagnostic transport cannot mask the write outcome or prevent the
+        # remaining cleanup. Do not echo the handler's exception anywhere else.
+        return
 
 
 class SemanticAssessmentStatus(str, Enum):
@@ -140,27 +249,41 @@ class SemanticAssessmentRepository:
         self._connect = connect or connect_vector_db
 
     def save_assessment(self, draft: SemanticAssessmentDraft) -> int:
-        evidence_json = json.dumps(
-            draft.evidence,
-            ensure_ascii=True,
-            allow_nan=False,
-            sort_keys=True,
-            separators=(",", ":"),
-        )
-        connection = self._connect()
-        cursor = connection.cursor(dictionary=True)
+        connection = cursor = None
+        operation = "serialize"
+        transaction_attempted = commit_attempted = committed = False
+        primary_error = None
+        rollback_failed = cursor_close_failed = connection_close_failed = False
+        outcome = "not_started"
+
+        def set_operation(value: str) -> None:
+            nonlocal operation
+            operation = value
+
         try:
+            evidence_json = json.dumps(
+                draft.evidence,
+                ensure_ascii=True,
+                allow_nan=False,
+                sort_keys=True,
+                separators=(",", ":"),
+            )
+            operation = "connect"
+            connection = self._connect()
+            operation = "cursor"
+            cursor = connection.cursor(dictionary=True)
+            operation = "begin"
+            transaction_attempted = True
             connection.start_transaction()
             assessment_id = self._promote_provisional_assessment(
                 cursor,
                 draft,
                 evidence_json,
+                set_operation=set_operation,
             )
-            if assessment_id is not None:
-                connection.commit()
-                return assessment_id
-
-            cursor.execute(
+            if assessment_id is None:
+                operation = "upsert"
+                cursor.execute(
                 """
                 INSERT INTO semantic_shadow_assessments
                     (query_source_article_id, query_document_id,
@@ -205,27 +328,68 @@ class SemanticAssessmentRepository:
                     draft.error_type,
                     draft.safe_error,
                 ),
-            )
-            assessment_id = int(cursor.lastrowid)
+                )
+                operation = "read_insert_id"
+                assessment_id = int(cursor.lastrowid)
+            operation = "commit"
+            commit_attempted = True
             connection.commit()
-            return assessment_id
-        except BaseException:
-            connection.rollback()
-            raise
+            committed = True
+            outcome = "committed"
+        except BaseException as error:
+            primary_error = error
+            if transaction_attempted:
+                try:
+                    connection.rollback()
+                    outcome = "rolled_back"
+                except Exception:
+                    rollback_failed = True
+                    outcome = "rollback_failed"
+            # An acknowledgement failure can follow a successful server commit.
+            # Rollback cannot prove absence, and no automatic replay is safe here.
+            if commit_attempted:
+                outcome = "commit_unknown"
         finally:
-            cursor.close()
-            connection.close()
+            if cursor is not None:
+                try:
+                    cursor.close()
+                except Exception as error:
+                    cursor_close_failed = True
+                    _log_cleanup_failure(error, "cursor_close", outcome)
+            if connection is not None:
+                try:
+                    connection.close()
+                except Exception as error:
+                    connection_close_failed = True
+                    _log_cleanup_failure(error, "connection_close", outcome)
+
+        if primary_error is not None:
+            if not isinstance(primary_error, Exception):
+                raise primary_error
+            error_type, errno, sqlstate = _error_fields(primary_error)
+            raise SemanticAssessmentPersistenceError(SemanticPersistenceDiagnostic(
+                operation=operation, error_type=error_type, errno=errno, sqlstate=sqlstate,
+                transaction_outcome=outcome, rollback_failed=rollback_failed,
+                cursor_close_failed=cursor_close_failed,
+                connection_close_failed=connection_close_failed,
+            )) from None
+        if not committed:
+            raise RuntimeError("semantic assessment commit was not confirmed")
+        return assessment_id
 
     @staticmethod
     def _promote_provisional_assessment(
         cursor: Any,
         draft: SemanticAssessmentDraft,
         evidence_json: str,
+        *,
+        set_operation: Callable[[str], None],
     ) -> int | None:
         """Resolve a source-level provisional row to its durable document identity."""
         if draft.query_document_id is None:
             return None
 
+        set_operation("select_provisional")
         cursor.execute(
             """
             SELECT id, query_document_id, evaluation_count, created_at
@@ -262,11 +426,12 @@ class SemanticAssessmentRepository:
         ]
         if duplicate_ids:
             placeholders = ", ".join("%s" for _ in duplicate_ids)
+            set_operation("delete_resolved")
             cursor.execute(
                 f"DELETE FROM semantic_shadow_assessments WHERE id IN ({placeholders})",
                 tuple(duplicate_ids),
             )
-
+        set_operation("promote_provisional")
         cursor.execute(
             """
             UPDATE semantic_shadow_assessments

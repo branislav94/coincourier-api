@@ -5,10 +5,12 @@ from __future__ import annotations
 from dataclasses import asdict, dataclass
 from datetime import datetime, timezone
 import json
+import logging
 import os
 from typing import Any, Callable, Mapping
 
 from runtime.config_validation import FALSE_VALUES, TRUE_VALUES, validate_runtime_config
+from runtime.editorial_modes import editorial_mode_summary
 
 from .locking import ConnectionFactory, advisory_job_lock
 from .models import (
@@ -386,6 +388,10 @@ def run_job(
             ),
         )
 
+    logging.getLogger(__name__).info(
+        "[EDITORIAL-MODES] context=invocation_environment settings=%s",
+        json.dumps(editorial_mode_summary(env), sort_keys=True, separators=(",", ":")),
+    )
     request = JobRequest(limit=limit, source=source)
     executor = EXECUTORS[spec.executor]
     try:

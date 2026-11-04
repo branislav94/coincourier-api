@@ -40,6 +40,7 @@ from config import (
     PUBLISH_DURABLE_STATE_ENABLED,
     PUBLISH_DAILY_HARD_CAP_ENABLED,
     PUBLISH_DAILY_HARD_CAP,
+    PUBLIC_COPY_GATE_MODE,
     STOCK_IMAGE_TIMEOUT_SECONDS,
     USE_API_IMAGES,
     USE_SOURCE_IMAGES,
@@ -73,6 +74,7 @@ from publishing.wordpress import media as wordpress_media
 from publishing.wordpress import persistence as wordpress_persistence
 from publishing.wordpress import seo as wordpress_seo
 from publishing.wordpress import taxonomy as wordpress_taxonomy
+from public_copy_gate import observe_public_copy
 
 API_BASE = wordpress_client.API_BASE
 RETRY_STATUS = wordpress_client.RETRY_STATUS
@@ -1962,6 +1964,15 @@ class WordPressPublisher:
         reconciled = self.reconcile(article, context)
         if reconciled is not None:
             return reconciled
+
+        try:
+            observe_public_copy(
+                article.html_content, mode=PUBLIC_COPY_GATE_MODE, stage='pre_create',
+                raw_article_id=context.raw_article_id, rich_article_id=context.rich_article_id,
+            )
+        except Exception:
+            # Existing identity, CREATE and metadata behavior cannot depend on shadow telemetry.
+            pass
 
         cat_names = [
             category.strip()

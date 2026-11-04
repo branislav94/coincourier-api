@@ -8,6 +8,7 @@ from datetime import datetime, timedelta
 from pathlib import Path
 from unittest.mock import Mock, patch
 
+from mysql.connector.errors import DatabaseError
 
 PROJECT_DIR = Path(__file__).resolve().parents[1]
 REPOSITORY_DIR = PROJECT_DIR.parent
@@ -39,8 +40,10 @@ from vector_store.models import (
 )
 from vector_store.semantic_assessments import (
     SemanticAssessmentDraft,
+    SemanticAssessmentPersistenceError,
     SemanticAssessmentRepository,
     SemanticAssessmentStatus,
+    SemanticPersistenceDiagnostic,
 )
 
 
@@ -336,6 +339,56 @@ class SemanticShadowMappingTests(unittest.TestCase):
         self.assertEqual(result.reason, "persistence_failed")
         self.assertFalse(result.persisted)
         self.assertEqual(result.error_type, "RuntimeError")
+
+    def test_controlled_database_diagnostic_preserves_candidates_and_continue(self):
+        selected = candidate()
+        writer = MemoryAssessmentWriter()
+        writer.error = SemanticAssessmentPersistenceError(SemanticPersistenceDiagnostic(
+            operation="commit", error_type="DatabaseError", errno=2013,
+            sqlstate="HY000", transaction_outcome="commit_unknown",
+            rollback_failed=True, cursor_close_failed=True,
+        ))
+        with self.assertLogs(shadow.logger, level="ERROR") as captured:
+            result, _ = self.run_stubbed(StubRetriever(retrieval_result(
+                SemanticRetrievalStatus.RETRIEVED, candidates=(selected,),
+            )), writer=writer)
+        self.assertFalse(result.persisted)
+        self.assertEqual(result.candidates, (selected,))
+        self.assertEqual(result.error_type, "DatabaseError")
+        self.assertEqual(result.persistence_operation, "commit")
+        self.assertEqual(result.database_errno, 2013)
+        self.assertEqual(result.database_sqlstate, "HY000")
+        self.assertEqual(result.transaction_outcome, "commit_unknown")
+        self.assertTrue(result.rollback_failed)
+        self.assertTrue(result.cursor_close_failed)
+        self.assertIn("decision=continue", " ".join(captured.output))
+        self.assertIn("db_errno=2013", " ".join(captured.output))
+        self.assertNotIn(selected.candidate_source_url, " ".join(captured.output))
+        self.assertNotIn(selected.candidate_title, " ".join(captured.output))
+
+    def test_confirmed_commit_with_cleanup_failure_remains_persisted_in_shadow(self):
+        cursor = Mock()
+        cursor.lastrowid = 17
+        cursor.fetchall.return_value = []
+        cursor.close.side_effect = DatabaseError("CREDENTIAL_CANARY_CLEANUP", errno=2013)
+        connection = Mock()
+        connection.cursor.return_value = cursor
+        repository = SemanticAssessmentRepository(connect=lambda: connection)
+        selected = candidate()
+        with self.assertLogs("vector_store.semantic_assessments", level="WARNING") as captured:
+            result, _ = self.run_stubbed(StubRetriever(retrieval_result(
+                SemanticRetrievalStatus.RETRIEVED, candidates=(selected,),
+            )), writer=repository)
+        self.assertTrue(result.persisted)
+        self.assertEqual(result.status, SemanticAssessmentStatus.RETRIEVED)
+        self.assertEqual(result.assessment_id, 17)
+        self.assertEqual(result.transaction_outcome, "committed")
+        self.assertEqual(result.candidates, (selected,))
+        connection.commit.assert_called_once_with()
+        connection.rollback.assert_not_called()
+        connection.close.assert_called_once_with()
+        self.assertIn("transaction_outcome=committed", " ".join(captured.output))
+        self.assertNotIn("CREDENTIAL_CANARY", " ".join(captured.output))
 
     def test_nonfinite_or_generated_evidence_cannot_persist_as_success(self):
         cases = (
@@ -672,10 +725,178 @@ class SemanticAssessmentRepositoryTests(unittest.TestCase):
         connection = Mock()
         connection.cursor.return_value = cursor
         repository = SemanticAssessmentRepository(connect=lambda: connection)
-        with self.assertRaisesRegex(RuntimeError, "write unavailable"):
+        with self.assertRaises(SemanticAssessmentPersistenceError) as caught:
             repository.save_assessment(self.draft())
+        self.assertEqual(caught.exception.diagnostic.operation, "select_provisional")
+        self.assertEqual(caught.exception.diagnostic.transaction_outcome, "rolled_back")
+        self.assertNotIn("write unavailable", str(caught.exception))
         connection.rollback.assert_called_once_with()
         connection.close.assert_called_once_with()
+
+    def test_cursor_creation_failure_closes_established_connection(self):
+        connection = Mock()
+        connection.cursor.side_effect = DatabaseError(
+            "CREDENTIAL_CANARY_CURSOR", errno=1045, sqlstate="28000",
+        )
+        repository = SemanticAssessmentRepository(connect=lambda: connection)
+        with self.assertRaises(SemanticAssessmentPersistenceError) as caught:
+            repository.save_assessment(self.draft())
+        diagnostic = caught.exception.diagnostic
+        self.assertEqual(diagnostic.operation, "cursor")
+        self.assertEqual(diagnostic.errno, 1045)
+        self.assertEqual(diagnostic.sqlstate, "28000")
+        self.assertEqual(diagnostic.transaction_outcome, "not_started")
+        connection.close.assert_called_once_with()
+        connection.start_transaction.assert_not_called()
+        connection.rollback.assert_not_called()
+        self.assertNotIn("CREDENTIAL_CANARY", str(caught.exception))
+
+    def test_primary_codes_survive_rollback_and_both_cleanup_failures(self):
+        cursor = Mock()
+        cursor.execute.side_effect = DatabaseError(
+            "CREDENTIAL_CANARY_PRIMARY", errno=1142, sqlstate="42000",
+        )
+        cursor.close.side_effect = RuntimeError("CREDENTIAL_CANARY_CURSOR_CLOSE")
+        connection = Mock()
+        connection.cursor.return_value = cursor
+        connection.rollback.side_effect = RuntimeError("CREDENTIAL_CANARY_ROLLBACK")
+        connection.close.side_effect = RuntimeError("CREDENTIAL_CANARY_CONNECTION_CLOSE")
+        repository = SemanticAssessmentRepository(connect=lambda: connection)
+        with self.assertLogs("vector_store.semantic_assessments", level="WARNING") as captured:
+            with self.assertRaises(SemanticAssessmentPersistenceError) as caught:
+                repository.save_assessment(self.draft())
+        diagnostic = caught.exception.diagnostic
+        self.assertEqual(diagnostic.operation, "select_provisional")
+        self.assertEqual(diagnostic.error_type, "DatabaseError")
+        self.assertEqual(diagnostic.errno, 1142)
+        self.assertEqual(diagnostic.sqlstate, "42000")
+        self.assertEqual(diagnostic.transaction_outcome, "rollback_failed")
+        self.assertTrue(diagnostic.rollback_failed)
+        self.assertTrue(diagnostic.cursor_close_failed)
+        self.assertTrue(diagnostic.connection_close_failed)
+        connection.close.assert_called_once_with()
+        self.assertNotIn("CREDENTIAL_CANARY", " ".join(captured.output))
+        self.assertNotIn("CREDENTIAL_CANARY", str(caught.exception))
+
+    def test_cleanup_failures_after_confirmed_commit_keep_saved_id(self):
+        cursor = Mock()
+        cursor.lastrowid = 7
+        cursor.fetchall.return_value = []
+        cursor.close.side_effect = DatabaseError("CREDENTIAL_CANARY_CURSOR", errno=2013)
+        connection = Mock()
+        connection.cursor.return_value = cursor
+        connection.close.side_effect = DatabaseError("CREDENTIAL_CANARY_CONNECTION", errno=2013)
+        repository = SemanticAssessmentRepository(connect=lambda: connection)
+        with self.assertLogs("vector_store.semantic_assessments", level="WARNING") as captured:
+            self.assertEqual(repository.save_assessment(self.draft()), 7)
+        connection.commit.assert_called_once_with()
+        connection.rollback.assert_not_called()
+        connection.close.assert_called_once_with()
+        self.assertEqual(len(captured.output), 2)
+        self.assertTrue(all("transaction_outcome=committed" in line for line in captured.output))
+        self.assertNotIn("CREDENTIAL_CANARY", " ".join(captured.output))
+
+    def test_broken_cleanup_logger_cannot_mask_commit_or_primary_codes(self):
+        for committed in (False, True):
+            with self.subTest(committed=committed):
+                cursor = Mock()
+                cursor.lastrowid = 7
+                cursor.fetchall.return_value = []
+                cursor.close.side_effect = DatabaseError("CREDENTIAL_CANARY_CURSOR_CLOSE", errno=2013)
+                if not committed:
+                    cursor.execute.side_effect = DatabaseError(
+                        "CREDENTIAL_CANARY_PRIMARY", errno=1142, sqlstate="42000",
+                    )
+                connection = Mock()
+                connection.cursor.return_value = cursor
+                connection.close.side_effect = DatabaseError("CREDENTIAL_CANARY_CONNECTION_CLOSE", errno=2013)
+                repository = SemanticAssessmentRepository(connect=lambda: connection)
+                with patch("vector_store.semantic_assessments.logger.warning",
+                           side_effect=RuntimeError("CREDENTIAL_CANARY_LOG_HANDLER")) as warning:
+                    if committed:
+                        self.assertEqual(repository.save_assessment(self.draft()), 7)
+                    else:
+                        with self.assertRaises(SemanticAssessmentPersistenceError) as caught:
+                            repository.save_assessment(self.draft())
+                        diagnostic = caught.exception.diagnostic
+                        self.assertEqual(diagnostic.operation, "select_provisional")
+                        self.assertEqual(diagnostic.error_type, "DatabaseError")
+                        self.assertEqual(diagnostic.errno, 1142)
+                        self.assertEqual(diagnostic.sqlstate, "42000")
+                        self.assertEqual(diagnostic.transaction_outcome, "rolled_back")
+                        self.assertTrue(diagnostic.cursor_close_failed)
+                        self.assertTrue(diagnostic.connection_close_failed)
+                        self.assertNotIn("CREDENTIAL_CANARY", str(caught.exception))
+                cursor.close.assert_called_once_with()
+                connection.close.assert_called_once_with()
+                self.assertEqual(warning.call_count, 2)
+                self.assertNotIn("CREDENTIAL_CANARY", repr(warning.call_args_list))
+                if committed:
+                    connection.commit.assert_called_once_with()
+                    connection.rollback.assert_not_called()
+                else:
+                    connection.commit.assert_not_called()
+                    connection.rollback.assert_called_once_with()
+
+    def test_commit_acknowledgement_failure_is_unknown_and_never_retried(self):
+        cursor = Mock()
+        cursor.lastrowid = 7
+        cursor.fetchall.return_value = []
+        connection = Mock()
+        connection.cursor.return_value = cursor
+        connection.commit.side_effect = DatabaseError("CREDENTIAL_CANARY_COMMIT", errno=2013, sqlstate="HY000")
+        repository = SemanticAssessmentRepository(connect=lambda: connection)
+        with self.assertRaises(SemanticAssessmentPersistenceError) as caught:
+            repository.save_assessment(self.draft())
+        self.assertEqual(caught.exception.diagnostic.operation, "commit")
+        self.assertEqual(caught.exception.diagnostic.transaction_outcome, "commit_unknown")
+        self.assertEqual(caught.exception.diagnostic.errno, 2013)
+        connection.commit.assert_called_once_with()
+        connection.rollback.assert_called_once_with()
+        self.assertEqual(cursor.execute.call_count, 2)
+
+    def test_serialization_failure_has_no_connection_or_payload_diagnostic(self):
+        evidence = self.valid_evidence()
+        evidence["extra_metadata"] = object()
+        connect = Mock()
+        repository = SemanticAssessmentRepository(connect=connect)
+        with self.assertRaises(SemanticAssessmentPersistenceError) as caught:
+            repository.save_assessment(self.draft(evidence=(evidence,)))
+        self.assertEqual(caught.exception.diagnostic.operation, "serialize")
+        self.assertEqual(caught.exception.diagnostic.error_type, "TypeError")
+        self.assertEqual(caught.exception.diagnostic.transaction_outcome, "not_started")
+        connect.assert_not_called()
+
+    def test_driver_codes_reject_nonprimitive_values_and_custom_class_names(self):
+        class Poison:
+            def __str__(self):
+                raise AssertionError("must not convert diagnostic input")
+
+            __repr__ = __str__
+
+        error_class = type("CREDENTIAL_CANARY_CLASS", (DatabaseError,), {})
+        error = error_class("CREDENTIAL_CANARY_MESSAGE")
+        error.errno = Poison()
+        error.sqlstate = Poison()
+        repository = SemanticAssessmentRepository(connect=Mock(side_effect=error))
+        with self.assertRaises(SemanticAssessmentPersistenceError) as caught:
+            repository.save_assessment(self.draft())
+        self.assertEqual(caught.exception.diagnostic.error_type, "DatabaseError")
+        self.assertIsNone(caught.exception.diagnostic.errno)
+        self.assertIsNone(caught.exception.diagnostic.sqlstate)
+        self.assertNotIn("CREDENTIAL_CANARY", str(caught.exception))
+
+    def test_diagnostic_rejects_uncontrolled_labels_or_codes(self):
+        valid = dict(operation="upsert", error_type="DatabaseError", errno=1452,
+                     sqlstate="23000", transaction_outcome="rolled_back")
+        for field, value in (("operation", "CREDENTIAL_CANARY"),
+                             ("error_type", "CREDENTIAL_CANARY"),
+                             ("errno", True), ("errno", "1452"),
+                             ("sqlstate", "CREDENTIAL_CANARY"),
+                             ("rollback_failed", "CREDENTIAL_CANARY")):
+            with self.subTest(field=field):
+                with self.assertRaises(ValueError):
+                    SemanticPersistenceDiagnostic(**{**valid, field: value})
 
     def test_storage_model_rejects_unbounded_or_sensitive_evidence(self):
         bad = self.valid_evidence()
