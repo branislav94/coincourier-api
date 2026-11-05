@@ -77,7 +77,7 @@ def _new_fact_codes(current: EventFacts, prior: EventFacts) -> tuple[str, ...]:
         codes.append("new_numeric_value")
     if current.key_entities - prior.key_entities:
         codes.append("new_named_participant")
-    if set(current.actions) != set(prior.actions):
+    if set(current.actions) - set(prior.actions):
         codes.append("new_action_or_status")
     return tuple(codes)
 
@@ -180,6 +180,9 @@ def assess_relationship(
         else:
             classification = AssessmentType.BROAD_TOPIC_OVERLAP
             reason_codes = ("generic_or_no_shared_event_identity",)
+
+    if set(prior_facts.actions) > set(current_facts.actions):
+        uncertainty = tuple(sorted({*uncertainty, "prior_only_action_evidence"}))
 
     return DuplicateAssessment(
         assessment_type=classification,

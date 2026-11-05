@@ -5,6 +5,7 @@ import unittest
 from unittest.mock import Mock, patch
 
 from duplicate_detection.enforcement import DuplicateDecision, assess_duplicate_enforcement
+from duplicate_detection.event_matching import extract_event_facts
 from duplicate_detection.identities import valid_event_id
 from duplicate_detection.policy import AssessmentType, assess_relationship
 from repositories.duplicate_assessments import DuplicateAssessmentRepository
@@ -174,6 +175,131 @@ class DuplicateEnforcementTests(unittest.TestCase):
     def test_specific_product_anchor_supports_valid_event_without_action(self):
         result, _ = self.decide(source(title="Solana Alpenglow mainnet", full_text="Brief summary."), [primary(title="Solana mainnet Alpenglow", full_text="Brief summary.")])
         self.assertTrue(result.reject)
+
+    def test_prior_only_action_evidence_continues_at_both_enforcement_stages(self):
+        cases = (
+            ("sparse_bitcoin", "Bitcoin market discussion", "Brief source summary.", "Bitcoin rises."),
+            ("product_anchor", "Solana Alpenglow mainnet", "Brief summary.", "Solana Alpenglow rises."),
+            ("nonempty_subset", "Bitcoin market discussion", "Bitcoin rises.", "Bitcoin rises. A report followed."),
+        )
+        for case, title, current_body, prior_body in cases:
+            current = source(title=title, full_text=current_body)
+            prior = primary(title=title, full_text=prior_body)
+            self.assertGreater(set(extract_event_facts(prior).actions), set(extract_event_facts(current).actions))
+            for stage in ("raw", "pre_publish"):
+                with self.subTest(case=case, stage=stage):
+                    repo = MemoryRepository(current, [prior])
+                    result = assess_duplicate_enforcement(current, stage=stage, mode="enforce", repository=repo)
+                    assessment = repo.saved[0][1][0][1]
+                    evidence = result.audit["candidate_audits"][1]
+                    self.assertEqual(assessment.assessment_type, AssessmentType.SAME_EVENT_DUPLICATE)
+                    self.assertEqual(assessment.new_fact_codes, ())
+                    self.assertIn("prior_only_action_evidence", assessment.evidence_uncertainty)
+                    self.assertIn("prior_only_action_evidence", evidence["evidence_uncertainty"])
+                    self.assertFalse(evidence["confirmed_duplicate"])
+                    self.assertTrue(result.available)
+                    self.assertFalse(result.reject)
+                    self.assertEqual(result.audit["decision"], "continue")
+                    self.assertEqual(result.counters["same_event_classifications"], 1)
+                    self.assertEqual(result.counters["same_event_unconfirmed"], 1)
+                    self.assertEqual(result.counters["same_event_blocks"], 0)
+                    self.assertEqual(result.counters["exact_blocks"], 0)
+                    self.assertEqual(result.counters["shadow_would_reject_duplicates"], 0)
+
+    def test_prior_only_cross_source_action_evidence_cannot_authorize_rejection(self):
+        from tests.test_duplicate_cross_source import fomc_source_pair
+
+        for event_ids in (("synthetic-prior-event", "synthetic-current-event"), (None, None)):
+            prior, current = fomc_source_pair(event_ids=event_ids)
+            prior["full_text"] += " A report followed."
+            canonical = {**prior, "processed": 1, "canonical_rich_id": 301,
+                         "canonical_wp_id": 901, "canonical_published": 1,
+                         "canonical_publish_status": "published"}
+            self.assertGreater(set(extract_event_facts(prior).actions), set(extract_event_facts(current).actions))
+            for stage in ("raw", "pre_publish"):
+                with self.subTest(event_ids=event_ids, stage=stage):
+                    repo = MemoryRepository(current, [canonical])
+                    result = assess_duplicate_enforcement(current, stage=stage, mode="enforce", repository=repo)
+                    assessment = repo.saved[0][1][0][1]
+                    evidence = result.audit["candidate_audits"][prior["id"]]
+                    self.assertFalse(assessment.same_event_id)
+                    self.assertEqual(assessment.assessment_type, AssessmentType.SAME_EVENT_DUPLICATE)
+                    self.assertEqual(assessment.event_identity_source, "structured_cross_source")
+                    self.assertGreaterEqual(len(assessment.confirmation_anchors), 2)
+                    self.assertEqual(assessment.new_fact_codes, ())
+                    self.assertIn("prior_only_action_evidence", assessment.evidence_uncertainty)
+                    self.assertFalse(evidence["confirmed_duplicate"])
+                    self.assertTrue(result.available)
+                    self.assertFalse(result.reject)
+                    self.assertEqual(result.audit["decision"], "continue")
+                    self.assertEqual(result.counters["same_event_blocks"], 0)
+                    self.assertEqual(result.counters["exact_blocks"], 0)
+
+    def test_prior_only_action_title_cannot_authorize_same_content_rejection(self):
+        body = "Bitcoin market background contains general context for readers and technical details about the network. " * 2
+        current = source(event_id=None, title="Solana Alpenglow market", full_text=body)
+        prior = primary(event_id=None, title="Solana Alpenglow market rises", full_text=body)
+        self.assertEqual(extract_event_facts(current).actions, ())
+        self.assertEqual(extract_event_facts(prior).actions, ("price_rise",))
+        for stage in ("raw", "pre_publish"):
+            with self.subTest(stage=stage):
+                repo = MemoryRepository(current, [prior])
+                result = assess_duplicate_enforcement(current, stage=stage, mode="enforce", repository=repo)
+                assessment = repo.saved[0][1][0][1]
+                evidence = result.audit["candidate_audits"][1]
+                self.assertFalse(assessment.same_event_id)
+                self.assertTrue(assessment.same_content_hash)
+                self.assertEqual(assessment.assessment_type, AssessmentType.EXACT_DUPLICATE)
+                self.assertEqual(assessment.new_fact_codes, ())
+                self.assertIn("prior_only_action_evidence", assessment.evidence_uncertainty)
+                self.assertFalse(evidence["confirmed_duplicate"])
+                self.assertTrue(result.available)
+                self.assertFalse(result.reject)
+                self.assertEqual(result.audit["decision"], "continue")
+                self.assertEqual(result.counters["exact_blocks"], 0)
+                self.assertEqual(result.counters["same_event_blocks"], 0)
+
+    def test_equal_action_positive_controls_keep_existing_confirmation(self):
+        for body in ("Brief summary.", "Solana Alpenglow rises."):
+            current = source(title="Solana Alpenglow mainnet", full_text=body)
+            prior = primary(title="Solana mainnet Alpenglow", full_text=body)
+            self.assertEqual(extract_event_facts(current).actions, extract_event_facts(prior).actions)
+            for stage in ("raw", "pre_publish"):
+                with self.subTest(body=body, stage=stage):
+                    repo = MemoryRepository(current, [prior])
+                    result = assess_duplicate_enforcement(current, stage=stage, mode="enforce", repository=repo)
+                    assessment = repo.saved[0][1][0][1]
+                    self.assertEqual(assessment.assessment_type, AssessmentType.SAME_EVENT_DUPLICATE)
+                    self.assertEqual(assessment.new_fact_codes, ())
+                    self.assertNotIn("prior_only_action_evidence", assessment.evidence_uncertainty)
+                    self.assertTrue(result.audit["candidate_audits"][1]["confirmed_duplicate"])
+                    self.assertTrue(result.available)
+                    self.assertTrue(result.reject)
+                    self.assertEqual(result.counters["same_event_blocks"], 1)
+
+    def test_current_side_action_additions_remain_material_and_unconfirmed(self):
+        cases = (
+            ("current_only", "Bitcoin rises.", "Brief source summary."),
+            ("changed", "Bitcoin rises.", "Bitcoin falls."),
+            ("both_sides", "Bitcoin rises. A report followed.", "Bitcoin falls."),
+        )
+        for case, current_body, prior_body in cases:
+            current = source(title="Bitcoin market discussion", full_text=current_body)
+            prior = primary(title="Bitcoin market discussion", full_text=prior_body)
+            self.assertTrue(set(extract_event_facts(current).actions) - set(extract_event_facts(prior).actions))
+            for stage in ("raw", "pre_publish"):
+                with self.subTest(case=case, stage=stage):
+                    repo = MemoryRepository(current, [prior])
+                    result = assess_duplicate_enforcement(current, stage=stage, mode="enforce", repository=repo)
+                    assessment = repo.saved[0][1][0][1]
+                    self.assertEqual(assessment.assessment_type, AssessmentType.MATERIAL_UPDATE)
+                    self.assertIn("new_action_or_status", assessment.new_fact_codes)
+                    self.assertNotIn("prior_only_action_evidence", assessment.evidence_uncertainty)
+                    self.assertFalse(result.audit["candidate_audits"][1]["confirmed_duplicate"])
+                    self.assertTrue(result.available)
+                    self.assertFalse(result.reject)
+                    self.assertEqual(result.counters["material_updates_allowed"], 1)
+                    self.assertEqual(result.counters["same_event_blocks"], 0)
 
     def test_related_regulatory_action_and_different_etf_dates_allowed(self):
         for now, before in (("SEC sues Coinbase", "SEC approves Coinbase"), ("Bitcoin ETF flows October 28 2026", "Bitcoin ETF flows October 27 2026")):

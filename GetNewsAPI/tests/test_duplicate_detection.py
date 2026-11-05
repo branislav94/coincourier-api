@@ -99,6 +99,75 @@ class EventPolicyTests(unittest.TestCase):
         self.assertTrue(result.same_event_id)
         self.assertEqual(result.assessment_type, AssessmentType.SAME_EVENT_DUPLICATE)
 
+    def test_prior_only_actions_are_uncertain_same_event_evidence(self):
+        cases = (
+            ("Brief source summary.", "Bitcoin rises.", (), ("price_rise",)),
+            ("Bitcoin rises.", "Bitcoin rises. A report followed.", ("price_rise",), ("price_rise", "report")),
+        )
+        for current_body, prior_body, current_actions, prior_actions in cases:
+            with self.subTest(current_actions=current_actions, prior_actions=prior_actions):
+                current = article(1, event_id="synthetic-action-event", title="Bitcoin market discussion", full_text=current_body)
+                prior = article(2, event_id="synthetic-action-event", title="Bitcoin market discussion", full_text=prior_body)
+                self.assertEqual(extract_event_facts(current).actions, current_actions)
+                self.assertEqual(extract_event_facts(prior).actions, prior_actions)
+                result = assess_relationship(current, prior)
+                self.assertEqual(result.assessment_type, AssessmentType.SAME_EVENT_DUPLICATE)
+                self.assertEqual(result.new_fact_codes, ())
+                self.assertIn("prior_only_action_evidence", result.evidence_uncertainty)
+
+    def test_current_action_additions_remain_material_updates(self):
+        cases = (
+            ("Bitcoin rises.", "Brief source summary.", ("price_rise",), ()),
+            ("Bitcoin rises.", "Bitcoin falls.", ("price_rise",), ("price_fall",)),
+            ("Bitcoin rises. A report followed.", "Bitcoin rises.", ("price_rise", "report"), ("price_rise",)),
+            ("Bitcoin rises. A report followed.", "Bitcoin falls. A report followed.", ("price_rise", "report"), ("price_fall", "report")),
+        )
+        for current_body, prior_body, current_actions, prior_actions in cases:
+            with self.subTest(current_actions=current_actions, prior_actions=prior_actions):
+                current = article(1, event_id="synthetic-action-event", title="Bitcoin market discussion", full_text=current_body)
+                prior = article(2, event_id="synthetic-action-event", title="Bitcoin market discussion", full_text=prior_body)
+                self.assertEqual(extract_event_facts(current).actions, current_actions)
+                self.assertEqual(extract_event_facts(prior).actions, prior_actions)
+                result = assess_relationship(current, prior)
+                self.assertEqual(result.assessment_type, AssessmentType.MATERIAL_UPDATE)
+                self.assertEqual(result.new_fact_codes, ("new_action_or_status",))
+                self.assertNotIn("prior_only_action_evidence", result.evidence_uncertainty)
+
+    def test_equal_action_sets_preserve_same_event_classification(self):
+        for body, actions in (("Brief source summary.", ()), ("Bitcoin rises.", ("price_rise",))):
+            with self.subTest(actions=actions):
+                current = article(1, event_id="synthetic-action-event", title="Bitcoin market discussion", full_text=body)
+                prior = article(2, event_id="synthetic-action-event", title="Bitcoin market discussion", full_text=body)
+                self.assertEqual(extract_event_facts(current).actions, actions)
+                self.assertEqual(extract_event_facts(prior).actions, actions)
+                result = assess_relationship(current, prior)
+                self.assertEqual(result.assessment_type, AssessmentType.SAME_EVENT_DUPLICATE)
+                self.assertEqual(result.new_fact_codes, ())
+                self.assertNotIn("prior_only_action_evidence", result.evidence_uncertainty)
+
+    def test_prior_only_action_evidence_preserves_existing_uncertainty(self):
+        current = article(1, event_id="synthetic-action-event", title="Bitcoin market discussion", full_text="Bitcoin may move.")
+        prior = article(2, event_id="synthetic-action-event", title="Bitcoin market discussion", full_text="Bitcoin rises.")
+        self.assertEqual(extract_event_facts(current).actions, ())
+        self.assertEqual(extract_event_facts(prior).actions, ("price_rise",))
+        self.assertIn("uncertain_outcome_or_status", extract_event_facts(current).uncertainty)
+        result = assess_relationship(current, prior)
+        self.assertEqual(result.assessment_type, AssessmentType.SAME_EVENT_DUPLICATE)
+        self.assertEqual(result.new_fact_codes, ())
+        self.assertEqual(result.evidence_uncertainty, ("prior_only_action_evidence", "uncertain_outcome_or_status"))
+
+    def test_related_event_action_reason_remains_symmetric(self):
+        sparse = article(1, title="Coinbase market discussion", full_text="Brief source summary.")
+        active = article(2, title="Coinbase market discussion", full_text="Coinbase launches.")
+        self.assertEqual(extract_event_facts(sparse).actions, ())
+        self.assertEqual(extract_event_facts(active).actions, ("launch",))
+        for current, prior in ((sparse, active), (active, sparse)):
+            with self.subTest(current_id=current["id"]):
+                result = assess_relationship(current, prior)
+                self.assertEqual(result.assessment_type, AssessmentType.RELATED_EVENT)
+                self.assertFalse(result.same_event_id)
+                self.assertEqual(result.reason_codes, ("shared_key_entity", "different_action_or_status"))
+
     def test_null_event_ids_do_not_compare_equal(self):
         result = assess_relationship(article(1), article(2))
         self.assertFalse(result.same_event_id)
