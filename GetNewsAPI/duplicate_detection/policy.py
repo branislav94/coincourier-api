@@ -8,6 +8,7 @@ from enum import Enum
 from typing import Any, Mapping
 
 from .event_matching import EventFacts, compare_cross_source_events, extract_event_facts
+from .event_matching import extract_relationship_organizations
 from .identities import ArticleIdentity, build_article_identity
 from .lexical import token_set_jaccard
 
@@ -183,6 +184,22 @@ def assess_relationship(
 
     if set(prior_facts.actions) > set(current_facts.actions):
         uncertainty = tuple(sorted({*uncertainty, "prior_only_action_evidence"}))
+
+    if classification is AssessmentType.BROAD_TOPIC_OVERLAP:
+        shared_context = (
+            set(extract_relationship_organizations(article))
+            & set(extract_relationship_organizations(candidate))
+        )
+        if shared_context:
+            classification = AssessmentType.RELATED_EVENT
+            shared_entities = tuple(sorted(set(shared_entities) | shared_context))
+            if set(current_facts.actions) != set(prior_facts.actions):
+                context_reason = "different_action_or_status"
+            elif current_facts.dates and prior_facts.dates and not shared_dates:
+                context_reason = "different_key_date"
+            else:
+                context_reason = "insufficient_same_event_evidence"
+            reason_codes = ("shared_relationship_organization", context_reason)
 
     return DuplicateAssessment(
         assessment_type=classification,
