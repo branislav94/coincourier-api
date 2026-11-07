@@ -11,6 +11,7 @@ from pathlib import Path
 import sqlite3
 import subprocess
 import sys
+import sysconfig
 import tempfile
 from typing import Any
 import unittest
@@ -1158,6 +1159,7 @@ class DurableMetadataProcessRestartTests(unittest.TestCase):
     def restart_attempts(self, first_phase: str) -> tuple[dict[str, Any], dict[str, Any]]:
         '''Run actual production objects with independent process-local fixtures.'''
         root = Path(__file__).resolve().parents[2]
+        dependency_paths = list(dict.fromkeys(sysconfig.get_path(name) for name in ('purelib', 'platlib')))
         bootstrap = r"""
 import importlib.util
 import io
@@ -1171,7 +1173,7 @@ from unittest.mock import patch
 
 root = Path(sys.argv[1]).resolve()
 project = root / 'GetNewsAPI'
-sys.path[:0] = [str(project), str(root), str(Path(sys.executable).parent / 'Lib/site-packages')]
+sys.path[:0] = [str(project), str(root), *json.loads(sys.argv[5])]
 spec = importlib.util.spec_from_file_location('restart_environment', project / 'tests/environment_isolation.py')
 if spec is None or spec.loader is None:
     raise RuntimeError('Cannot load the isolated fixture environment')
@@ -1210,7 +1212,7 @@ print(json.dumps(result, ensure_ascii=False))
             for phase in (first_phase, 'second'):
                 process = subprocess.run(
                     [sys.executable, '-I', '-S', '-B', '-c', bootstrap,
-                     str(root), app_path, wp_path, phase],
+                     str(root), app_path, wp_path, phase, json.dumps(dependency_paths)],
                     check=False, capture_output=True, text=True, encoding='utf-8', timeout=30,
                 )
                 self.assertEqual(process.returncode, 0, process.stdout + process.stderr)

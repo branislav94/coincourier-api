@@ -153,8 +153,8 @@ class DuplicatePublicationRepositoryTests(unittest.TestCase):
         self.assertTrue(updates[1].startswith("UPDATE cryptonewsapi"))
         self.assertEqual(self.events[-2:], ["cursor-close", "close"])
 
-    def test_legacy_unclaimed_fresh_pending_and_retryable_are_terminal(self):
-        for status in ("fresh", "pending", "retryable"):
+    def test_legacy_unclaimed_fresh_deferred_pending_and_retryable_are_terminal(self):
+        for status in ("fresh", "quota_deferred", "pending", "retryable"):
             with self.subTest(status=status):
                 self.update(publish_status=status)
                 self.assertTrue(self.reject())

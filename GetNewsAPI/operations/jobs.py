@@ -5,10 +5,12 @@ from __future__ import annotations
 from dataclasses import asdict, dataclass
 from datetime import datetime, timezone
 import json
+import logging
 import os
 from typing import Any, Callable, Mapping
 
 from runtime.config_validation import FALSE_VALUES, TRUE_VALUES, validate_runtime_config
+from runtime.editorial_modes import editorial_mode_summary
 
 from .locking import ConnectionFactory, advisory_job_lock
 from .models import (
@@ -213,7 +215,7 @@ def _execute_process(_request: JobRequest) -> WorkResult:
     if counts.get("failed", 0):
         return WorkResult(JobStatus.FAILED, "process", counts, "ArticleFailures")
     status = JobStatus.NO_WORK if counts.get("attempted", 0) == 0 else JobStatus.SUCCESS
-    return WorkResult(status, "process", counts)
+    return WorkResult(status, "process", counts, 'PublicationQuotaDeferred' if counts.get('quota_deferred') else None)
 
 
 def _execute_publish(_request: JobRequest) -> WorkResult:
@@ -226,6 +228,13 @@ def _execute_publish(_request: JobRequest) -> WorkResult:
         return WorkResult(JobStatus.SKIPPED_ALREADY_RUNNING, "publish", counts)
     if status == "no_work":
         return WorkResult(JobStatus.NO_WORK, "publish", counts)
+    if status == 'capacity_unavailable':
+        return WorkResult(JobStatus.CONFIGURATION_ERROR, 'publish', counts, 'PublicationCapacityUnavailable')
+    if status == 'quota_deferred':
+        return WorkResult(
+            JobStatus.SUCCESS if counts.get('succeeded') else JobStatus.NO_WORK,
+            'publish', counts, 'PublicationQuotaDeferred',
+        )
     if status == "failed" or counts.get("failed", 0):
         return WorkResult(JobStatus.FAILED, "publish", counts, "PublicationFailures")
     return WorkResult(JobStatus.SUCCESS, "publish", counts)
@@ -247,10 +256,15 @@ def _execute_pipeline(request: JobRequest) -> WorkResult:
         **{f"process_{key}": value for key, value in process.counts.items()},
         **{f"publish_{key}": value for key, value in publish.counts.items()},
     }
-    failed = [result for result in (process, publish) if result.status is JobStatus.FAILED]
+    failed = [
+        result for result in (process, publish)
+        if result.status in (JobStatus.FAILED, JobStatus.CONFIGURATION_ERROR)
+    ]
     if failed:
         return WorkResult(
-            JobStatus.FAILED,
+            JobStatus.CONFIGURATION_ERROR
+            if any(result.status is JobStatus.CONFIGURATION_ERROR for result in failed)
+            else JobStatus.FAILED,
             ",".join(result.stage for result in failed),
             counts,
             ",".join(result.reason_type or "JobFailure" for result in failed),
@@ -374,6 +388,10 @@ def run_job(
             ),
         )
 
+    logging.getLogger(__name__).info(
+        "[EDITORIAL-MODES] context=invocation_environment settings=%s",
+        json.dumps(editorial_mode_summary(env), sort_keys=True, separators=(",", ":")),
+    )
     request = JobRequest(limit=limit, source=source)
     executor = EXECUTORS[spec.executor]
     try:

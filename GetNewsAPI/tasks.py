@@ -115,6 +115,12 @@ def run_config_check(profile: str = "web") -> bool:
     issues = validate_runtime_config(environment, profile=profile)
     if not issues:
         print(f"Configuration valid for profile: {profile}")
+        from runtime.editorial_modes import editorial_mode_summary
+        import json
+
+        print("Editorial modes (process environment): " + json.dumps(
+            editorial_mode_summary(environment), sort_keys=True, separators=(",", ":")
+        ))
         return True
 
     rendered = format_config_issues(issues)

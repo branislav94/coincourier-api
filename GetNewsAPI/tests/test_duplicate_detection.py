@@ -17,7 +17,7 @@ if str(PROJECT_DIR) not in sys.path:
 import config
 import fetcher
 import gpt_processor
-from duplicate_detection.event_matching import extract_event_facts
+from duplicate_detection.event_matching import EventFacts, extract_event_facts, extract_relationship_organizations
 from duplicate_detection.identities import (
     canonicalize_url,
     content_fingerprint,
@@ -90,6 +90,121 @@ class IdentityTests(unittest.TestCase):
         self.assertIn("2026", normalized)
 
 
+class RelationshipOrganizationTests(unittest.TestCase):
+    def test_relationship_organizations_recognize_title_and_source_body(self):
+        cases = (
+            {"title": "Mercado Bitcoin Hack Continues After Containment Claim", "full_text": "Brief source summary."},
+            {"title": "Exchange incident", "full_text": "Attackers continued draining Mercado Bitcoin wallets"},
+            {"title": "Exchange incident", "text": "Attackers continued draining Mercado Bitcoin wallets", "full_text": "Other content."},
+            {"title": "  mErCaDo   bItCoIn wallets  ", "full_text": "Brief source summary."},
+            {"title": "Exchange incident", "full_text": "<p>Attackers reached Mercado <b>Bitcoin</b> wallets.</p>"},
+        )
+        for fields in cases:
+            with self.subTest(fields=fields):
+                row = article(1, **fields)
+                original = dict(row)
+                before = extract_event_facts(row)
+                self.assertEqual(extract_relationship_organizations(row), ("org:mercado-bitcoin",))
+                self.assertEqual(extract_event_facts(row), before)
+                self.assertEqual(row, original)
+
+    def test_relationship_context_preserves_reporting_actor_and_core_facts(self):
+        row = article(1, title="Mercado Bitcoin says phased reopening", full_text="Brief source summary.")
+        expected = EventFacts(
+            entities=("actor:mercado bitcoin", "asset:BTC", "source:example news"),
+            dates=(), numbers=(), actions=(),
+        )
+        self.assertEqual(extract_event_facts(row), expected)
+        self.assertEqual(extract_relationship_organizations(row), ("org:mercado-bitcoin",))
+        self.assertEqual(extract_event_facts(row), expected)
+        self.assertNotIn("org:mercado-bitcoin", expected.entities)
+
+    def test_relationship_organizations_ignore_partial_and_non_source_mentions(self):
+        cases = (
+            {"title": "Mercado Bitcoins incident"},
+            {"title": "NotMercado Bitcoin incident"},
+            {"source_name": "Mercado Bitcoin"},
+            {"news_url": "https://news.example/Mercado-Bitcoin"},
+            {"generated_title": "Mercado Bitcoin incident", "generated_text": "Mercado Bitcoin wallets"},
+            {"enriched_title": "Mercado Bitcoin incident", "enriched_text": "Mercado Bitcoin wallets"},
+            {"title": "Mercado", "full_text": "Bitcoin wallets are discussed."},
+            {"text": "Original unrelated source evidence.", "full_text": "Mercado Bitcoin wallets"},
+        )
+        for fields in cases:
+            with self.subTest(fields=fields):
+                row = article(1, title="Exchange incident", full_text="Brief source summary.")
+                row.update(fields)
+                original = dict(row)
+                before = extract_event_facts(row)
+                self.assertEqual(extract_relationship_organizations(row), ())
+                self.assertEqual(extract_event_facts(row), before)
+                self.assertEqual(row, original)
+
+    def test_shared_relationship_context_refines_only_broad_overlap(self):
+        current = article(1,
+            title="Mercado Bitcoin hack continued hours after exchange said attack was contained, report finds",
+            full_text="Attackers drained $391000 through 2 wallets.")
+        prior = article(2,
+            title="Mercado Bitcoin says phased reopening to begin Monday, will cover losses",
+            full_text="Mercado Bitcoin halted withdrawals on Monday.")
+        before = (extract_event_facts(current), extract_event_facts(prior))
+        with patch("duplicate_detection.policy.extract_relationship_organizations", return_value=()):
+            baseline = assess_relationship(current, prior)
+        self.assertEqual(baseline.assessment_type, AssessmentType.BROAD_TOPIC_OVERLAP)
+        result = assess_relationship(current, prior)
+        self.assertEqual(result.assessment_type, AssessmentType.RELATED_EVENT)
+        self.assertEqual(result.reason_codes, ("shared_relationship_organization", "different_action_or_status"))
+        self.assertEqual(set(result.shared_entities), set(baseline.shared_entities) | {"org:mercado-bitcoin"})
+        self.assertEqual(result.new_fact_codes, baseline.new_fact_codes)
+        self.assertEqual(result.evidence_uncertainty, baseline.evidence_uncertainty)
+        self.assertEqual(result.event_identity_source, baseline.event_identity_source)
+        self.assertEqual(result.event_identity_source, "none")
+        self.assertEqual(result.shared_dates, baseline.shared_dates)
+        self.assertEqual(result.shared_numbers, baseline.shared_numbers)
+        self.assertEqual(result.shared_actions, baseline.shared_actions)
+        self.assertEqual(result.confirmation_anchors, baseline.confirmation_anchors)
+        self.assertEqual(result.contradiction_flags, baseline.contradiction_flags)
+        self.assertEqual((extract_event_facts(current), extract_event_facts(prior)), before)
+        for facts in before:
+            self.assertNotIn("org:mercado-bitcoin", facts.entities)
+
+    def test_one_sided_relationship_organization_does_not_refine(self):
+        mercado = article(1, title="Mercado Bitcoin hack continues", full_text="Short source text.")
+        unrelated = article(2, title="Bitcoin custody policy discussion", full_text="Brief source summary.")
+        for current, prior in ((mercado, unrelated), (unrelated, mercado)):
+            with self.subTest(current_id=current["id"]):
+                with patch("duplicate_detection.policy.extract_relationship_organizations", return_value=()):
+                    baseline = assess_relationship(current, prior)
+                self.assertEqual(baseline.assessment_type, AssessmentType.BROAD_TOPIC_OVERLAP)
+                self.assertEqual(assess_relationship(current, prior), baseline)
+
+    def test_non_broad_assessments_do_not_consume_relationship_context(self):
+        body = "Neutral background context about markets and the network for readers. " * 3
+        cases = (
+            (AssessmentType.MATERIAL_UPDATE,
+             article(1, event_id="synthetic-context-event", title="Mercado Bitcoin says Bitcoin rises", full_text="Brief summary."),
+             article(2, event_id="synthetic-context-event", title="Mercado Bitcoin price rises", full_text="Short context.")),
+            (AssessmentType.SAME_EVENT_DUPLICATE,
+             article(1, event_id="synthetic-context-event", title="Coinbase acquires Mercado Bitcoin", full_text="Brief summary."),
+             article(2, event_id="synthetic-context-event", title="Coinbase acquires Mercado Bitcoin", full_text="Short context.")),
+            (AssessmentType.EXACT_DUPLICATE,
+             article(1, title="Mercado Bitcoin price rises", full_text=body),
+             article(2, title="Mercado Bitcoin price rises", full_text=body)),
+            (AssessmentType.RELATED_EVENT,
+             article(1, title="Mercado Bitcoin price rises", full_text="Brief summary."),
+             article(2, title="Mercado Bitcoin price falls", full_text="Short context.")),
+        )
+        for expected_type, current, prior in cases:
+            with self.subTest(classification=expected_type):
+                with patch("duplicate_detection.policy.extract_relationship_organizations", return_value=()):
+                    baseline = assess_relationship(current, prior)
+                with patch("duplicate_detection.policy.extract_relationship_organizations", wraps=extract_relationship_organizations) as context:
+                    result = assess_relationship(current, prior)
+                self.assertEqual(result.assessment_type, expected_type)
+                self.assertEqual(result, baseline)
+                context.assert_not_called()
+
+
 class EventPolicyTests(unittest.TestCase):
     def test_same_non_null_event_id_is_same_event_duplicate(self):
         result = assess_relationship(
@@ -98,6 +213,75 @@ class EventPolicyTests(unittest.TestCase):
         )
         self.assertTrue(result.same_event_id)
         self.assertEqual(result.assessment_type, AssessmentType.SAME_EVENT_DUPLICATE)
+
+    def test_prior_only_actions_are_uncertain_same_event_evidence(self):
+        cases = (
+            ("Brief source summary.", "Bitcoin rises.", (), ("price_rise",)),
+            ("Bitcoin rises.", "Bitcoin rises. A report followed.", ("price_rise",), ("price_rise", "report")),
+        )
+        for current_body, prior_body, current_actions, prior_actions in cases:
+            with self.subTest(current_actions=current_actions, prior_actions=prior_actions):
+                current = article(1, event_id="synthetic-action-event", title="Bitcoin market discussion", full_text=current_body)
+                prior = article(2, event_id="synthetic-action-event", title="Bitcoin market discussion", full_text=prior_body)
+                self.assertEqual(extract_event_facts(current).actions, current_actions)
+                self.assertEqual(extract_event_facts(prior).actions, prior_actions)
+                result = assess_relationship(current, prior)
+                self.assertEqual(result.assessment_type, AssessmentType.SAME_EVENT_DUPLICATE)
+                self.assertEqual(result.new_fact_codes, ())
+                self.assertIn("prior_only_action_evidence", result.evidence_uncertainty)
+
+    def test_current_action_additions_remain_material_updates(self):
+        cases = (
+            ("Bitcoin rises.", "Brief source summary.", ("price_rise",), ()),
+            ("Bitcoin rises.", "Bitcoin falls.", ("price_rise",), ("price_fall",)),
+            ("Bitcoin rises. A report followed.", "Bitcoin rises.", ("price_rise", "report"), ("price_rise",)),
+            ("Bitcoin rises. A report followed.", "Bitcoin falls. A report followed.", ("price_rise", "report"), ("price_fall", "report")),
+        )
+        for current_body, prior_body, current_actions, prior_actions in cases:
+            with self.subTest(current_actions=current_actions, prior_actions=prior_actions):
+                current = article(1, event_id="synthetic-action-event", title="Bitcoin market discussion", full_text=current_body)
+                prior = article(2, event_id="synthetic-action-event", title="Bitcoin market discussion", full_text=prior_body)
+                self.assertEqual(extract_event_facts(current).actions, current_actions)
+                self.assertEqual(extract_event_facts(prior).actions, prior_actions)
+                result = assess_relationship(current, prior)
+                self.assertEqual(result.assessment_type, AssessmentType.MATERIAL_UPDATE)
+                self.assertEqual(result.new_fact_codes, ("new_action_or_status",))
+                self.assertNotIn("prior_only_action_evidence", result.evidence_uncertainty)
+
+    def test_equal_action_sets_preserve_same_event_classification(self):
+        for body, actions in (("Brief source summary.", ()), ("Bitcoin rises.", ("price_rise",))):
+            with self.subTest(actions=actions):
+                current = article(1, event_id="synthetic-action-event", title="Bitcoin market discussion", full_text=body)
+                prior = article(2, event_id="synthetic-action-event", title="Bitcoin market discussion", full_text=body)
+                self.assertEqual(extract_event_facts(current).actions, actions)
+                self.assertEqual(extract_event_facts(prior).actions, actions)
+                result = assess_relationship(current, prior)
+                self.assertEqual(result.assessment_type, AssessmentType.SAME_EVENT_DUPLICATE)
+                self.assertEqual(result.new_fact_codes, ())
+                self.assertNotIn("prior_only_action_evidence", result.evidence_uncertainty)
+
+    def test_prior_only_action_evidence_preserves_existing_uncertainty(self):
+        current = article(1, event_id="synthetic-action-event", title="Bitcoin market discussion", full_text="Bitcoin may move.")
+        prior = article(2, event_id="synthetic-action-event", title="Bitcoin market discussion", full_text="Bitcoin rises.")
+        self.assertEqual(extract_event_facts(current).actions, ())
+        self.assertEqual(extract_event_facts(prior).actions, ("price_rise",))
+        self.assertIn("uncertain_outcome_or_status", extract_event_facts(current).uncertainty)
+        result = assess_relationship(current, prior)
+        self.assertEqual(result.assessment_type, AssessmentType.SAME_EVENT_DUPLICATE)
+        self.assertEqual(result.new_fact_codes, ())
+        self.assertEqual(result.evidence_uncertainty, ("prior_only_action_evidence", "uncertain_outcome_or_status"))
+
+    def test_related_event_action_reason_remains_symmetric(self):
+        sparse = article(1, title="Coinbase market discussion", full_text="Brief source summary.")
+        active = article(2, title="Coinbase market discussion", full_text="Coinbase launches.")
+        self.assertEqual(extract_event_facts(sparse).actions, ())
+        self.assertEqual(extract_event_facts(active).actions, ("launch",))
+        for current, prior in ((sparse, active), (active, sparse)):
+            with self.subTest(current_id=current["id"]):
+                result = assess_relationship(current, prior)
+                self.assertEqual(result.assessment_type, AssessmentType.RELATED_EVENT)
+                self.assertFalse(result.same_event_id)
+                self.assertEqual(result.reason_codes, ("shared_key_entity", "different_action_or_status"))
 
     def test_null_event_ids_do_not_compare_equal(self):
         result = assess_relationship(article(1), article(2))

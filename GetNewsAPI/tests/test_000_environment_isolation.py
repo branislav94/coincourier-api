@@ -36,6 +36,17 @@ import tasks
 
 
 class EnvironmentIsolationTests(unittest.TestCase):
+    def test_ambient_editorial_modes_cannot_override_test_isolation(self):
+        with patch.dict(os.environ, {
+            "DUPLICATE_ENFORCE_MODE": "emforce",
+            "DUPLICATE_ENFORCEMENT_MODE": "enforce",
+            "PUBLIC_COPY_GATE_MODE": "enforce",
+        }):
+            install_test_environment()
+            self.assertNotIn("DUPLICATE_ENFORCE_MODE", os.environ)
+            self.assertEqual(os.environ["DUPLICATE_ENFORCEMENT_MODE"], "shadow")
+            self.assertEqual(os.environ["PUBLIC_COPY_GATE_MODE"], "shadow")
+
     def test_dotenv_files_cannot_override_test_connectivity(self):
         with patch("builtins.open") as open_file:
             self.assertFalse(

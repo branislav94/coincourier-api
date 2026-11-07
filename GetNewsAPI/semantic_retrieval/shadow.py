@@ -12,6 +12,7 @@ from vector_store.models import SourceType
 from vector_store.repository import VectorRepository
 from vector_store.semantic_assessments import (
     SemanticAssessmentDraft,
+    SemanticAssessmentPersistenceError,
     SemanticAssessmentRepository,
     SemanticAssessmentStatus,
 )
@@ -65,6 +66,13 @@ class SemanticShadowRunResult:
     assessment_id: int | None = None
     error_type: str | None = None
     candidates: tuple[SemanticCandidate, ...] = ()
+    persistence_operation: str | None = None
+    database_errno: int | None = None
+    database_sqlstate: str | None = None
+    transaction_outcome: str | None = None
+    rollback_failed: bool = False
+    cursor_close_failed: bool = False
+    connection_close_failed: bool = False
 
 
 def _configured_defaults() -> tuple[bool, bool, str]:
@@ -321,7 +329,12 @@ def run_semantic_shadow(
     try:
         assessment_id = writer.save_assessment(draft)
     except Exception as persistence_error:
-        error_type, _ = _safe_error(persistence_error, "persistence")
+        diagnostic = (
+            persistence_error.diagnostic
+            if isinstance(persistence_error, SemanticAssessmentPersistenceError)
+            else None
+        )
+        error_type = diagnostic.error_type if diagnostic else _safe_error(persistence_error, "persistence")[0]
         result = SemanticShadowRunResult(
             status=SemanticAssessmentStatus.ERROR,
             reason="persistence_failed",
@@ -334,12 +347,32 @@ def run_semantic_shadow(
             best_native_distance=draft.best_native_distance,
             error_type=error_type,
             candidates=validated_candidates,
+            persistence_operation=diagnostic.operation if diagnostic else None,
+            database_errno=diagnostic.errno if diagnostic else None,
+            database_sqlstate=diagnostic.sqlstate if diagnostic else None,
+            transaction_outcome=diagnostic.transaction_outcome if diagnostic else None,
+            rollback_failed=diagnostic.rollback_failed if diagnostic else False,
+            cursor_close_failed=diagnostic.cursor_close_failed if diagnostic else False,
+            connection_close_failed=diagnostic.connection_close_failed if diagnostic else False,
         )
         logger.error(
             "[SEMANTIC-SHADOW] semantic_shadow_error=true article_id=%s "
-            "error_type=%s reason=persistence_failed persisted=false decision=continue",
+            "error_type=%s reason=persistence_failed persisted=false "
+            "persistence_operation=%s db_errno=%s db_sqlstate=%s transaction_outcome=%s "
+            "rollback_failed=%s cursor_close_failed=%s connection_close_failed=%s "
+            "retrieval_status=%s draft_status=%s candidate_count=%s decision=continue",
             source_article_id,
             error_type,
+            result.persistence_operation,
+            result.database_errno,
+            result.database_sqlstate,
+            result.transaction_outcome,
+            result.rollback_failed,
+            result.cursor_close_failed,
+            result.connection_close_failed,
+            retrieval.status.value if retrieval else None,
+            draft.status.value,
+            len(draft.evidence),
         )
         return result
 
@@ -357,6 +390,7 @@ def run_semantic_shadow(
         assessment_id=assessment_id,
         error_type=(type(retrieval_error).__name__ if retrieval_error else None),
         candidates=validated_candidates,
+        transaction_outcome="committed",
     )
     _log_result(result)
     return result

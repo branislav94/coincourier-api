@@ -1,0 +1,1279 @@
+{
+  "schema_version": "g1a-duplicate-regression-v1",
+  "corpus_kind": "offline_contract_foundation_not_independent_historical_accuracy",
+  "baseline_commit": "b1223cb9cf1fead0b1e3b30a5dcc3cd5cfe953b0",
+  "baseline_source_hashes": {
+    "GetNewsAPI/duplicate_detection/policy.py": "80ce3f5cb8f7750297d11f17ca0f385f50ef02eb09cf4e1d66d97b7a5bfd8d70",
+    "GetNewsAPI/duplicate_detection/enforcement.py": "969abf9da66f7bf324e2801583a360b09a26152fbdc9cdcfadbd3d9f79841948",
+    "GetNewsAPI/duplicate_detection/event_matching.py": "f504e9b6f9bfc638ae6d2abf27754254d152ae8c2f714ab433b4fb91f64b31d9",
+    "GetNewsAPI/duplicate_detection/identities.py": "5b6b9a81810aa1dec68a23cca34ac9805efa68bdb5960ad2dd06b1d41832b170"
+  },
+  "settings": {
+    "duplicate_policy_version": "v1",
+    "duplicate_lookback_hours": 72,
+    "candidate_limit": 200,
+    "daily_cap_enabled": false
+  },
+  "native_relation_mapping": {
+    "exact_duplicate": "exact_duplicate",
+    "same_event_duplicate": "same_event_duplicate",
+    "material_update": "material_update",
+    "related_event": "related_event",
+    "broad_topic_overlap": "broad_topic_overlap",
+    "unrelated": "broad_topic_overlap"
+  },
+  "historical_readiness": {
+    "independent_historical_raw_pairs": 0,
+    "status": "blocked_missing_immutable_raw_snapshots_and_independent_label_artifact",
+    "independent_label_json": "unavailable_not_reconstructed_from_memory"
+  },
+  "retained_final_provenance": {
+    "database_basename": "acceptance-2026-10-28.sqlite3",
+    "database_sha256": "908f583389c5c5db28e7dd4c33fcf3d30c9643858b306f3318443df96c9636dd",
+    "markdown_sha256": "a4cefdeece63514a15d4e82b6a02043eebb0c4e9d8059f895634796b3c06b135",
+    "jsonl_sha256": "adf2b3844acc4e3624f6d756376201d2f77682ab8924d96aa82a027c9df7a1ac",
+    "read_scope": "30 operator-approved public WP IDs; metadata and public titles only; no original raw pipeline replay"
+  },
+  "final_family_label_registry": [
+    {
+      "family": "glamsterdam_hoodi_postponement",
+      "wp_ids": [
+        6364,
+        6367,
+        6370,
+        6376,
+        6378,
+        6381,
+        6390,
+        6393,
+        6396,
+        6398
+      ],
+      "label_source": "operator_attested_primary_review_of_retained_FINAL",
+      "raw_inputs_available": false
+    },
+    {
+      "family": "alpenglow_mainnet_activation",
+      "wp_ids": [
+        6267,
+        6282,
+        6290,
+        6425
+      ],
+      "excluded_material_exception_wp_ids": [
+        6344
+      ],
+      "label_source": "operator_attested_primary_review_of_retained_FINAL",
+      "raw_inputs_available": false
+    },
+    {
+      "family": "deka_sparkassen_crypto_trading",
+      "wp_ids": [
+        6252,
+        6336
+      ],
+      "label_source": "operator_attested_primary_review_of_retained_FINAL",
+      "raw_inputs_available": false
+    },
+    {
+      "family": "jpmorgan_solana_tokenized_fund",
+      "wp_ids": [
+        6346,
+        6401,
+        6431
+      ],
+      "label_source": "operator_attested_primary_review_of_retained_FINAL",
+      "raw_inputs_available": false
+    },
+    {
+      "family": "uk_qian_ownership_law",
+      "wp_ids": [
+        6255,
+        6264,
+        6434
+      ],
+      "label_source": "operator_attested_primary_review_of_retained_FINAL",
+      "raw_inputs_available": false
+    },
+    {
+      "family": "tianjin_confiscation_filing",
+      "wp_ids": [
+        6352,
+        6387
+      ],
+      "distinct_from_family": "uk_qian_ownership_law",
+      "label_source": "operator_attested_primary_review_of_retained_FINAL",
+      "raw_inputs_available": false
+    },
+    {
+      "family": "bitmine_holdings",
+      "wp_ids": [
+        6293,
+        6498
+      ],
+      "label_source": "operator_attested_primary_review_of_retained_FINAL",
+      "raw_inputs_available": false
+    },
+    {
+      "family": "aviva_xrpl_sterling_share_class",
+      "wp_ids": [
+        6483,
+        6486,
+        6516
+      ],
+      "label_source": "operator_attested_primary_review_of_retained_FINAL",
+      "raw_inputs_available": false
+    }
+  ],
+  "cases": [
+    {
+      "case_id": "S01_exact_source_copy",
+      "population": "synthetic_contract",
+      "semantic_reference": {
+        "relation": "exact_duplicate",
+        "reason": "The title and original source body are identical; no additional fact is stated.",
+        "review_status": "root_second_review_approved",
+        "review_kind": "automated_contract_review_not_historical_human_gold"
+      },
+      "provenance": {
+        "source": "authored_minimal_contract_example",
+        "actual_historical_raw_snapshot": false,
+        "primary_source_review": false,
+        "notes": "All input identities and narrative details are deliberately synthetic; no production record is reconstructed."
+      },
+      "inputs": {
+        "prior": {
+          "id": 1001,
+          "news_id": "fixture-provider-1001",
+          "event_id": null,
+          "news_url": "https://news.example.invalid/fixture-1001",
+          "title": "Coinbase launches Bitcoin custody service",
+          "full_text": "Coinbase launched a Bitcoin custody service on October 28, 2026. The service provides storage for institutional clients and supports ordinary custody operations.",
+          "publish_date": "2026-10-28 12:00:00",
+          "source_name": "Fixture prior",
+          "tickers": ""
+        },
+        "current": {
+          "id": 1101,
+          "news_id": "fixture-provider-1101",
+          "event_id": null,
+          "news_url": "https://news.example.invalid/fixture-1101",
+          "title": "Coinbase launches Bitcoin custody service",
+          "full_text": "Coinbase launched a Bitcoin custody service on October 28, 2026. The service provides storage for institutional clients and supports ordinary custody operations.",
+          "publish_date": "2026-10-28 13:00:00",
+          "source_name": "Fixture current",
+          "tickers": ""
+        }
+      },
+      "historical_accuracy_eligible": false,
+      "input_sha256": {
+        "prior": "e847cf9cf4e561b53cb74188af2f2fd9841545f6bea3f71f3e45fd7f8264a5b9",
+        "current": "a7fc55493eb9cda57963bd2cf24e2c33a084b73c5c5333232cbcceb2253e0f9a"
+      },
+      "expected_contract_confirmation": true,
+      "contract_review": "root_pre_engine_contract_review; independent of semantic relationship alignment"
+    },
+    {
+      "case_id": "S02_same_event_paraphrase",
+      "population": "synthetic_contract",
+      "semantic_reference": {
+        "relation": "same_event_duplicate",
+        "reason": "Both texts describe the same actor, custody launch, date and service, with no material new fact.",
+        "review_status": "root_second_review_approved",
+        "review_kind": "automated_contract_review_not_historical_human_gold"
+      },
+      "provenance": {
+        "source": "authored_minimal_contract_example",
+        "actual_historical_raw_snapshot": false,
+        "primary_source_review": false,
+        "notes": "All input identities and narrative details are deliberately synthetic; no production record is reconstructed."
+      },
+      "inputs": {
+        "prior": {
+          "id": 1002,
+          "news_id": "fixture-provider-1002",
+          "event_id": "fixture-event-custody",
+          "news_url": "https://news.example.invalid/fixture-1002",
+          "title": "Coinbase launched Bitcoin custody service",
+          "full_text": "Coinbase launched a Bitcoin custody service on October 28, 2026. The service provides storage for institutional clients.",
+          "publish_date": "2026-10-28 12:00:00",
+          "source_name": "Fixture prior",
+          "tickers": ""
+        },
+        "current": {
+          "id": 1102,
+          "news_id": "fixture-provider-1102",
+          "event_id": "fixture-event-custody",
+          "news_url": "https://news.example.invalid/fixture-1102",
+          "title": "Coinbase launches Bitcoin custody service",
+          "full_text": "On October 28, 2026, Coinbase introduced institutional Bitcoin custody. The service provides storage for clients.",
+          "publish_date": "2026-10-28 13:00:00",
+          "source_name": "Fixture current",
+          "tickers": ""
+        }
+      },
+      "historical_accuracy_eligible": false,
+      "input_sha256": {
+        "prior": "ce61d8e7754586b50fa5612099277bae3d7d11fbcc636f93773f1043ae937811",
+        "current": "34c2e44e5454df796cd1293758e9edd9d1e6d27fd8b44b887a481b35727d8d65"
+      },
+      "expected_contract_confirmation": true,
+      "contract_review": "root_pre_engine_contract_review; independent of semantic relationship alignment"
+    },
+    {
+      "case_id": "S03_material_new_assets",
+      "population": "synthetic_contract",
+      "semantic_reference": {
+        "relation": "material_update",
+        "reason": "The current text newly reports assets of $250 million; this is an additional substantive result, not a unit conversion.",
+        "review_status": "root_second_review_approved",
+        "review_kind": "automated_contract_review_not_historical_human_gold"
+      },
+      "provenance": {
+        "source": "authored_minimal_contract_example",
+        "actual_historical_raw_snapshot": false,
+        "primary_source_review": false,
+        "notes": "All input identities and narrative details are deliberately synthetic; no production record is reconstructed."
+      },
+      "inputs": {
+        "prior": {
+          "id": 1003,
+          "news_id": "fixture-provider-1003",
+          "event_id": "fixture-event-assets",
+          "news_url": "https://news.example.invalid/fixture-1003",
+          "title": "Coinbase launched Bitcoin custody service",
+          "full_text": "Coinbase launched a Bitcoin custody service on October 28, 2026. The service provides storage for institutional clients.",
+          "publish_date": "2026-10-28 12:00:00",
+          "source_name": "Fixture prior",
+          "tickers": ""
+        },
+        "current": {
+          "id": 1103,
+          "news_id": "fixture-provider-1103",
+          "event_id": "fixture-event-assets",
+          "news_url": "https://news.example.invalid/fixture-1103",
+          "title": "Coinbase launches Bitcoin custody service",
+          "full_text": "On October 28, 2026, Coinbase introduced institutional Bitcoin custody. The service provides storage for clients. The service now holds $250 million in client assets.",
+          "publish_date": "2026-10-28 13:00:00",
+          "source_name": "Fixture current",
+          "tickers": ""
+        }
+      },
+      "historical_accuracy_eligible": false,
+      "input_sha256": {
+        "prior": "50c61e28557961ba7a3ab56ef22ced1385214622d96df25b75d6c0a3a782b56e",
+        "current": "8e937608e44c26c952cdd0731b1330d8c10534e1f1e8aae5856ffc4df7530198"
+      },
+      "expected_contract_confirmation": false,
+      "contract_review": "root_pre_engine_contract_review; independent of semantic relationship alignment"
+    },
+    {
+      "case_id": "S04_distinct_regulatory_action",
+      "population": "synthetic_contract",
+      "semantic_reference": {
+        "relation": "related_event",
+        "reason": "The common company and asset do not make a custody launch and a regulatory lawsuit the same event.",
+        "review_status": "root_second_review_approved",
+        "review_kind": "automated_contract_review_not_historical_human_gold"
+      },
+      "provenance": {
+        "source": "authored_minimal_contract_example",
+        "actual_historical_raw_snapshot": false,
+        "primary_source_review": false,
+        "notes": "All input identities and narrative details are deliberately synthetic; no production record is reconstructed."
+      },
+      "inputs": {
+        "prior": {
+          "id": 1004,
+          "news_id": "fixture-provider-1004",
+          "event_id": "fixture-event-launch",
+          "news_url": "https://news.example.invalid/fixture-1004",
+          "title": "Coinbase launches Bitcoin custody service",
+          "full_text": "On October 28, 2026, Coinbase introduced institutional Bitcoin custody. The service provides storage for clients.",
+          "publish_date": "2026-10-28 12:00:00",
+          "source_name": "Fixture prior",
+          "tickers": ""
+        },
+        "current": {
+          "id": 1104,
+          "news_id": "fixture-provider-1104",
+          "event_id": "fixture-event-lawsuit",
+          "news_url": "https://news.example.invalid/fixture-1104",
+          "title": "SEC sues Coinbase over Bitcoin custody service",
+          "full_text": "The SEC sued Coinbase over its Bitcoin custody service on October 28, 2026. This is a separate regulatory action.",
+          "publish_date": "2026-10-28 13:00:00",
+          "source_name": "Fixture current",
+          "tickers": ""
+        }
+      },
+      "historical_accuracy_eligible": false,
+      "input_sha256": {
+        "prior": "8dd52baf2da0c1dead1d23b2708e855e9ed9fbbdde3e0d0b3716e09f4ab4f358",
+        "current": "225a62bf972b6696eb78138b381e6359a9746983e97457fe5877e2f02a0cce2e"
+      },
+      "expected_contract_confirmation": false,
+      "contract_review": "root_pre_engine_contract_review; independent of semantic relationship alignment"
+    },
+    {
+      "case_id": "S05_broad_topic_analysis",
+      "population": "synthetic_contract",
+      "semantic_reference": {
+        "relation": "broad_topic_overlap",
+        "reason": "These are different analyses sharing Bitcoin as a broad subject, not reports of one concrete event.",
+        "review_status": "root_second_review_approved",
+        "review_kind": "automated_contract_review_not_historical_human_gold"
+      },
+      "provenance": {
+        "source": "authored_minimal_contract_example",
+        "actual_historical_raw_snapshot": false,
+        "primary_source_review": false,
+        "notes": "All input identities and narrative details are deliberately synthetic; no production record is reconstructed."
+      },
+      "inputs": {
+        "prior": {
+          "id": 1005,
+          "news_id": "fixture-provider-1005",
+          "event_id": null,
+          "news_url": "https://news.example.invalid/fixture-1005",
+          "title": "Bitcoin transaction fees and software maintenance",
+          "full_text": "Developers discuss how network transaction fees affect Bitcoin software maintenance and node operation.",
+          "publish_date": "2026-10-28 12:00:00",
+          "source_name": "Fixture prior",
+          "tickers": ""
+        },
+        "current": {
+          "id": 1105,
+          "news_id": "fixture-provider-1105",
+          "event_id": null,
+          "news_url": "https://news.example.invalid/fixture-1105",
+          "title": "Bitcoin sentiment amid macroeconomic uncertainty",
+          "full_text": "Traders discuss Bitcoin sentiment as macroeconomic conditions change around traditional markets.",
+          "publish_date": "2026-10-28 13:00:00",
+          "source_name": "Fixture current",
+          "tickers": ""
+        }
+      },
+      "historical_accuracy_eligible": false,
+      "input_sha256": {
+        "prior": "0f04d0f77e5dcc5afef26faaae12684e41dfed02eac27b72f9c560b80ba69f90",
+        "current": "0f21a7ae207246c4d3b8b05cc8eb2b2ef865c199a4f901c80b2333516529fe2c"
+      },
+      "expected_contract_confirmation": false,
+      "contract_review": "root_pre_engine_contract_review; independent of semantic relationship alignment"
+    },
+    {
+      "case_id": "S06_unrelated_topics",
+      "population": "synthetic_contract",
+      "semantic_reference": {
+        "relation": "unrelated",
+        "reason": "A Coinbase Bitcoin custody launch and a Solana validator outage have different actors, subjects and actions.",
+        "review_status": "root_second_review_approved",
+        "review_kind": "automated_contract_review_not_historical_human_gold"
+      },
+      "provenance": {
+        "source": "authored_minimal_contract_example",
+        "actual_historical_raw_snapshot": false,
+        "primary_source_review": false,
+        "notes": "All input identities and narrative details are deliberately synthetic; no production record is reconstructed."
+      },
+      "inputs": {
+        "prior": {
+          "id": 1006,
+          "news_id": "fixture-provider-1006",
+          "event_id": null,
+          "news_url": "https://news.example.invalid/fixture-1006",
+          "title": "Coinbase launches Bitcoin custody service",
+          "full_text": "On October 28, 2026, Coinbase introduced institutional Bitcoin custody. The service provides storage for clients.",
+          "publish_date": "2026-10-28 12:00:00",
+          "source_name": "Fixture prior",
+          "tickers": ""
+        },
+        "current": {
+          "id": 1106,
+          "news_id": "fixture-provider-1106",
+          "event_id": null,
+          "news_url": "https://news.example.invalid/fixture-1106",
+          "title": "Solana validator outage disrupts network",
+          "full_text": "Solana validators were offline during a network outage on October 28, 2026. Network operations were unavailable.",
+          "publish_date": "2026-10-28 13:00:00",
+          "source_name": "Fixture current",
+          "tickers": ""
+        }
+      },
+      "historical_accuracy_eligible": false,
+      "input_sha256": {
+        "prior": "fe122d3d145f17a869db29743c6f8b79f23ac4e1abead213375bc29167f836da",
+        "current": "7698fe7c0290b2bd48b20683fa96b76ca440f237709d1e81d09f61033933af22"
+      },
+      "expected_contract_confirmation": false,
+      "contract_review": "root_pre_engine_contract_review; independent of semantic relationship alignment"
+    },
+    {
+      "case_id": "S07_same_event_missing_identity",
+      "population": "synthetic_contract",
+      "semantic_reference": {
+        "relation": "same_event_duplicate",
+        "reason": "The narrative facts match S02, but no upstream event identity or supported signature is supplied; semantic truth and conservative confirmation differ.",
+        "review_status": "root_second_review_approved",
+        "review_kind": "automated_contract_review_not_historical_human_gold"
+      },
+      "provenance": {
+        "source": "authored_minimal_contract_example",
+        "actual_historical_raw_snapshot": false,
+        "primary_source_review": false,
+        "notes": "All input identities and narrative details are deliberately synthetic; no production record is reconstructed."
+      },
+      "inputs": {
+        "prior": {
+          "id": 1007,
+          "news_id": "fixture-provider-1007",
+          "event_id": null,
+          "news_url": "https://news.example.invalid/fixture-1007",
+          "title": "Coinbase launched Bitcoin custody service",
+          "full_text": "Coinbase launched a Bitcoin custody service on October 28, 2026. The service provides storage for institutional clients.",
+          "publish_date": "2026-10-28 12:00:00",
+          "source_name": "Fixture prior",
+          "tickers": ""
+        },
+        "current": {
+          "id": 1107,
+          "news_id": "fixture-provider-1107",
+          "event_id": null,
+          "news_url": "https://news.example.invalid/fixture-1107",
+          "title": "Coinbase launches Bitcoin custody service",
+          "full_text": "On October 28, 2026, Coinbase introduced institutional Bitcoin custody. The service provides storage for clients.",
+          "publish_date": "2026-10-28 13:00:00",
+          "source_name": "Fixture current",
+          "tickers": ""
+        }
+      },
+      "historical_accuracy_eligible": false,
+      "input_sha256": {
+        "prior": "f72f543cee891685deb11885cba3b6e27d5a07746a912c9ea892f61ab261043c",
+        "current": "0b009d3c1b41cd7e6ac2486183e114ba005b2dd05073e2450a4ff0e6d1ab904d"
+      },
+      "expected_contract_confirmation": false,
+      "contract_review": "root_pre_engine_contract_review; independent of semantic relationship alignment"
+    },
+    {
+      "case_id": "S08_mutable_identity_without_content_proof",
+      "population": "synthetic_contract",
+      "semantic_reference": {
+        "relation": "same_event_duplicate",
+        "reason": "Both short texts explicitly identify the same actor, launch and date. Shared mutable URL/provider identity is not immutable source-content proof.",
+        "review_status": "root_second_review_approved",
+        "review_kind": "automated_contract_review_not_historical_human_gold"
+      },
+      "provenance": {
+        "source": "authored_minimal_contract_example",
+        "actual_historical_raw_snapshot": false,
+        "primary_source_review": false,
+        "notes": "All input identities and narrative details are deliberately synthetic; no production record is reconstructed."
+      },
+      "inputs": {
+        "prior": {
+          "id": 1008,
+          "news_id": "fixture-mutable-article",
+          "event_id": null,
+          "news_url": "https://news.example.invalid/mutable-fixture",
+          "title": "Coinbase launched Bitcoin custody service",
+          "full_text": "Coinbase launched Bitcoin custody on October 28, 2026.",
+          "publish_date": "2026-10-28 12:00:00",
+          "source_name": "Fixture prior",
+          "tickers": ""
+        },
+        "current": {
+          "id": 1108,
+          "news_id": "fixture-mutable-article",
+          "event_id": null,
+          "news_url": "https://news.example.invalid/mutable-fixture",
+          "title": "Coinbase launches Bitcoin custody service",
+          "full_text": "On October 28, 2026, Coinbase introduced Bitcoin custody.",
+          "publish_date": "2026-10-28 13:00:00",
+          "source_name": "Fixture current",
+          "tickers": ""
+        }
+      },
+      "historical_accuracy_eligible": false,
+      "input_sha256": {
+        "prior": "aac748c896c9f4adb0b6cfd9a634541a994e2abcad1b06f4d1f05aeab2a07f5c",
+        "current": "30aae2f6e7565a443659a60ab714f4f89b09cd8a68fe68dcf95f93afaa46c371"
+      },
+      "expected_contract_confirmation": false,
+      "contract_review": "root_pre_engine_contract_review; independent of semantic relationship alignment"
+    },
+    {
+      "case_id": "S09_identical_uncertain_source",
+      "population": "synthetic_contract",
+      "semantic_reference": {
+        "relation": "exact_duplicate",
+        "reason": "This is an exact copy of the same speculative report, not proof that the proposed launch occurred. Uncertain evidence may remain unconfirmed.",
+        "review_status": "root_second_review_approved",
+        "review_kind": "automated_contract_review_not_historical_human_gold"
+      },
+      "provenance": {
+        "source": "authored_minimal_contract_example",
+        "actual_historical_raw_snapshot": false,
+        "primary_source_review": false,
+        "notes": "All input identities and narrative details are deliberately synthetic; no production record is reconstructed."
+      },
+      "inputs": {
+        "prior": {
+          "id": 1009,
+          "news_id": "fixture-provider-1009",
+          "event_id": null,
+          "news_url": "https://news.example.invalid/fixture-1009",
+          "title": "Coinbase may launch Bitcoin custody service",
+          "full_text": "Coinbase may launch a Bitcoin custody service on October 28, 2026. The launch remains an unconfirmed proposal for institutional clients.",
+          "publish_date": "2026-10-28 12:00:00",
+          "source_name": "Fixture prior",
+          "tickers": ""
+        },
+        "current": {
+          "id": 1109,
+          "news_id": "fixture-provider-1109",
+          "event_id": null,
+          "news_url": "https://news.example.invalid/fixture-1109",
+          "title": "Coinbase may launch Bitcoin custody service",
+          "full_text": "Coinbase may launch a Bitcoin custody service on October 28, 2026. The launch remains an unconfirmed proposal for institutional clients.",
+          "publish_date": "2026-10-28 13:00:00",
+          "source_name": "Fixture current",
+          "tickers": ""
+        }
+      },
+      "historical_accuracy_eligible": false,
+      "input_sha256": {
+        "prior": "e747953c298ebf9e40aaec81d1ce8938fc558701e1af011c4188f9ff364014eb",
+        "current": "1698420cc3e1ac861e38f832c1a21c8b2440ede77b697a608e954b78bc0fbb5f"
+      },
+      "expected_contract_confirmation": false,
+      "contract_review": "root_pre_engine_contract_review; independent of semantic relationship alignment"
+    },
+    {
+      "case_id": "R01_existing_fomc_reconstruction",
+      "population": "reconstructed_baseline",
+      "semantic_reference": {
+        "relation": "same_event_duplicate",
+        "reason": "Baseline regression for matching FOMC date, target range and vote across different provider event identities; not an independent historical holdout.",
+        "review_status": "existing_baseline_reconstruction",
+        "review_kind": "automated_contract_review_not_historical_human_gold"
+      },
+      "provenance": {
+        "source": "existing_baseline_reconstructed_fixture",
+        "source_path": "GetNewsAPI/tests/test_duplicate_cross_source.py",
+        "source_symbol": "fomc_source_pair",
+        "source_sha256": "b68507aac42d5bc6f4cebbd6d3b36cbca1021646cbb49dcd13038d63365e677f",
+        "actual_historical_raw_snapshot": false,
+        "primary_source_review": false,
+        "notes": "Copied from an already reconstructed baseline fixture; historical-looking IDs remain fixture IDs, not proof of original raw captures."
+      },
+      "inputs": {
+        "prior": {
+          "id": 18789,
+          "news_id": "source-fed-18789",
+          "event_id": "fed-wire-a",
+          "news_url": "https://first-source.example/fed-decision",
+          "title": "Fed holds federal funds rate",
+          "full_text": "The Federal Reserve held its federal funds target range at 3.75%-4.00% on October 28, 2026. The FOMC voted 10-2. Bitcoin traded near $81,000.",
+          "source_name": "First Source",
+          "publish_date": "2026-10-28 18:01:00",
+          "tickers": "BTC"
+        },
+        "current": {
+          "id": 18825,
+          "news_id": "source-fed-18825",
+          "event_id": "fed-wire-b",
+          "news_url": "https://second-source.example/fomc-crypto",
+          "title": "FOMC meeting impact on crypto markets: Fed holds rates at 3.75%-4.00%",
+          "full_text": "At the October 28, 2026 FOMC meeting, the Federal Reserve maintained the federal funds rate range of 3.75 to 4.00%. A 10 to 2 vote kept that target unchanged. Bitcoin was near $81,000.",
+          "source_name": "Second Source",
+          "publish_date": "2026-10-28 18:05:00",
+          "tickers": "BTC"
+        }
+      },
+      "historical_accuracy_eligible": false,
+      "input_sha256": {
+        "prior": "e4ba5105beb3df968897ac21a02d55122dde5bfefa5d14a020c3c38e7ca8cb19",
+        "current": "d270c7477e805221996eb98600e98d42337cbcf300a65f43dc3fd6288d1a72d3"
+      },
+      "expected_contract_confirmation": true,
+      "contract_review": "root_pre_engine_contract_review; independent of semantic relationship alignment"
+    },
+    {
+      "case_id": "F01_glamsterdam_hoodi_minimal",
+      "population": "operator_FINAL_minimal_analogue",
+      "semantic_reference": {
+        "relation": "same_event_duplicate",
+        "reason": "Minimal paraphrases retain the operator-reviewed FINAL event-family distinction. They are not original pipeline raw inputs or an independent raw historical replay.",
+        "review_status": "root_second_review_approved",
+        "review_kind": "operator_FINAL_family_attestation_plus_automated_minimal_text_review"
+      },
+      "provenance": {
+        "source": "operator_attested_primary_review_of_retained_FINAL",
+        "family": "glamsterdam_hoodi_postponement",
+        "final_wp_post_ids": [
+          6378,
+          6381
+        ],
+        "source_database_sha256": "908f583389c5c5db28e7dd4c33fcf3d30c9643858b306f3318443df96c9636dd",
+        "actual_historical_raw_snapshot": false,
+        "primary_source_review": "operator_attestation_for_FINAL_family_only",
+        "notes": "IDs/URLs are synthetic aliases; event identity and source publication time are deliberately unknown, not fabricated historical fields."
+      },
+      "inputs": {
+        "prior": {
+          "id": 2001,
+          "news_id": "synthetic-final-analogue-2001",
+          "event_id": null,
+          "news_url": "https://news.example.invalid/final-analogue-2001",
+          "title": "Ethereum postpones Glamsterdam Hoodi testnet activation",
+          "full_text": "Ethereum Foundation postponed the Glamsterdam activation on the Hoodi testnet because of contract risks.",
+          "publish_date": null,
+          "source_name": "Synthetic minimal prior",
+          "tickers": ""
+        },
+        "current": {
+          "id": 2101,
+          "news_id": "synthetic-final-analogue-2101",
+          "event_id": null,
+          "news_url": "https://news.example.invalid/final-analogue-2101",
+          "title": "Ethereum delays Glamsterdam activation on Hoodi testnet",
+          "full_text": "Ethereum Foundation delayed the Glamsterdam fork on the Hoodi testnet over contract risks.",
+          "publish_date": null,
+          "source_name": "Synthetic minimal current",
+          "tickers": ""
+        }
+      },
+      "historical_accuracy_eligible": false,
+      "expected_contract_confirmation": false,
+      "contract_review": "root_pre_engine_contract_review; independent of semantic relationship alignment",
+      "input_sha256": {
+        "prior": "761b06a4d0ca6e2d353868cc4bc2dd00a6c16197bf1c464acb8e54caa35662fb",
+        "current": "d21a0b7221fbae8f488edfe113186f843dc105737a39dce2cc371b7e143bd746"
+      }
+    },
+    {
+      "case_id": "F02_alpenglow_activation_minimal",
+      "population": "operator_FINAL_minimal_analogue",
+      "semantic_reference": {
+        "relation": "same_event_duplicate",
+        "reason": "Minimal paraphrases retain the operator-reviewed FINAL event-family distinction. They are not original pipeline raw inputs or an independent raw historical replay.",
+        "review_status": "root_second_review_approved",
+        "review_kind": "operator_FINAL_family_attestation_plus_automated_minimal_text_review"
+      },
+      "provenance": {
+        "source": "operator_attested_primary_review_of_retained_FINAL",
+        "family": "alpenglow_mainnet_activation",
+        "final_wp_post_ids": [
+          6267,
+          6282
+        ],
+        "source_database_sha256": "908f583389c5c5db28e7dd4c33fcf3d30c9643858b306f3318443df96c9636dd",
+        "actual_historical_raw_snapshot": false,
+        "primary_source_review": "operator_attestation_for_FINAL_family_only",
+        "notes": "IDs/URLs are synthetic aliases; event identity and source publication time are deliberately unknown, not fabricated historical fields."
+      },
+      "inputs": {
+        "prior": {
+          "id": 2002,
+          "news_id": "synthetic-final-analogue-2002",
+          "event_id": null,
+          "news_url": "https://news.example.invalid/final-analogue-2002",
+          "title": "Solana activates Alpenglow consensus upgrade on mainnet",
+          "full_text": "Solana activated the Alpenglow consensus upgrade on mainnet.",
+          "publish_date": null,
+          "source_name": "Synthetic minimal prior",
+          "tickers": ""
+        },
+        "current": {
+          "id": 2102,
+          "news_id": "synthetic-final-analogue-2102",
+          "event_id": null,
+          "news_url": "https://news.example.invalid/final-analogue-2102",
+          "title": "Solana Alpenglow consensus upgrade goes live on mainnet",
+          "full_text": "The Alpenglow consensus upgrade went live on Solana mainnet.",
+          "publish_date": null,
+          "source_name": "Synthetic minimal current",
+          "tickers": ""
+        }
+      },
+      "historical_accuracy_eligible": false,
+      "expected_contract_confirmation": false,
+      "contract_review": "root_pre_engine_contract_review; independent of semantic relationship alignment",
+      "input_sha256": {
+        "prior": "a1d67f6f10c4952da9cfc542490b28a4251fa54d8706959bd2cf9ea177184754",
+        "current": "e0675fadecd49a9f960534aa81ef516a46960e1e8635daf6e8d15b341c5b8dc9"
+      }
+    },
+    {
+      "case_id": "F03_deka_sparkassen_minimal",
+      "population": "operator_FINAL_minimal_analogue",
+      "semantic_reference": {
+        "relation": "same_event_duplicate",
+        "reason": "Minimal paraphrases retain the operator-reviewed FINAL event-family distinction. They are not original pipeline raw inputs or an independent raw historical replay.",
+        "review_status": "root_second_review_approved",
+        "review_kind": "operator_FINAL_family_attestation_plus_automated_minimal_text_review"
+      },
+      "provenance": {
+        "source": "operator_attested_primary_review_of_retained_FINAL",
+        "family": "deka_sparkassen_crypto_trading",
+        "final_wp_post_ids": [
+          6252,
+          6336
+        ],
+        "source_database_sha256": "908f583389c5c5db28e7dd4c33fcf3d30c9643858b306f3318443df96c9636dd",
+        "actual_historical_raw_snapshot": false,
+        "primary_source_review": "operator_attestation_for_FINAL_family_only",
+        "notes": "IDs/URLs are synthetic aliases; event identity and source publication time are deliberately unknown, not fabricated historical fields."
+      },
+      "inputs": {
+        "prior": {
+          "id": 2003,
+          "news_id": "synthetic-final-analogue-2003",
+          "event_id": null,
+          "news_url": "https://news.example.invalid/final-analogue-2003",
+          "title": "DekaBank launches crypto trading for Sparkassen customers",
+          "full_text": "DekaBank launched crypto trading for Sparkassen customers.",
+          "publish_date": null,
+          "source_name": "Synthetic minimal prior",
+          "tickers": ""
+        },
+        "current": {
+          "id": 2103,
+          "news_id": "synthetic-final-analogue-2103",
+          "event_id": null,
+          "news_url": "https://news.example.invalid/final-analogue-2103",
+          "title": "DekaBank introduces crypto trading for Sparkassen customers",
+          "full_text": "DekaBank introduced crypto trading for Sparkassen customers.",
+          "publish_date": null,
+          "source_name": "Synthetic minimal current",
+          "tickers": ""
+        }
+      },
+      "historical_accuracy_eligible": false,
+      "expected_contract_confirmation": false,
+      "contract_review": "root_pre_engine_contract_review; independent of semantic relationship alignment",
+      "input_sha256": {
+        "prior": "f7a6439ff27e380289609943d0b57b1989e2b048c2f2f32b40a33cad6adbd313",
+        "current": "96da3158017ddb3282f6f9489620ad2c7544eb54a07d071c40b586a25e612a9f"
+      }
+    },
+    {
+      "case_id": "F04_jpmorgan_solana_minimal",
+      "population": "operator_FINAL_minimal_analogue",
+      "semantic_reference": {
+        "relation": "same_event_duplicate",
+        "reason": "Minimal paraphrases retain the operator-reviewed FINAL event-family distinction. They are not original pipeline raw inputs or an independent raw historical replay.",
+        "review_status": "root_second_review_approved",
+        "review_kind": "operator_FINAL_family_attestation_plus_automated_minimal_text_review"
+      },
+      "provenance": {
+        "source": "operator_attested_primary_review_of_retained_FINAL",
+        "family": "jpmorgan_solana_tokenized_fund",
+        "final_wp_post_ids": [
+          6346,
+          6401
+        ],
+        "source_database_sha256": "908f583389c5c5db28e7dd4c33fcf3d30c9643858b306f3318443df96c9636dd",
+        "actual_historical_raw_snapshot": false,
+        "primary_source_review": "operator_attestation_for_FINAL_family_only",
+        "notes": "IDs/URLs are synthetic aliases; event identity and source publication time are deliberately unknown, not fabricated historical fields."
+      },
+      "inputs": {
+        "prior": {
+          "id": 2004,
+          "news_id": "synthetic-final-analogue-2004",
+          "event_id": null,
+          "news_url": "https://news.example.invalid/final-analogue-2004",
+          "title": "JPMorgan launches tokenized money market funds on Solana",
+          "full_text": "JPMorgan launched tokenized money market funds on Solana.",
+          "publish_date": null,
+          "source_name": "Synthetic minimal prior",
+          "tickers": ""
+        },
+        "current": {
+          "id": 2104,
+          "news_id": "synthetic-final-analogue-2104",
+          "event_id": null,
+          "news_url": "https://news.example.invalid/final-analogue-2104",
+          "title": "J.P. Morgan introduces tokenized money market funds on Solana",
+          "full_text": "J.P. Morgan introduced tokenized money market funds on Solana.",
+          "publish_date": null,
+          "source_name": "Synthetic minimal current",
+          "tickers": ""
+        }
+      },
+      "historical_accuracy_eligible": false,
+      "expected_contract_confirmation": false,
+      "contract_review": "root_pre_engine_contract_review; independent of semantic relationship alignment",
+      "input_sha256": {
+        "prior": "225efca609dcf230c898fb5de9863dad9fee7228a09ddc611ad03bd1b32d301b",
+        "current": "c05d5044a4b0d2b6ae5e929c9916b395e020b3740c92a6931e88d821c01ac07a"
+      }
+    },
+    {
+      "case_id": "F05_uk_qian_minimal",
+      "population": "operator_FINAL_minimal_analogue",
+      "semantic_reference": {
+        "relation": "same_event_duplicate",
+        "reason": "Minimal paraphrases retain the operator-reviewed FINAL event-family distinction. They are not original pipeline raw inputs or an independent raw historical replay.",
+        "review_status": "root_second_review_approved",
+        "review_kind": "operator_FINAL_family_attestation_plus_automated_minimal_text_review"
+      },
+      "provenance": {
+        "source": "operator_attested_primary_review_of_retained_FINAL",
+        "family": "uk_qian_ownership_law",
+        "final_wp_post_ids": [
+          6255,
+          6264
+        ],
+        "source_database_sha256": "908f583389c5c5db28e7dd4c33fcf3d30c9643858b306f3318443df96c9636dd",
+        "actual_historical_raw_snapshot": false,
+        "primary_source_review": "operator_attestation_for_FINAL_family_only",
+        "notes": "IDs/URLs are synthetic aliases; event identity and source publication time are deliberately unknown, not fabricated historical fields."
+      },
+      "inputs": {
+        "prior": {
+          "id": 2005,
+          "news_id": "synthetic-final-analogue-2005",
+          "event_id": null,
+          "news_url": "https://news.example.invalid/final-analogue-2005",
+          "title": "UK court applies Chinese law to Qian Bitcoin ownership claims",
+          "full_text": "A UK court ruled that Chinese law applies to ownership claims in the Qian Bitcoin case.",
+          "publish_date": null,
+          "source_name": "Synthetic minimal prior",
+          "tickers": ""
+        },
+        "current": {
+          "id": 2105,
+          "news_id": "synthetic-final-analogue-2105",
+          "event_id": null,
+          "news_url": "https://news.example.invalid/final-analogue-2105",
+          "title": "British court rules Chinese law applies to Qian Bitcoin ownership claims",
+          "full_text": "A British court applied Chinese law to the Qian Bitcoin ownership claims.",
+          "publish_date": null,
+          "source_name": "Synthetic minimal current",
+          "tickers": ""
+        }
+      },
+      "historical_accuracy_eligible": false,
+      "expected_contract_confirmation": false,
+      "contract_review": "root_pre_engine_contract_review; independent of semantic relationship alignment",
+      "input_sha256": {
+        "prior": "300de7528e7dc2806cec593458c19644f469aa3dcfa7932da4057c705ee0bca3",
+        "current": "fbe1f468c159ef234c5674fec3a9f2992106058f8e7e24b87db5be4cf8552ead"
+      }
+    },
+    {
+      "case_id": "F06_tianjin_distinct_from_uk_qian",
+      "population": "operator_FINAL_minimal_analogue",
+      "semantic_reference": {
+        "relation": "insufficient_evidence",
+        "reason": "The operator establishes different court actions only. Related-event versus broad-topic granularity is not independently established by the minimal text; abstain exact native-class comparison while retaining a not-same-event control.",
+        "review_status": "root_second_review_approved",
+        "review_kind": "operator_FINAL_family_attestation_plus_automated_minimal_text_review",
+        "duplicate_truth": false
+      },
+      "provenance": {
+        "source": "operator_attested_primary_review_of_retained_FINAL",
+        "family": "tianjin_confiscation_filing_distinct_from_uk_qian_ownership_law",
+        "final_wp_post_ids": [
+          6255,
+          6352
+        ],
+        "source_database_sha256": "908f583389c5c5db28e7dd4c33fcf3d30c9643858b306f3318443df96c9636dd",
+        "actual_historical_raw_snapshot": false,
+        "primary_source_review": "operator_attestation_for_FINAL_family_only",
+        "notes": "IDs/URLs are synthetic aliases; event identity and source publication time are deliberately unknown, not fabricated historical fields."
+      },
+      "inputs": {
+        "prior": {
+          "id": 2006,
+          "news_id": "synthetic-final-analogue-2006",
+          "event_id": null,
+          "news_url": "https://news.example.invalid/final-analogue-2006",
+          "title": "UK court applies Chinese law to Qian Bitcoin ownership claims",
+          "full_text": "A UK court ruled that Chinese law applies to ownership claims in the Qian Bitcoin case.",
+          "publish_date": null,
+          "source_name": "Synthetic minimal prior",
+          "tickers": ""
+        },
+        "current": {
+          "id": 2106,
+          "news_id": "synthetic-final-analogue-2106",
+          "event_id": null,
+          "news_url": "https://news.example.invalid/final-analogue-2106",
+          "title": "Tianjin court accepts Bitcoin confiscation filing",
+          "full_text": "A Tianjin court accepted a confiscation filing for Bitcoin. This is a distinct court action.",
+          "publish_date": null,
+          "source_name": "Synthetic minimal current",
+          "tickers": ""
+        }
+      },
+      "historical_accuracy_eligible": false,
+      "expected_contract_confirmation": false,
+      "contract_review": "root_pre_engine_contract_review; independent of semantic relationship alignment",
+      "input_sha256": {
+        "prior": "50bfc7926888a471597267c746a81d52c985e6626e9421adf684b6773eeba55b",
+        "current": "93d9681fa1fe932e1a975947ac7dffb13c949521ce74df3aa4618caeb606d93c"
+      }
+    },
+    {
+      "case_id": "F07_bitmine_holdings_minimal",
+      "population": "operator_FINAL_minimal_analogue",
+      "semantic_reference": {
+        "relation": "same_event_duplicate",
+        "reason": "Minimal paraphrases retain the operator-reviewed FINAL event-family distinction. They are not original pipeline raw inputs or an independent raw historical replay.",
+        "review_status": "root_second_review_approved",
+        "review_kind": "operator_FINAL_family_attestation_plus_automated_minimal_text_review"
+      },
+      "provenance": {
+        "source": "operator_attested_primary_review_of_retained_FINAL",
+        "family": "bitmine_holdings",
+        "final_wp_post_ids": [
+          6293,
+          6498
+        ],
+        "source_database_sha256": "908f583389c5c5db28e7dd4c33fcf3d30c9643858b306f3318443df96c9636dd",
+        "actual_historical_raw_snapshot": false,
+        "primary_source_review": "operator_attestation_for_FINAL_family_only",
+        "notes": "IDs/URLs are synthetic aliases; event identity and source publication time are deliberately unknown, not fabricated historical fields.",
+        "numeric_fact_source": "Retained FINAL public titles for approved WP6293 and WP6498 explicitly contain 6.05 million ETH and $15 billion; not invented raw fields."
+      },
+      "inputs": {
+        "prior": {
+          "id": 2007,
+          "news_id": "synthetic-final-analogue-2007",
+          "event_id": null,
+          "news_url": "https://news.example.invalid/final-analogue-2007",
+          "title": "Bitmine reports 6.05 million ETH holdings worth $15 billion",
+          "full_text": "Bitmine reports 6.05 million ETH in holdings worth $15 billion.",
+          "publish_date": null,
+          "source_name": "Synthetic minimal prior",
+          "tickers": ""
+        },
+        "current": {
+          "id": 2107,
+          "news_id": "synthetic-final-analogue-2107",
+          "event_id": null,
+          "news_url": "https://news.example.invalid/final-analogue-2107",
+          "title": "Bitmine reports 6.05 million ETH in $15 billion holdings",
+          "full_text": "Bitmine reports total holdings of 6.05 million ETH valued at $15 billion.",
+          "publish_date": null,
+          "source_name": "Synthetic minimal current",
+          "tickers": ""
+        }
+      },
+      "historical_accuracy_eligible": false,
+      "expected_contract_confirmation": false,
+      "contract_review": "root_pre_engine_contract_review; independent of semantic relationship alignment",
+      "input_sha256": {
+        "prior": "b9c2107c9af8539d0010647b227d44a2d7111d7ba09c8152dd516f32ac42dc28",
+        "current": "e0b06811afaf1ab6e60baf372cdafac27d0fc215018a29ee2a99a3badd4015f6"
+      }
+    },
+    {
+      "case_id": "F08_aviva_xrpl_share_class_minimal",
+      "population": "operator_FINAL_minimal_analogue",
+      "semantic_reference": {
+        "relation": "same_event_duplicate",
+        "reason": "Minimal paraphrases retain the operator-reviewed FINAL event-family distinction. They are not original pipeline raw inputs or an independent raw historical replay.",
+        "review_status": "root_second_review_approved",
+        "review_kind": "operator_FINAL_family_attestation_plus_automated_minimal_text_review"
+      },
+      "provenance": {
+        "source": "operator_attested_primary_review_of_retained_FINAL",
+        "family": "aviva_xrpl_sterling_share_class",
+        "final_wp_post_ids": [
+          6483,
+          6486
+        ],
+        "source_database_sha256": "908f583389c5c5db28e7dd4c33fcf3d30c9643858b306f3318443df96c9636dd",
+        "actual_historical_raw_snapshot": false,
+        "primary_source_review": "operator_attestation_for_FINAL_family_only",
+        "notes": "IDs/URLs are synthetic aliases; event identity and source publication time are deliberately unknown, not fabricated historical fields.",
+        "numeric_fact_source": "Retained FINAL public title for approved WP6483 explicitly contains £50M; rendered as £50 million in the minimal analogue, not attributed to missing raw input."
+      },
+      "inputs": {
+        "prior": {
+          "id": 2008,
+          "news_id": "synthetic-final-analogue-2008",
+          "event_id": null,
+          "news_url": "https://news.example.invalid/final-analogue-2008",
+          "title": "Aviva Investors launches tokenized sterling fund share class on XRPL",
+          "full_text": "Aviva Investors launches a £50 million tokenized sterling fund share class on XRPL.",
+          "publish_date": null,
+          "source_name": "Synthetic minimal prior",
+          "tickers": ""
+        },
+        "current": {
+          "id": 2108,
+          "news_id": "synthetic-final-analogue-2108",
+          "event_id": null,
+          "news_url": "https://news.example.invalid/final-analogue-2108",
+          "title": "Aviva Investors adds tokenized share class to sterling fund on XRPL",
+          "full_text": "Aviva Investors adds a £50 million tokenized share class to its sterling fund on XRPL.",
+          "publish_date": null,
+          "source_name": "Synthetic minimal current",
+          "tickers": ""
+        }
+      },
+      "historical_accuracy_eligible": false,
+      "expected_contract_confirmation": false,
+      "contract_review": "root_pre_engine_contract_review; independent of semantic relationship alignment",
+      "input_sha256": {
+        "prior": "c04a559e7b1d68c7b7f5bbb6cef06e37c60f69debe08bcb53e468b80baf58c10",
+        "current": "26bf6fd33fca37f9317bce57c1d2a14b0bbf6007b51de61eda19855451af0782"
+      }
+    }
+  ],
+  "quarantine": [
+    {
+      "case_id": "Q01_observed_production_34778_34388",
+      "population": "unadjudicated_production_observation",
+      "reported_raw_ids": [
+        34778,
+        34388
+      ],
+      "observed_classification": "related_event",
+      "semantic_reference": null,
+      "inputs": null,
+      "reason": "Complete immutable raw/research/human-label evidence was not retained; do not relabel or include in quality denominators.",
+      "historical_accuracy_eligible": false
+    },
+    {
+      "case_id": "Q02_alpenglow_measured_finality_6344",
+      "population": "operator_reviewed_FINAL_material_exception",
+      "wp_ids": [
+        6344
+      ],
+      "semantic_reference": "material_update",
+      "inputs": null,
+      "reason": "Operator identifies a useful measured-finality exception. Concrete primary measurement evidence is unavailable here; review-only, no invented metric or raw input.",
+      "historical_accuracy_eligible": false
+    }
+  ],
+  "candidate_contexts": {
+    "published": {
+      "processed": 1,
+      "processing_status": "completed",
+      "canonical_rich_id": 50001,
+      "canonical_wp_id": 60001,
+      "canonical_published": 1,
+      "canonical_publish_status": "published",
+      "canonical_publish_attempt_count": 1,
+      "canonical_published_at": "2026-10-28 12:30:00",
+      "canonical_post_created_at": "2026-10-28 12:29:00"
+    },
+    "processed_unpublished": {
+      "processed": 1,
+      "processing_status": "completed",
+      "canonical_rich_id": 50001,
+      "canonical_wp_id": null,
+      "canonical_published": 0,
+      "canonical_publish_status": "fresh",
+      "canonical_publish_attempt_count": 0
+    },
+    "selected_only": {
+      "processed": 0,
+      "processing_status": "pending",
+      "chosen_for_publish": 1,
+      "canonical_rich_id": null,
+      "canonical_wp_id": null,
+      "canonical_published": 0,
+      "canonical_publish_status": null,
+      "canonical_publish_attempt_count": 0
+    },
+    "raw_duplicate": {
+      "processed": 1,
+      "processing_status": "duplicate",
+      "canonical_rich_id": 50001,
+      "canonical_wp_id": 60001,
+      "canonical_published": 1,
+      "canonical_publish_status": "published",
+      "canonical_publish_attempt_count": 1
+    },
+    "rich_duplicate": {
+      "processed": 1,
+      "processing_status": "completed",
+      "canonical_rich_id": 50001,
+      "canonical_wp_id": null,
+      "canonical_published": 0,
+      "canonical_publish_status": "duplicate",
+      "canonical_publish_attempt_count": 1
+    },
+    "unresolved_attempt": {
+      "processed": 0,
+      "processing_status": "pending",
+      "canonical_rich_id": 50001,
+      "canonical_wp_id": null,
+      "canonical_published": 0,
+      "canonical_publish_status": "retryable",
+      "canonical_publish_attempt_count": 1
+    },
+    "unattempted_claim": {
+      "processed": 0,
+      "processing_status": "pending",
+      "canonical_rich_id": 50001,
+      "canonical_wp_id": null,
+      "canonical_published": 0,
+      "canonical_publish_status": "claimed",
+      "canonical_publish_attempt_count": 0
+    }
+  },
+  "scenarios": [
+    {
+      "scenario_id": "enforce_raw_published",
+      "stage": "raw",
+      "mode": "enforce",
+      "candidate_context": "published",
+      "audit_outcome": "persist",
+      "cases": "all"
+    },
+    {
+      "scenario_id": "enforce_pre_publish_published",
+      "stage": "pre_publish",
+      "mode": "enforce",
+      "candidate_context": "published",
+      "audit_outcome": "persist",
+      "cases": "all"
+    },
+    {
+      "scenario_id": "shadow_raw_published",
+      "stage": "raw",
+      "mode": "shadow",
+      "candidate_context": "published",
+      "audit_outcome": "persist",
+      "cases": "all"
+    },
+    {
+      "scenario_id": "shadow_pre_publish_published",
+      "stage": "pre_publish",
+      "mode": "shadow",
+      "candidate_context": "published",
+      "audit_outcome": "persist",
+      "cases": "all"
+    },
+    {
+      "scenario_id": "off_raw",
+      "stage": "raw",
+      "mode": "off",
+      "candidate_context": "published",
+      "audit_outcome": "persist",
+      "cases": [
+        "S02_same_event_paraphrase"
+      ]
+    },
+    {
+      "scenario_id": "enforce_raw_selected_only",
+      "stage": "raw",
+      "mode": "enforce",
+      "candidate_context": "selected_only",
+      "audit_outcome": "persist",
+      "cases": [
+        "S02_same_event_paraphrase"
+      ]
+    },
+    {
+      "scenario_id": "enforce_raw_processed_unpublished",
+      "stage": "raw",
+      "mode": "enforce",
+      "candidate_context": "processed_unpublished",
+      "audit_outcome": "persist",
+      "cases": [
+        "S02_same_event_paraphrase"
+      ]
+    },
+    {
+      "scenario_id": "enforce_pre_publish_processed_unpublished",
+      "stage": "pre_publish",
+      "mode": "enforce",
+      "candidate_context": "processed_unpublished",
+      "audit_outcome": "persist",
+      "cases": [
+        "S02_same_event_paraphrase"
+      ]
+    },
+    {
+      "scenario_id": "enforce_raw_terminal_duplicate",
+      "stage": "raw",
+      "mode": "enforce",
+      "candidate_context": "raw_duplicate",
+      "audit_outcome": "persist",
+      "cases": [
+        "S02_same_event_paraphrase"
+      ]
+    },
+    {
+      "scenario_id": "enforce_pre_publish_terminal_duplicate",
+      "stage": "pre_publish",
+      "mode": "enforce",
+      "candidate_context": "rich_duplicate",
+      "audit_outcome": "persist",
+      "cases": [
+        "S02_same_event_paraphrase"
+      ]
+    },
+    {
+      "scenario_id": "enforce_pre_publish_unresolved",
+      "stage": "pre_publish",
+      "mode": "enforce",
+      "candidate_context": "unresolved_attempt",
+      "audit_outcome": "persist",
+      "cases": [
+        "S02_same_event_paraphrase"
+      ]
+    },
+    {
+      "scenario_id": "shadow_pre_publish_unresolved",
+      "stage": "pre_publish",
+      "mode": "shadow",
+      "candidate_context": "unresolved_attempt",
+      "audit_outcome": "persist",
+      "cases": [
+        "S02_same_event_paraphrase"
+      ]
+    },
+    {
+      "scenario_id": "enforce_pre_publish_unattempted_claim",
+      "stage": "pre_publish",
+      "mode": "enforce",
+      "candidate_context": "unattempted_claim",
+      "audit_outcome": "persist",
+      "cases": [
+        "S02_same_event_paraphrase"
+      ]
+    },
+    {
+      "scenario_id": "enforce_raw_audit_failure",
+      "stage": "raw",
+      "mode": "enforce",
+      "candidate_context": "published",
+      "audit_outcome": "error",
+      "cases": [
+        "S02_same_event_paraphrase"
+      ]
+    },
+    {
+      "scenario_id": "enforce_pre_publish_audit_failure",
+      "stage": "pre_publish",
+      "mode": "enforce",
+      "candidate_context": "published",
+      "audit_outcome": "error",
+      "cases": [
+        "S02_same_event_paraphrase"
+      ]
+    },
+    {
+      "scenario_id": "enforce_raw_incomplete_audit",
+      "stage": "raw",
+      "mode": "enforce",
+      "candidate_context": "published",
+      "audit_outcome": "incomplete",
+      "cases": [
+        "S02_same_event_paraphrase"
+      ]
+    }
+  ],
+  "review_protocol": "S01-S09 and F01-F08 semantic references were second-reviewed by root before any engine execution; automated contract review is not independent historical human adjudication. F06 granularity abstention was fixed before execution."
+}

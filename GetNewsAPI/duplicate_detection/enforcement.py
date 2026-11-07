@@ -22,6 +22,7 @@ DUPLICATE_COUNTER_NAMES = (
     "semantic_candidates_evaluated", "semantic_candidates_promoted",
     "fail_open_unavailable_embeddings",
     "shadow_would_reject_duplicates", "cross_source_duplicates_confirmed",
+    "same_event_classifications", "same_event_unconfirmed",
 )
 
 
@@ -183,6 +184,9 @@ def assess_duplicate_enforcement(
             seen.add(candidate_id)
             assessment = assess_relationship(source, candidate, policy_version=getattr(config, "DUPLICATE_POLICY_VERSION", "v1"), lookback_hours=getattr(config, "DUPLICATE_LOOKBACK_HOURS", 72))
             confirmed = _confirmed(assessment)
+            if assessment.assessment_type is AssessmentType.SAME_EVENT_DUPLICATE:
+                counters["same_event_classifications"] += 1
+                counters["same_event_unconfirmed"] += int(not confirmed)
             if confirmed and assessment.event_identity_source == "structured_cross_source":
                 counters["cross_source_duplicates_confirmed"] += 1
             assessments.append((candidate_id, assessment))

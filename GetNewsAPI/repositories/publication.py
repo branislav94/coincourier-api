@@ -36,6 +36,9 @@ class PublicationRepository:
         timeout_minutes: int,
         fresh_start_after: str | None,
         exclude_rich_article_ids: Collection[int] = (),
+        capacity_guard: bool = False,
+        existing_posts_only: bool = False,
+        reserved_posts_allowed: bool = False,
     ) -> PublicationClaim | None:
         """Claim the next eligible row, retaining caller exclusions across a deadlock retry."""
         excluded_ids = tuple(sorted(set(exclude_rich_article_ids)))
@@ -45,6 +48,9 @@ class PublicationRepository:
                     timeout_minutes=timeout_minutes,
                     fresh_start_after=fresh_start_after,
                     exclude_rich_article_ids=excluded_ids,
+                    capacity_guard=capacity_guard,
+                    existing_posts_only=existing_posts_only,
+                    reserved_posts_allowed=reserved_posts_allowed,
                 )
             except mysql.connector.Error as error:
                 if not is_claim_deadlock(error):
@@ -59,10 +65,25 @@ class PublicationRepository:
         timeout_minutes: int,
         fresh_start_after: str | None,
         exclude_rich_article_ids: Collection[int] = (),
+        capacity_guard: bool = False,
+        existing_posts_only: bool = False,
+        reserved_posts_allowed: bool = False,
     ) -> PublicationClaim | None:
         token = new_claim_token()
         fresh_clause = ""
         exclude_clause = ""
+        source_columns = ', c.publish_date AS source_publish_date, c.selected_at' if capacity_guard else ''
+        identity_clause = ' AND r.wp_post_id IS NOT NULL' if existing_posts_only else ''
+        if existing_posts_only and reserved_posts_allowed:
+            identity_clause = ''' AND (r.wp_post_id IS NOT NULL OR EXISTS (
+                SELECT 1 FROM publication_capacity_reservations pcr
+                WHERE pcr.rich_article_id = r.id AND pcr.utc_date = UTC_DATE()
+                  AND pcr.create_started_at IS NULL))'''
+        ordering = (
+            '(r.wp_post_id IS NOT NULL) DESC, COALESCE(c.is_breaking, 0) DESC, '
+            'c.scheduled_for ASC, r.id ASC'
+            if capacity_guard else 'c.scheduled_for ASC, r.id ASC'
+        )
         params: list[Any] = [timeout_minutes]
         if fresh_start_after:
             fresh_clause = " AND c.insertDate >= %s"
@@ -80,7 +101,7 @@ class PublicationRepository:
             cursor.execute(
                 f"""
                 SELECT r.*, c.id AS durable_raw_article_id,
-                       c.scheduled_for, c.is_breaking
+                       c.scheduled_for, c.is_breaking {source_columns}
                 FROM rich_crpytonews r
                 JOIN cryptonewsapi c ON c.news_url = r.news_url
                 WHERE r.published = 0
@@ -89,13 +110,14 @@ class PublicationRepository:
                   AND c.scheduled_for <= UTC_TIMESTAMP()
                   AND (
                     r.publish_status IS NULL
-                    OR r.publish_status IN ('fresh', 'pending', 'retryable')
+                    OR r.publish_status IN ('fresh', 'quota_deferred', 'pending', 'retryable')
                     OR (r.publish_status IN ('claimed', 'post_created')
                         AND r.publish_claimed_at < TIMESTAMPADD(MINUTE, -%s, UTC_TIMESTAMP()))
                   )
                   {fresh_clause}
                   {exclude_clause}
-                ORDER BY c.scheduled_for ASC, r.id ASC
+                  {identity_clause}
+                ORDER BY {ordering}
                 LIMIT 1
                 FOR UPDATE
                 """,
@@ -118,7 +140,7 @@ class PublicationRepository:
                   AND published = 0
                   AND (
                     publish_status IS NULL
-                    OR publish_status IN ('fresh', 'pending', 'retryable')
+                    OR publish_status IN ('fresh', 'quota_deferred', 'pending', 'retryable')
                     OR (publish_status IN ('claimed', 'post_created')
                         AND publish_claimed_at < TIMESTAMPADD(MINUTE, -%s, UTC_TIMESTAMP()))
                   )
@@ -308,7 +330,7 @@ class PublicationRepository:
                 cursor.close()
             conn.close()
 
-    def begin_legacy_creation(self, rich_article_id: int) -> bool:
+    def begin_legacy_creation(self, rich_article_id: int, *, allow_quota_deferred: bool = False) -> bool:
         """Commit creation intent only for an explicitly fresh legacy article.
 
         The publisher holds the existing application advisory lock. This durable
@@ -325,15 +347,19 @@ class PublicationRepository:
         cursor = None
         try:
             cursor = conn.cursor()
+            fresh_clause = (
+                "publish_status IN ('fresh', 'quota_deferred')" if allow_quota_deferred
+                else "publish_status = 'fresh'"
+            )
             cursor.execute(
-                """
+                f"""
                 UPDATE rich_crpytonews
                 SET publish_status = 'claimed',
                     publish_attempt_count = 1,
                     publish_claimed_at = UTC_TIMESTAMP()
                 WHERE id = %s
                   AND published = 0
-                  AND publish_status = 'fresh'
+                  AND {fresh_clause}
                   AND publish_attempt_count = 0
                   AND wp_post_id IS NULL
                   AND wp_post_url IS NULL
@@ -573,7 +599,7 @@ class PublicationRepository:
         ownership = (
             "r.publish_status = 'claimed' AND r.publish_claim_token = %s"
             if token is not None else
-            "r.publish_status IN ('fresh', 'pending', 'retryable') "
+            "r.publish_status IN ('fresh', 'quota_deferred', 'pending', 'retryable') "
             "AND r.publish_claim_token IS NULL AND r.publish_claimed_at IS NULL"
         )
         ownership_params = (token,) if token is not None else ()
@@ -742,6 +768,55 @@ class PublicationRepository:
               AND wp_post_created_at IS NULL
             """,
             (rich_article_id, token),
+        )
+
+    def defer_capacity(self, rich_article_id: int, token: str, code: str) -> bool:
+        """Restore first-attempt provenance only after a pre-CREATE quota deferral.
+
+        The capacity ledger independently fences any committed creation intent.
+        Never reset a prior attempt, linked post, or another worker's claim.
+        """
+        return self._owned_update(
+            """
+            UPDATE rich_crpytonews
+            SET publish_status = 'quota_deferred', publish_attempt_count = 0,
+                publish_claim_token = NULL, publish_claimed_at = NULL,
+                publish_last_error = %s
+            WHERE id = %s AND publish_claim_token = %s
+              AND published = 0 AND publish_status = 'claimed'
+              AND publish_attempt_count = 1
+              AND wp_post_id IS NULL AND wp_post_url IS NULL
+              AND wp_post_created_at IS NULL
+            """,
+            (code[:500], rich_article_id, token),
+        )
+
+    def defer_legacy_capacity(self, rich_article_id: int, code: str) -> bool:
+        return self._owned_update(
+            """
+            UPDATE rich_crpytonews
+            SET publish_status = 'quota_deferred', publish_last_error = %s
+            WHERE id = %s AND published = 0
+              AND publish_status IN ('fresh', 'quota_deferred')
+              AND publish_attempt_count = 0 AND publish_claim_token IS NULL
+              AND wp_post_id IS NULL AND wp_post_url IS NULL
+              AND wp_post_created_at IS NULL
+            """,
+            (code[:500], rich_article_id),
+        )
+
+    def defer_legacy_freshness(self, rich_article_id: int) -> bool:
+        return self._owned_update(
+            """
+            UPDATE rich_crpytonews
+            SET publish_status = 'manual_review',
+                publish_last_error = 'stale_backlog_review_required'
+            WHERE id = %s AND published = 0 AND wp_post_id IS NULL
+              AND publish_claim_token IS NULL
+              AND publish_status IN ('fresh', 'quota_deferred')
+              AND publish_attempt_count = 0
+            """,
+            (rich_article_id,),
         )
 
     def _owned_update(self, sql: str, params: tuple[Any, ...]) -> bool:

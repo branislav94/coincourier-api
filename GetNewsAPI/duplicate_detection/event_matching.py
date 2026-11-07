@@ -51,6 +51,9 @@ _ORGANIZATION_ALIASES = {
     "deutsche bank": "org:deutsche-bank",
     "hsbc": "org:hsbc",
 }
+_RELATIONSHIP_ORGANIZATION_ALIASES = {
+    "mercado bitcoin": "org:mercado-bitcoin",
+}
 _SUBJECT_ALIASES = {
     "glamsterdam": "product:glamsterdam",
     "hoodi": "product:hoodi",
@@ -313,6 +316,19 @@ def _structured_values(value: Any) -> Iterable[str]:
 def _matches_alias(text: str, alias: str) -> bool:
     pattern = r"(?:\s+|[-\u2013\u2014])".join(re.escape(part) for part in alias.split())
     return re.search(rf"(?<!\w){pattern}(?!\w)", text) is not None
+
+
+def extract_relationship_organizations(article: Mapping[str, Any]) -> tuple[str, ...]:
+    """Recognize literal source organization context without changing core facts."""
+    source_texts = (
+        _normalized_text(article.get("title")),
+        normalize_source_content(article.get("text") or article.get("full_text")),
+    )
+    return tuple(sorted({
+        identity
+        for alias, identity in _RELATIONSHIP_ORGANIZATION_ALIASES.items()
+        if any(_matches_alias(text, alias) for text in source_texts)
+    }))
 
 
 def extract_event_facts(article: Mapping[str, Any]) -> EventFacts:

@@ -5,6 +5,7 @@ import unittest
 from unittest.mock import Mock, patch
 
 from duplicate_detection.enforcement import DuplicateDecision, assess_duplicate_enforcement
+from duplicate_detection.event_matching import extract_event_facts
 from duplicate_detection.identities import valid_event_id
 from duplicate_detection.policy import AssessmentType, assess_relationship
 from repositories.duplicate_assessments import DuplicateAssessmentRepository
@@ -106,6 +107,8 @@ class DuplicateEnforcementTests(unittest.TestCase):
                 self.assertFalse(result.reject)
                 self.assertEqual(result.assessment, None)
                 self.assertEqual(result.counters["material_updates_allowed"], 1)
+                self.assertEqual(result.counters["same_event_classifications"], 0)
+                self.assertEqual(result.counters["same_event_unconfirmed"], 0)
 
     def test_same_url_or_provider_cannot_hide_material_numeric_delta(self):
         for identity in ({"news_url": "https://news.example/shared"}, {"news_id": "same-upstream-article"}):
@@ -138,6 +141,8 @@ class DuplicateEnforcementTests(unittest.TestCase):
         result, _ = self.decide(source(full_text=body), [primary(full_text=body)])
         self.assertTrue(result.reject)
         self.assertEqual(result.counters["exact_blocks"], 1)
+        self.assertEqual(result.counters["same_event_classifications"], 0)
+        self.assertEqual(result.counters["same_event_unconfirmed"], 0)
 
     def test_new_title_status_overrides_identical_source_body(self):
         body = "Solana Alpenglow activation was discussed by participants. " * 3
@@ -171,12 +176,276 @@ class DuplicateEnforcementTests(unittest.TestCase):
         result, _ = self.decide(source(title="Solana Alpenglow mainnet", full_text="Brief summary."), [primary(title="Solana mainnet Alpenglow", full_text="Brief summary.")])
         self.assertTrue(result.reject)
 
+    def test_relationship_context_refines_incident_without_enforcement_changes(self):
+        later = source(event_id=None, source_name="Coindesk",
+                       title="Mercado Bitcoin hack continued hours after exchange said attack was contained, report finds",
+                       full_text="Attackers drained $391000 through 2 wallets.")
+        earlier = primary(event_id=None, source_name="Cointelegraph",
+                          title="Mercado Bitcoin says phased reopening to begin Monday, will cover losses",
+                          full_text="Mercado Bitcoin halted withdrawals on Monday.")
+        self.assertEqual(extract_event_facts(later).entities, ("asset:BTC", "source:coindesk"))
+        self.assertEqual(extract_event_facts(earlier).entities,
+                         ("actor:mercado bitcoin", "asset:BTC", "source:cointelegraph"))
+        cases = (
+            ("forward", later, earlier, ("new_numeric_value", "new_action_or_status")),
+            ("reverse", earlier, later, ("new_date", "new_named_participant", "new_action_or_status")),
+        )
+        for direction, current, prior_source, expected_new_facts in cases:
+            prior = {**prior_source, "canonical_rich_id": 100 + prior_source["id"],
+                     "canonical_wp_id": 900 + prior_source["id"], "canonical_published": 1,
+                     "canonical_publish_status": "published"}
+            facts = (extract_event_facts(current), extract_event_facts(prior))
+            for stage in ("raw", "pre_publish"):
+                with self.subTest(direction=direction, stage=stage):
+                    baseline_repo = MemoryRepository(current, [prior])
+                    with patch("duplicate_detection.policy.extract_relationship_organizations", return_value=()):
+                        baseline = assess_duplicate_enforcement(current, stage=stage, mode="enforce", repository=baseline_repo)
+                    repo = MemoryRepository(current, [prior])
+                    result = assess_duplicate_enforcement(current, stage=stage, mode="enforce", repository=repo)
+                    baseline_assessment = baseline_repo.saved[0][1][0][1]
+                    assessment = repo.saved[0][1][0][1]
+                    self.assertEqual(baseline_assessment.assessment_type, AssessmentType.BROAD_TOPIC_OVERLAP)
+                    self.assertEqual(assessment.assessment_type, AssessmentType.RELATED_EVENT)
+                    self.assertIn("org:mercado-bitcoin", assessment.shared_entities)
+                    self.assertNotIn("org:mercado-bitcoin", baseline_assessment.shared_entities)
+                    self.assertEqual(assessment.reason_codes,
+                                     ("shared_relationship_organization", "different_action_or_status"))
+                    permitted = {"assessment_type", "shared_entities", "reason_codes"}
+                    self.assertEqual({key: value for key, value in vars(assessment).items() if key not in permitted},
+                                     {key: value for key, value in vars(baseline_assessment).items() if key not in permitted})
+                    self.assertEqual(assessment.new_fact_codes, expected_new_facts)
+                    self.assertEqual(assessment.event_identity_source, "none")
+                    self.assertEqual(assessment.confirmation_anchors, ())
+                    self.assertEqual(assessment.contradiction_flags, ())
+                    self.assertEqual(len(repo.saved), 1)
+                    self.assertEqual(len(repo.saved[0][1]), 1)
+                    evidence = result.audit["candidate_audits"][prior["id"]]
+                    self.assertEqual(evidence["classification"], "related_event")
+                    self.assertFalse(evidence["confirmed_duplicate"])
+                    self.assertEqual((extract_event_facts(current), extract_event_facts(prior)), facts)
+                    for decision in (baseline, result):
+                        self.assertTrue(decision.available)
+                        self.assertFalse(decision.reject)
+                        self.assertEqual(decision.audit["decision"], "continue")
+                        self.assertEqual(decision.counters["same_event_blocks"], 0)
+                        self.assertEqual(decision.counters["exact_blocks"], 0)
+                    self.assertEqual((result.canonical_raw_id, result.canonical_rich_id, result.canonical_wp_id),
+                                     (baseline.canonical_raw_id, baseline.canonical_rich_id, baseline.canonical_wp_id))
+                    allowed = {"broad_topic_overlaps_allowed", "related_events_allowed"}
+                    self.assertEqual({key: value for key, value in result.counters.items() if key not in allowed},
+                                     {key: value for key, value in baseline.counters.items() if key not in allowed})
+                    self.assertEqual(baseline.counters["broad_topic_overlaps_allowed"], 1)
+                    self.assertEqual(result.counters["broad_topic_overlaps_allowed"], 0)
+                    self.assertEqual(result.counters["related_events_allowed"], 1)
+
+    def test_relationship_context_preserves_actor_and_acquisition_counterexamples(self):
+        cases = (
+            ("actor_novelty", "Mercado Bitcoin says Bitcoin rises", "Mercado Bitcoin price rises",
+             AssessmentType.MATERIAL_UPDATE, ("new_named_participant",), False),
+            ("acquisition_roles", "Coinbase acquires Mercado Bitcoin", "Coinbase acquires Mercado Bitcoin",
+             AssessmentType.SAME_EVENT_DUPLICATE, (), True),
+        )
+        for case, current_title, prior_title, expected_type, expected_new_facts, confirmed in cases:
+            current = source(title=current_title, full_text="Brief summary.")
+            prior = primary(title=prior_title, full_text="Short context.")
+            facts = (extract_event_facts(current), extract_event_facts(prior))
+            if case == "actor_novelty":
+                self.assertIn("actor:mercado bitcoin", facts[0].entities)
+                self.assertNotIn("actor:mercado bitcoin", facts[1].entities)
+            else:
+                self.assertEqual(facts[0].entities, ("asset:BTC", "org:coinbase", "source:independent wire"))
+                self.assertEqual(facts[1].entities, facts[0].entities)
+            self.assertTrue(all("org:mercado-bitcoin" not in item.entities for item in facts))
+            self.assertEqual((facts[0].uncertainty, facts[1].uncertainty), ((), ()))
+            for stage in ("raw", "pre_publish"):
+                with self.subTest(case=case, stage=stage):
+                    baseline_repo = MemoryRepository(current, [prior])
+                    with patch("duplicate_detection.policy.extract_relationship_organizations", return_value=()):
+                        baseline = assess_duplicate_enforcement(current, stage=stage, mode="enforce", repository=baseline_repo)
+                    repo = MemoryRepository(current, [prior])
+                    result = assess_duplicate_enforcement(current, stage=stage, mode="enforce", repository=repo)
+                    assessment = repo.saved[0][1][0][1]
+                    self.assertEqual(assessment, baseline_repo.saved[0][1][0][1])
+                    self.assertEqual(assessment.assessment_type, expected_type)
+                    self.assertEqual(assessment.new_fact_codes, expected_new_facts)
+                    self.assertEqual(assessment.evidence_uncertainty, ())
+                    self.assertEqual(result.audit["candidate_audits"][1]["confirmed_duplicate"], confirmed)
+                    self.assertEqual(result, baseline)
+                    self.assertTrue(result.available)
+                    self.assertEqual(result.reject, confirmed)
+                    self.assertEqual(result.audit["decision"], "reject_duplicate" if confirmed else "continue")
+                    self.assertEqual((extract_event_facts(current), extract_event_facts(prior)), facts)
+
+    def test_relationship_context_preserves_current_only_organization_positive(self):
+        current = source(title="Mercado Bitcoin price rises", full_text="Brief summary.")
+        prior = primary(title="Bitcoin price rises", full_text="Short context.")
+        facts = (extract_event_facts(current), extract_event_facts(prior))
+        self.assertEqual(facts[0], facts[1])
+        self.assertEqual(facts[0].entities, ("asset:BTC", "source:independent wire"))
+        self.assertEqual(facts[0].actions, ("price_rise",))
+        for stage in ("raw", "pre_publish"):
+            with self.subTest(stage=stage):
+                baseline_repo = MemoryRepository(current, [prior])
+                with patch("duplicate_detection.policy.extract_relationship_organizations", return_value=()):
+                    baseline = assess_duplicate_enforcement(current, stage=stage, mode="enforce", repository=baseline_repo)
+                repo = MemoryRepository(current, [prior])
+                result = assess_duplicate_enforcement(current, stage=stage, mode="enforce", repository=repo)
+                assessment = repo.saved[0][1][0][1]
+                self.assertEqual(assessment, baseline_repo.saved[0][1][0][1])
+                self.assertEqual(assessment.assessment_type, AssessmentType.SAME_EVENT_DUPLICATE)
+                self.assertEqual(assessment.new_fact_codes, ())
+                self.assertEqual(assessment.evidence_uncertainty, ())
+                self.assertTrue(result.audit["candidate_audits"][1]["confirmed_duplicate"])
+                self.assertEqual(result, baseline)
+                self.assertTrue(result.available)
+                self.assertTrue(result.reject)
+                self.assertEqual(result.audit["decision"], "reject_duplicate")
+                self.assertEqual(result.counters["same_event_blocks"], 1)
+                self.assertEqual((extract_event_facts(current), extract_event_facts(prior)), facts)
+
+    def test_prior_only_action_evidence_continues_at_both_enforcement_stages(self):
+        cases = (
+            ("sparse_bitcoin", "Bitcoin market discussion", "Brief source summary.", "Bitcoin rises."),
+            ("product_anchor", "Solana Alpenglow mainnet", "Brief summary.", "Solana Alpenglow rises."),
+            ("nonempty_subset", "Bitcoin market discussion", "Bitcoin rises.", "Bitcoin rises. A report followed."),
+        )
+        for case, title, current_body, prior_body in cases:
+            current = source(title=title, full_text=current_body)
+            prior = primary(title=title, full_text=prior_body)
+            self.assertGreater(set(extract_event_facts(prior).actions), set(extract_event_facts(current).actions))
+            for stage in ("raw", "pre_publish"):
+                with self.subTest(case=case, stage=stage):
+                    repo = MemoryRepository(current, [prior])
+                    result = assess_duplicate_enforcement(current, stage=stage, mode="enforce", repository=repo)
+                    assessment = repo.saved[0][1][0][1]
+                    evidence = result.audit["candidate_audits"][1]
+                    self.assertEqual(assessment.assessment_type, AssessmentType.SAME_EVENT_DUPLICATE)
+                    self.assertEqual(assessment.new_fact_codes, ())
+                    self.assertIn("prior_only_action_evidence", assessment.evidence_uncertainty)
+                    self.assertIn("prior_only_action_evidence", evidence["evidence_uncertainty"])
+                    self.assertFalse(evidence["confirmed_duplicate"])
+                    self.assertTrue(result.available)
+                    self.assertFalse(result.reject)
+                    self.assertEqual(result.audit["decision"], "continue")
+                    self.assertEqual(result.counters["same_event_classifications"], 1)
+                    self.assertEqual(result.counters["same_event_unconfirmed"], 1)
+                    self.assertEqual(result.counters["same_event_blocks"], 0)
+                    self.assertEqual(result.counters["exact_blocks"], 0)
+                    self.assertEqual(result.counters["shadow_would_reject_duplicates"], 0)
+
+    def test_prior_only_cross_source_action_evidence_cannot_authorize_rejection(self):
+        from tests.test_duplicate_cross_source import fomc_source_pair
+
+        for event_ids in (("synthetic-prior-event", "synthetic-current-event"), (None, None)):
+            prior, current = fomc_source_pair(event_ids=event_ids)
+            prior["full_text"] += " A report followed."
+            canonical = {**prior, "processed": 1, "canonical_rich_id": 301,
+                         "canonical_wp_id": 901, "canonical_published": 1,
+                         "canonical_publish_status": "published"}
+            self.assertGreater(set(extract_event_facts(prior).actions), set(extract_event_facts(current).actions))
+            for stage in ("raw", "pre_publish"):
+                with self.subTest(event_ids=event_ids, stage=stage):
+                    repo = MemoryRepository(current, [canonical])
+                    result = assess_duplicate_enforcement(current, stage=stage, mode="enforce", repository=repo)
+                    assessment = repo.saved[0][1][0][1]
+                    evidence = result.audit["candidate_audits"][prior["id"]]
+                    self.assertFalse(assessment.same_event_id)
+                    self.assertEqual(assessment.assessment_type, AssessmentType.SAME_EVENT_DUPLICATE)
+                    self.assertEqual(assessment.event_identity_source, "structured_cross_source")
+                    self.assertGreaterEqual(len(assessment.confirmation_anchors), 2)
+                    self.assertEqual(assessment.new_fact_codes, ())
+                    self.assertIn("prior_only_action_evidence", assessment.evidence_uncertainty)
+                    self.assertFalse(evidence["confirmed_duplicate"])
+                    self.assertTrue(result.available)
+                    self.assertFalse(result.reject)
+                    self.assertEqual(result.audit["decision"], "continue")
+                    self.assertEqual(result.counters["same_event_blocks"], 0)
+                    self.assertEqual(result.counters["exact_blocks"], 0)
+
+    def test_prior_only_action_title_cannot_authorize_same_content_rejection(self):
+        body = "Bitcoin market background contains general context for readers and technical details about the network. " * 2
+        current = source(event_id=None, title="Solana Alpenglow market", full_text=body)
+        prior = primary(event_id=None, title="Solana Alpenglow market rises", full_text=body)
+        self.assertEqual(extract_event_facts(current).actions, ())
+        self.assertEqual(extract_event_facts(prior).actions, ("price_rise",))
+        for stage in ("raw", "pre_publish"):
+            with self.subTest(stage=stage):
+                repo = MemoryRepository(current, [prior])
+                result = assess_duplicate_enforcement(current, stage=stage, mode="enforce", repository=repo)
+                assessment = repo.saved[0][1][0][1]
+                evidence = result.audit["candidate_audits"][1]
+                self.assertFalse(assessment.same_event_id)
+                self.assertTrue(assessment.same_content_hash)
+                self.assertEqual(assessment.assessment_type, AssessmentType.EXACT_DUPLICATE)
+                self.assertEqual(assessment.new_fact_codes, ())
+                self.assertIn("prior_only_action_evidence", assessment.evidence_uncertainty)
+                self.assertFalse(evidence["confirmed_duplicate"])
+                self.assertTrue(result.available)
+                self.assertFalse(result.reject)
+                self.assertEqual(result.audit["decision"], "continue")
+                self.assertEqual(result.counters["exact_blocks"], 0)
+                self.assertEqual(result.counters["same_event_blocks"], 0)
+
+    def test_equal_action_positive_controls_keep_existing_confirmation(self):
+        for body in ("Brief summary.", "Solana Alpenglow rises."):
+            current = source(title="Solana Alpenglow mainnet", full_text=body)
+            prior = primary(title="Solana mainnet Alpenglow", full_text=body)
+            self.assertEqual(extract_event_facts(current).actions, extract_event_facts(prior).actions)
+            for stage in ("raw", "pre_publish"):
+                with self.subTest(body=body, stage=stage):
+                    repo = MemoryRepository(current, [prior])
+                    result = assess_duplicate_enforcement(current, stage=stage, mode="enforce", repository=repo)
+                    assessment = repo.saved[0][1][0][1]
+                    self.assertEqual(assessment.assessment_type, AssessmentType.SAME_EVENT_DUPLICATE)
+                    self.assertEqual(assessment.new_fact_codes, ())
+                    self.assertNotIn("prior_only_action_evidence", assessment.evidence_uncertainty)
+                    self.assertTrue(result.audit["candidate_audits"][1]["confirmed_duplicate"])
+                    self.assertTrue(result.available)
+                    self.assertTrue(result.reject)
+                    self.assertEqual(result.counters["same_event_blocks"], 1)
+
+    def test_current_side_action_additions_remain_material_and_unconfirmed(self):
+        cases = (
+            ("current_only", "Bitcoin rises.", "Brief source summary."),
+            ("changed", "Bitcoin rises.", "Bitcoin falls."),
+            ("both_sides", "Bitcoin rises. A report followed.", "Bitcoin falls."),
+        )
+        for case, current_body, prior_body in cases:
+            current = source(title="Bitcoin market discussion", full_text=current_body)
+            prior = primary(title="Bitcoin market discussion", full_text=prior_body)
+            self.assertTrue(set(extract_event_facts(current).actions) - set(extract_event_facts(prior).actions))
+            for stage in ("raw", "pre_publish"):
+                with self.subTest(case=case, stage=stage):
+                    repo = MemoryRepository(current, [prior])
+                    result = assess_duplicate_enforcement(current, stage=stage, mode="enforce", repository=repo)
+                    assessment = repo.saved[0][1][0][1]
+                    self.assertEqual(assessment.assessment_type, AssessmentType.MATERIAL_UPDATE)
+                    self.assertIn("new_action_or_status", assessment.new_fact_codes)
+                    self.assertNotIn("prior_only_action_evidence", assessment.evidence_uncertainty)
+                    self.assertFalse(result.audit["candidate_audits"][1]["confirmed_duplicate"])
+                    self.assertTrue(result.available)
+                    self.assertFalse(result.reject)
+                    self.assertEqual(result.counters["material_updates_allowed"], 1)
+                    self.assertEqual(result.counters["same_event_blocks"], 0)
+
     def test_related_regulatory_action_and_different_etf_dates_allowed(self):
         for now, before in (("SEC sues Coinbase", "SEC approves Coinbase"), ("Bitcoin ETF flows October 28 2026", "Bitcoin ETF flows October 27 2026")):
             with self.subTest(now=now):
                 result, _ = self.decide(source(title=now, event_id=None), [primary(title=before, event_id=None)])
                 self.assertFalse(result.reject)
                 self.assertEqual(result.counters["related_events_allowed"], 1)
+                self.assertEqual(result.counters["same_event_classifications"], 0)
+                self.assertEqual(result.counters["same_event_unconfirmed"], 0)
+
+    def test_broad_topic_overlap_does_not_count_as_same_event(self):
+        current = source(event_id=None, title="Bitcoin market discussion", full_text="Brief source summary.")
+        prior = primary(event_id=None, title="Solana market discussion", full_text="Brief source summary.")
+        result, repo = self.decide(current, [prior])
+        self.assertEqual(repo.saved[0][1][0][1].assessment_type, AssessmentType.BROAD_TOPIC_OVERLAP)
+        self.assertFalse(result.reject)
+        self.assertEqual(result.counters["broad_topic_overlaps_allowed"], 1)
+        self.assertEqual(result.counters["same_event_classifications"], 0)
+        self.assertEqual(result.counters["same_event_unconfirmed"], 0)
 
     def test_uncertain_and_negated_outcomes_fail_open(self):
         for title in ("Solana may activate Alpenglow", "Solana does not activate Alpenglow", "Solana Alpenglow reportedly activates", "Solana Alpenglow isn't online", "Solana Alpenglow isn\u2019t online", "Solana Alpenglow has yet to go online", "Solana Alpenglow activates tomorrow"):
@@ -236,6 +505,100 @@ class DuplicateEnforcementTests(unittest.TestCase):
         self.assertEqual(result.audit["decision"], "would_reject_duplicate")
         self.assertEqual(result.counters["shadow_would_reject_duplicates"], 1)
         self.assertEqual(result.counters["same_event_blocks"], 0)
+        self.assertEqual(result.counters["same_event_classifications"], 1)
+        self.assertEqual(result.counters["same_event_unconfirmed"], 0)
+
+    def test_shadow_sparse_same_event_observation_is_not_a_hypothetical_block(self):
+        current = source(title="Bitcoin market discussion", full_text="Brief source summary.")
+        prior = primary(title="Bitcoin market discussion", full_text="Brief source summary.")
+        repo = MemoryRepository(current, [prior])
+        result = assess_duplicate_enforcement(current, stage="raw", mode="shadow", repository=repo)
+        evidence = result.audit["candidate_audits"][1]
+        self.assertEqual(evidence["classification"], AssessmentType.SAME_EVENT_DUPLICATE.value)
+        self.assertFalse(evidence["confirmed_duplicate"])
+        self.assertEqual(evidence["decision_reason"], "insufficient_structured_evidence")
+        self.assertTrue(result.available)
+        self.assertFalse(result.reject)
+        self.assertEqual(result.audit["decision"], "would_continue")
+        self.assertEqual(result.counters["same_event_classifications"], 1)
+        self.assertEqual(result.counters["same_event_unconfirmed"], 1)
+        self.assertEqual(result.counters["shadow_would_reject_duplicates"], 0)
+        self.assertEqual(result.counters["same_event_blocks"], 0)
+        self.assertEqual(result.counters["exact_blocks"], 0)
+
+    def test_sparse_noncredible_peers_do_not_enter_same_event_counts(self):
+        current = source(title="Bitcoin market discussion", full_text="Brief source summary.")
+        credible = primary(title="Bitcoin market discussion", full_text="Brief source summary.")
+        control = assess_duplicate_enforcement(
+            current, stage="raw", mode="shadow", repository=MemoryRepository(current, [credible]),
+        )
+        evidence = control.audit["candidate_audits"][1]
+        self.assertEqual(evidence["classification"], AssessmentType.SAME_EVENT_DUPLICATE.value)
+        self.assertFalse(evidence["confirmed_duplicate"])
+        self.assertEqual(control.counters["same_event_classifications"], 1)
+        self.assertEqual(control.counters["same_event_unconfirmed"], 1)
+
+        cases = (
+            ("terminal_duplicate_raw", "raw", {"processing_status": "duplicate"}),
+            ("missing_rich_raw", "raw", {"canonical_rich_id": None}),
+            ("unattempted_pending_pre_publish", "pre_publish", {
+                "canonical_wp_id": None, "canonical_wp_url": None, "canonical_published": 0,
+                "canonical_publish_status": "pending", "canonical_publish_attempt_count": 0,
+            }),
+        )
+        for case, stage, exclusions in cases:
+            with self.subTest(case=case, stage=stage):
+                prior = {**credible, **exclusions}
+                self.assertEqual(assess_relationship(current, prior).assessment_type, AssessmentType.SAME_EVENT_DUPLICATE)
+                repo = MemoryRepository(current, [prior])
+                result = assess_duplicate_enforcement(current, stage=stage, mode="shadow", repository=repo)
+                self.assertTrue(result.available)
+                self.assertFalse(result.reject)
+                self.assertEqual(result.audit["decision"], "would_continue")
+                self.assertEqual(len(repo.saved), 1)
+                self.assertEqual(repo.saved[0][1], [])
+                self.assertEqual(result.audit["candidate_audits"], {})
+                self.assertEqual(result.counters["same_event_classifications"], 0)
+                self.assertEqual(result.counters["same_event_unconfirmed"], 0)
+                self.assertEqual(result.counters["shadow_would_reject_duplicates"], 0)
+                self.assertEqual(result.counters["same_event_blocks"], 0)
+                self.assertEqual(result.counters["exact_blocks"], 0)
+
+    def test_sparse_repeated_rich_join_counts_one_unconfirmed_pair(self):
+        current = source(title="Bitcoin market discussion", full_text="Brief source summary.")
+        prior = primary(title="Bitcoin market discussion", full_text="Brief source summary.")
+        repo = MemoryRepository(current, [prior, {**prior, "canonical_rich_id": 501}])
+        result = assess_duplicate_enforcement(current, stage="raw", mode="shadow", repository=repo)
+        self.assertTrue(result.available)
+        self.assertFalse(result.reject)
+        self.assertEqual(result.audit["decision"], "would_continue")
+        self.assertEqual(len(repo.saved), 1)
+        self.assertEqual([candidate_id for candidate_id, _ in repo.saved[0][1]], [1])
+        evidence = result.audit["candidate_audits"][1]
+        self.assertEqual(evidence["classification"], AssessmentType.SAME_EVENT_DUPLICATE.value)
+        self.assertFalse(evidence["confirmed_duplicate"])
+        self.assertEqual(result.counters["same_event_classifications"], 1)
+        self.assertEqual(result.counters["same_event_unconfirmed"], 1)
+        self.assertEqual(result.counters["shadow_would_reject_duplicates"], 0)
+        self.assertEqual(result.counters["same_event_blocks"], 0)
+        self.assertEqual(result.counters["exact_blocks"], 0)
+
+    def test_shadow_counts_distinct_credible_pairs_with_one_article_flag(self):
+        first = primary(1)
+        rows = [first, {**first, "canonical_rich_id": 501}, primary(2),
+                primary(3, processing_status="duplicate"),
+                primary(4, canonical_publish_status="duplicate"),
+                source(5, chosen_for_publish=1, processed=0), primary(0), primary(10)]
+        repo = MemoryRepository(source(), rows)
+        result = assess_duplicate_enforcement(source(), stage="raw", mode="shadow", repository=repo)
+        self.assertEqual([candidate_id for candidate_id, _ in repo.saved[0][1]], [1, 2])
+        self.assertEqual(result.canonical_raw_id, 1)
+        self.assertFalse(result.reject)
+        self.assertEqual(result.counters["same_event_classifications"], 2)
+        self.assertEqual(result.counters["same_event_unconfirmed"], 0)
+        self.assertEqual(result.counters["shadow_would_reject_duplicates"], 1)
+        self.assertEqual(result.counters["same_event_blocks"], 0)
+        self.assertEqual(result.counters["exact_blocks"], 0)
 
     def test_fomc_shadow_and_enforce_share_classification_and_confirmation_at_both_stages(self):
         from tests.test_duplicate_cross_source import fomc_source_pair
@@ -323,13 +686,33 @@ class DuplicateEnforcementTests(unittest.TestCase):
         self.assertFalse(result.reject)
         self.assertFalse(result.available)
         self.assertEqual(result.counters["shadow_would_reject_duplicates"], 0)
+        self.assertEqual(result.counters["same_event_classifications"], 1)
+        self.assertEqual(result.counters["same_event_unconfirmed"], 0)
+        self.assertEqual(result.counters["same_event_blocks"], 0)
         self.assertIn("decision=would_continue", " ".join(logs.output))
         self.assertNotIn("secret", " ".join(logs.output))
+
+    def test_unconfirmed_observation_counts_do_not_claim_successful_audit(self):
+        current = source(title="Bitcoin market discussion", full_text="Brief source summary.")
+        prior = primary(title="Bitcoin market discussion", full_text="Brief source summary.")
+        repo = MemoryRepository(current, [prior])
+        repo.fail_save = True
+        with self.assertLogs(level="WARNING"):
+            result = assess_duplicate_enforcement(current, stage="raw", mode="shadow", repository=repo)
+        self.assertFalse(result.available)
+        self.assertFalse(result.reject)
+        self.assertEqual(repo.saved, [])
+        self.assertEqual(result.counters["same_event_classifications"], 1)
+        self.assertEqual(result.counters["same_event_unconfirmed"], 1)
+        self.assertEqual(result.counters["shadow_would_reject_duplicates"], 0)
+        self.assertEqual(result.counters["same_event_blocks"], 0)
 
     def test_off_performs_no_reads_or_writes(self):
         repo = Mock()
         result = assess_duplicate_enforcement(source(), stage="raw", mode="off", repository=repo)
         self.assertEqual(result, DuplicateDecision(mode="off", article_id=10, counters=result.counters))
+        self.assertEqual(result.counters["same_event_classifications"], 0)
+        self.assertEqual(result.counters["same_event_unconfirmed"], 0)
         self.assertEqual(repo.mock_calls, [])
 
     def test_read_and_audit_failure_are_unavailable_not_rejection_and_do_not_log_secrets(self):
@@ -341,6 +724,8 @@ class DuplicateEnforcementTests(unittest.TestCase):
             self.assertFalse(result.reject)
             self.assertFalse(result.available)
             self.assertEqual(result.error, "RuntimeError")
+            self.assertEqual(result.counters["same_event_classifications"], int(failure == "fail_save"))
+            self.assertEqual(result.counters["same_event_unconfirmed"], 0)
             self.assertNotIn("secret", " ".join(logs.output))
 
     def test_selected_unprocessed_and_terminal_duplicates_never_anchor(self):
@@ -348,6 +733,8 @@ class DuplicateEnforcementTests(unittest.TestCase):
         result, repo = self.decide(candidates=rows)
         self.assertFalse(result.reject)
         self.assertEqual(repo.saved[0][1], [])
+        self.assertEqual(result.counters["same_event_classifications"], 0)
+        self.assertEqual(result.counters["same_event_unconfirmed"], 0)
 
     def test_unpublished_rich_primary_only_blocks_raw_not_pre_publish(self):
         row = primary(canonical_wp_id=None, canonical_published=0, canonical_publish_status="pending")

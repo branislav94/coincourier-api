@@ -228,11 +228,18 @@ them: the image has no migration entrypoint, startup hook, or automatic apply
 behavior. The repository-owned manifests pin every SQL resource by ID, target,
 kind, dependency, order, and SHA-256 checksum.
 
-The application forward chain is `001` preflight, `002`, `003` preflight, `004`,
-`006` preflight, and `007`. Migration `005` is a claimed-state recovery utility;
+The application execution chain is `001` preflight, `002`, `003` preflight, `004`,
+`006` preflight, `007`, and `008` (UTC daily publication capacity schema).
+`app-008` depends on `app-004`. Migration `005` is a claimed-state recovery utility;
 it is never part of normal apply. Both `maintenance/sql/fresh_start_*` utilities
 and the test-only baseline are also excluded. The vector forward chain is exactly
 `001`, `002`, `003` and is guarded for the separate MariaDB 11.8 vector database.
+
+`migration_apply app` includes every pending forward migration in its plan,
+including `app-008`; approve the entire planned set and stop if any pending
+migration is outside the approved scope. Keep `PUBLISH_DAILY_HARD_CAP_ENABLED=false`
+until the separate [daily-cap activation procedure](GETNEWSAPI_DAILY_PUBLICATION_CAP.md)
+establishes the verified UTC baseline and coordinated publisher activation.
 
 ## Migration Commands
 

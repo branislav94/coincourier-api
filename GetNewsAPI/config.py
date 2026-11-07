@@ -14,6 +14,7 @@ All values are sourced from environment variables to avoid hardcoding secrets.
 import os
 from datetime import datetime, timezone
 from dotenv import load_dotenv
+from runtime.editorial_modes import duplicate_mode, public_copy_mode
 
 load_dotenv()  # Load environment variables from .env file
 
@@ -265,12 +266,27 @@ PROCESS_CLAIM_TIMEOUT_MINUTES = int(os.getenv("PROCESS_CLAIM_TIMEOUT_MINUTES", "
 PUBLISH_DURABLE_STATE_ENABLED = _env_bool("PUBLISH_DURABLE_STATE_ENABLED", False)
 PUBLISH_CLAIM_TIMEOUT_MINUTES = int(os.getenv("PUBLISH_CLAIM_TIMEOUT_MINUTES", "30"))
 
+# Keep disabled until the additive daily-capacity migration and controlled
+# activation procedure have been completed for every publisher instance.
+if "PUBLISH_DAILY_HARD_CAP_ENABLED" in os.environ and not os.environ["PUBLISH_DAILY_HARD_CAP_ENABLED"].strip():
+    raise ValueError("PUBLISH_DAILY_HARD_CAP_ENABLED must be a boolean value such as true or false")
+PUBLISH_DAILY_HARD_CAP_ENABLED = _env_bool("PUBLISH_DAILY_HARD_CAP_ENABLED", False)
+try:
+    PUBLISH_DAILY_HARD_CAP = int(os.getenv("PUBLISH_DAILY_HARD_CAP", "30"))
+except ValueError:
+    raise ValueError("PUBLISH_DAILY_HARD_CAP must be a positive integer") from None
+if not 1 <= PUBLISH_DAILY_HARD_CAP <= 4294967295:
+    raise ValueError("PUBLISH_DAILY_HARD_CAP must be a positive integer no greater than 4294967295")
+
 # Apply the existing Phase 2/5 schema before enabling assessment persistence.
 # Shadow remains the rollout/rollback default; enforcement is explicit.
 DUPLICATE_SHADOW_ENABLED = _env_bool("DUPLICATE_SHADOW_ENABLED", False)
-DUPLICATE_ENFORCEMENT_MODE = os.getenv("DUPLICATE_ENFORCEMENT_MODE", "shadow").strip().lower()
-if DUPLICATE_ENFORCEMENT_MODE not in {"off", "shadow", "enforce"}:
-    raise ValueError("DUPLICATE_ENFORCEMENT_MODE must be off, shadow or enforce")
+_duplicate_mode = duplicate_mode(os.environ)
+DUPLICATE_ENFORCEMENT_MODE = _duplicate_mode.mode
+DUPLICATE_ENFORCEMENT_MODE_SOURCE = _duplicate_mode.source
+_public_copy_mode = public_copy_mode(os.environ)
+PUBLIC_COPY_GATE_MODE = _public_copy_mode.mode
+PUBLIC_COPY_GATE_MODE_SOURCE = _public_copy_mode.source
 DUPLICATE_LOOKBACK_HOURS = int(os.getenv("DUPLICATE_LOOKBACK_HOURS", "72"))
 DUPLICATE_POLICY_VERSION = os.getenv("DUPLICATE_POLICY_VERSION", "v1").strip() or "v1"
 

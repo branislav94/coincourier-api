@@ -12,9 +12,13 @@ from config import (
     API_DOCS_ENABLED,
     APP_ENV,
     DB_CONFIG,
+    DUPLICATE_ENFORCEMENT_MODE,
+    DUPLICATE_ENFORCEMENT_MODE_SOURCE,
     ENABLE_APSCHEDULER,
     PIPELINE_FRESH_START_AFTER_UTC_SQL,
     PUBLISH_API_TOKEN,
+    PUBLIC_COPY_GATE_MODE,
+    PUBLIC_COPY_GATE_MODE_SOURCE,
     READINESS_DB_TIMEOUT_SECONDS,
     VECTOR_DB_CONFIG,
     VECTOR_ENABLED,
@@ -88,6 +92,13 @@ async def lifespan(application: FastAPI):
             raise RuntimeError(
                 "Invalid production configuration:\n" + format_config_issues(issues)
             )
+
+    logger.info(
+        "[EDITORIAL-MODES] context=loaded_config duplicate_enforcement_mode=%s "
+        "duplicate_mode_source=%s public_copy_gate_mode=%s public_copy_mode_source=%s",
+        DUPLICATE_ENFORCEMENT_MODE, DUPLICATE_ENFORCEMENT_MODE_SOURCE,
+        PUBLIC_COPY_GATE_MODE, PUBLIC_COPY_GATE_MODE_SOURCE,
+    )
 
     if PIPELINE_FRESH_START_AFTER_UTC_SQL:
         logger.info(

@@ -540,6 +540,14 @@ The exact application execution sequence is:
 | `app-004` | Durable-state indexes | Forward DDL |
 | `app-006` | Duplicate-table ownership preflight | Read-only preflight for `app-007` |
 | `app-007` | Deterministic duplicate-shadow schema | Forward DDL |
+| `app-008` | UTC daily publication capacity schema | Forward DDL; depends on `app-004` |
+
+`migration_apply app` includes every pending forward migration in its plan,
+including `app-008`. Review and approve the entire planned set before applying;
+stop if any pending migration is outside the approved scope. Keep
+`PUBLISH_DAILY_HARD_CAP_ENABLED=false` until the separate
+[daily-cap activation procedure](GETNEWSAPI_DAILY_PUBLICATION_CAP.md) establishes
+the verified UTC baseline and coordinated publisher activation.
 
 Execute:
 
@@ -684,9 +692,27 @@ Change one stage at a time. Record effective non-secret configuration, exact
 commands, JSON result, relevant logs, data evidence, and acceptance decision.
 Revert or stop at the first unexplained result.
 
+### G1A configuration migration before deployment or restart
+
+Before deploying G1A code or restarting any G1A process, remove unsupported
+`DUPLICATE_ENFORCE_MODE` entirely from the target environment. Leaving it blank
+or alongside `DUPLICATE_ENFORCEMENT_MODE` causes configuration failure; neither
+form is supported. For the DEV observation rollout, explicitly set
+`DUPLICATE_ENFORCEMENT_MODE=shadow` and `PUBLIC_COPY_GATE_MODE=shadow`, following
+the [G1A REMOVE/SET/KEEP checklist](audits/GETNEWSAPI_G1A_CONFIGURATION.md).
+That checklist preserves an already accepted semantic-shadow DEV stage and the
+disabled daily cap; it does not bypass new-environment prerequisites below.
+Stage 0 and emergency shared-policy disable controls still use canonical `off`.
+
+Run `config_check web` and `config_check pipeline` (and any other intended job
+profiles) before enabling scheduled or manual execution. Configuration success
+does not approve enforcement or production rollout.
+
 ### Stage 0: Everything Off
 
-Keep every rollout flag false and APScheduler off.
+Keep every rollout flag false and APScheduler off. Set
+`DUPLICATE_ENFORCEMENT_MODE=off` for this new-environment stage to stop shared
+duplicate assessments; the legacy shadow flag alone does not stop them.
 
 ```text
 python GetNewsAPI/tasks.py config_check web
@@ -756,17 +782,45 @@ investigate WordPress side effects before replay.
 
 ### Stage 4: Deterministic Duplicate Shadow
 
-Confirm `app-007` is verified, then set:
+Confirm `app-007` is verified, then use canonical `shadow` mode for nonblocking
+shared assessments. The separate legacy flag enables only the older observer:
 
 ```text
+DUPLICATE_ENFORCEMENT_MODE=shadow
 DUPLICATE_SHADOW_ENABLED=true
 ```
 
+Restart affected processes after changing these settings. Shared assessments
+remain active in `shadow` mode even when `DUPLICATE_SHADOW_ENABLED=false`.
 Run controlled processing and collect evidence for `exact_duplicate`,
 `same_event_duplicate`, `material_update`, `related_event`, and
 `broad_topic_overlap`. The assessment is shadow-only and fail-open. Confirm every
 article continues through its normal processing decision and no article is
 suppressed solely because of duplicate-shadow evidence.
+
+Editorial adjudication is mandatory before any future enforcement approval:
+
+```text
+shadow -> observe -> adjudicate -> separately approve enforce
+```
+
+Collect bounded shadow decisions, then have a human/editorial reviewer
+adjudicate representative would-block and would-continue cases. The review must
+cover same-event cases, material updates, related events and uncertain cases.
+Specifically examine false-positive blocking, legitimate material updates being
+suppressed, related stories being incorrectly collapsed, and known duplicate
+families continuing unexpectedly. Review false-positive risk and material-update
+preservation before requesting a separate operator/release enforcement decision.
+
+Do not change `DUPLICATE_ENFORCEMENT_MODE` from `shadow` to `enforce` until those
+collected decisions have been editorially adjudicated and a separate enforcement
+rollout has been explicitly approved after that review. Only then may `enforce`
+be considered. Successful tests, schema readiness and a period of shadow
+operation do not authorize enforcement. Classifier labels are not editorial
+ground truth. Independent historical RAW duplicate accuracy remains unavailable
+with a zero eligible denominator; RAW34778/34388 remains unlabeled and must not
+be used as accuracy evidence. There is no automatic promotion from shadow to
+enforce, and G1A does not approve production enforcement.
 
 ### Historical Vector Backfill
 
@@ -1046,7 +1100,7 @@ change a runtime flag and redeploy/restart; it never means automatic schema-down
 | `APPLY_SUCCEEDED_VERIFY_FAILED` | Treat as failed mutation; stop | Keep target-dependent flags off | Unrelated verified paths only | Preserve output; inspect partial effects; restore/repair |
 | Durable processing problem | Stop process/pipeline schedules while assessing claims | Set `PROCESS_DURABLE_CLAIMS_ENABLED=false` only to return to legacy behavior | Web and other jobs can continue; processing is not halted by flag alone | State remains; use only reviewed claim recovery; code rollback usually unnecessary |
 | Durable publishing problem | Stop publish/pipeline; inspect WP before replay | Set `PUBLISH_DURABLE_STATE_ENABLED=false` only to return to legacy behavior | Web/non-publish jobs can continue | App/WP state remains; reconcile side effects; code rollback usually unnecessary |
-| Duplicate shadow problem | Disable evidence collection | `DUPLICATE_SHADOW_ENABLED=false` | Yes, normal pipeline continues | Existing evidence remains; investigate |
+| Duplicate shadow/policy problem | Disable the affected observer or shared policy and restart affected processes | `DUPLICATE_ENFORCEMENT_MODE=off` stops shared assessments and suppression; `DUPLICATE_SHADOW_ENABLED=false` stops only the legacy observer | Yes; pause job/manual/API invocations to halt base work | Existing evidence remains; investigate |
 | Vector problem | Stop vector-dependent jobs and semantic rollout | `VECTOR_ENABLED=false`; also stop ingest/backfill/worker schedules | Base web/pipeline can continue; `/ready` stops vector probe | Vector data remains; investigate DB/network/index |
 | Embedding problem | Stop worker and registration/backfill invocations | `EMBEDDING_ENABLED=false` disables worker execution | Base app/vector storage can continue | Existing vectors/jobs remain; ingest/backfill can still register if invoked, so stop those too |
 | Semantic shadow problem | Disable semantic evidence path | `SEMANTIC_SHADOW_ENABLED=false` | Yes, normal pipeline continues | Existing evidence/vectors remain |
@@ -1065,10 +1119,14 @@ or execute an explicitly reviewed repair. Do not improvise a down migration.
 | `ENABLE_APSCHEDULER` | Stops only in-process development scheduling; external schedules are unaffected |
 | `PROCESS_DURABLE_CLAIMS_ENABLED` | Uses legacy processing selection; does not halt processing or erase claim state |
 | `PUBLISH_DURABLE_STATE_ENABLED` | Uses legacy publication path; does not halt publishing or undo WordPress side effects |
-| `DUPLICATE_SHADOW_ENABLED` | Stops new deterministic shadow assessments; normal pipeline continues |
+| `DUPLICATE_SHADOW_ENABLED` | Stops only the optional legacy duplicate observer; shared policy still follows `DUPLICATE_ENFORCEMENT_MODE` |
 | `VECTOR_ENABLED` | Disables vector-dependent runtime paths and vector readiness probe; stored vector data remains |
 | `EMBEDDING_ENABLED` | Worker is disabled and new vector generation stops; stored vectors/jobs remain; explicit ingest/backfill registration still requires only vector enablement |
 | `SEMANTIC_SHADOW_ENABLED` | Stops new semantic assessment evidence; normal pipeline continues |
+
+`DUPLICATE_ENFORCEMENT_MODE=off` stops shared duplicate assessments and suppression;
+`shadow` retains nonblocking assessments without suppression. Restart affected
+processes after changing the mode. The legacy shadow flag does not override it.
 
 To halt base recurring work, pause the external `fetch_once` and/or
 `pipeline_once` schedules. Feature flags are not substitutes for scheduler stop

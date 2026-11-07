@@ -12,6 +12,8 @@ from datetime import datetime, timezone
 import os
 from typing import Mapping
 
+from .editorial_modes import EditorialModeError, duplicate_mode, public_copy_mode
+
 
 TRUE_VALUES = frozenset({"1", "true", "yes", "y", "on"})
 FALSE_VALUES = frozenset({"0", "false", "no", "n", "off"})
@@ -289,12 +291,11 @@ def validate_runtime_config(
     vector_enabled = _boolean(env, "VECTOR_ENABLED", False, issues)
     embedding_enabled = _boolean(env, "EMBEDDING_ENABLED", False, issues)
     semantic_enabled = _boolean(env, "SEMANTIC_SHADOW_ENABLED", False, issues)
-    duplicate_mode = (
-        _value(env, "DUPLICATE_ENFORCEMENT_MODE").lower()
-        if "DUPLICATE_ENFORCEMENT_MODE" in env else "shadow"
-    )
-    if duplicate_mode not in {"off", "shadow", "enforce"}:
-        issues.append(ConfigIssue("DUPLICATE_ENFORCEMENT_MODE", "must be off, shadow or enforce"))
+    for parse_mode in (duplicate_mode, public_copy_mode):
+        try:
+            parse_mode(env)
+        except EditorialModeError as error:
+            issues.append(ConfigIssue(error.field, error.message))
 
     scheduler_enabled = _boolean(env, "ENABLE_APSCHEDULER", False, issues)
     scheduler_profile = normalized_profile == "web" and scheduler_enabled
@@ -308,10 +309,16 @@ def validate_runtime_config(
     for flag in (
         "PROCESS_DURABLE_CLAIMS_ENABLED",
         "PUBLISH_DURABLE_STATE_ENABLED",
+        "PUBLISH_DAILY_HARD_CAP_ENABLED",
         "DUPLICATE_SHADOW_ENABLED",
         "FILE_LOGGING_ENABLED",
     ):
         _boolean(env, flag, False, issues)
+    _positive_integer(env, "PUBLISH_DAILY_HARD_CAP", 30, issues, maximum=4294967295)
+    if "PUBLISH_DAILY_HARD_CAP_ENABLED" in env and not _value(env, "PUBLISH_DAILY_HARD_CAP_ENABLED"):
+        issues.append(ConfigIssue("PUBLISH_DAILY_HARD_CAP_ENABLED", "must be true or false"))
+    if "PUBLISH_DAILY_HARD_CAP" in env and not _value(env, "PUBLISH_DAILY_HARD_CAP"):
+        issues.append(ConfigIssue("PUBLISH_DAILY_HARD_CAP", "must be a positive integer"))
 
     if vector_enabled:
         _require(env, VECTOR_DB_FIELDS, issues)

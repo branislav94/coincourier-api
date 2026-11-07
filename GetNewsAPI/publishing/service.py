@@ -9,15 +9,22 @@ from datetime import datetime, timezone
 from dataclasses import replace
 from typing import Any, Callable, Mapping
 
-from config import DUPLICATE_ENFORCEMENT_MODE, PIPELINE_FRESH_START_AFTER_UTC_SQL, PUBLISH_CLAIM_TIMEOUT_MINUTES
+from config import (
+    DUPLICATE_ENFORCEMENT_MODE, PIPELINE_FRESH_START_AFTER_UTC_SQL, PUBLISH_CLAIM_TIMEOUT_MINUTES,
+    PUBLISH_DAILY_HARD_CAP_ENABLED, PUBLISH_DAILY_HARD_CAP,
+)
 from duplicate_detection.enforcement import DUPLICATE_COUNTER_NAMES, DuplicateDecision
 from duplicate_detection.publication import (
     PublicationDuplicateGuard, PublicationDuplicateRejected, PublicationDuplicateUnavailable,
 )
 from repositories.publication import PublicationClaim, PublicationRepository
+from repositories.publication_capacity import (
+    CapacityRepository, CapacityUnavailable, CapacityAlreadyAttempted,
+)
 from repositories.state import claim_prefix, safe_error_message
 
 from .base import Publisher
+from .capacity import CAPACITY_UNAVAILABLE, QUOTA_EXHAUSTED, STALE_BACKLOG, needs_freshness_review
 from .models import (
     PublicationArticle, PublicationContext, PublicationImage, PublicationResult,
     is_fresh_publication_state,
@@ -58,6 +65,8 @@ class PublishingService:
         fresh_start_after: str | None = PIPELINE_FRESH_START_AFTER_UTC_SQL,
         duplicate_mode: str | None = None,
         duplicate_guard_factory: Callable[[int | None], PublicationDuplicateGuard] | None = None,
+        capacity_repository: CapacityRepository | None = None,
+        capacity_enabled: bool | None = None,
     ) -> None:
         self.repository = repository
         self.publisher = publisher
@@ -68,6 +77,13 @@ class PublishingService:
         if self.duplicate_mode not in {"off", "shadow", "enforce"}:
             raise ValueError("invalid duplicate enforcement mode")
         self.duplicate_guard_factory = duplicate_guard_factory
+        self.capacity_enabled = (
+            PUBLISH_DAILY_HARD_CAP_ENABLED if capacity_enabled is None else capacity_enabled
+        )
+        self.capacity = (
+            capacity_repository or CapacityRepository(PUBLISH_DAILY_HARD_CAP)
+            if self.capacity_enabled else None
+        )
 
     def publish_due(self, limit: int) -> dict[str, int]:
         if self.duplicate_mode == "off" or limit <= 0:
@@ -93,12 +109,36 @@ class PublishingService:
         if self.duplicate_mode != "off":
             result.update(duplicates_rejected=0, duplicate_guard_deferred=0)
             result.update(dict.fromkeys(DUPLICATE_COUNTER_NAMES, 0))
+        if self.capacity_enabled:
+            result.update(quota_deferred=0, quota_exhausted=0, capacity_unavailable=0, freshness_deferred=0)
         attempted_rich_ids: set[int] = set()
         for _ in range(max(0, limit)):
+            claim_options: dict[str, Any] = {}
+            if self.capacity_enabled:
+                existing_only = False
+                schema_available = False
+                try:
+                    existing_only = self.capacity.snapshot().remaining <= 0
+                    schema_available = True
+                    if existing_only:
+                        result['quota_exhausted'] = 1
+                except CapacityUnavailable:
+                    existing_only = True
+                    result['capacity_unavailable'] = 1
+                if existing_only:
+                    logger.info(
+                        '[PUBLICATION-CAPACITY] phase=publish decision=deferred reason=%s existing_posts_only=true',
+                        CAPACITY_UNAVAILABLE if result['capacity_unavailable'] else QUOTA_EXHAUSTED,
+                    )
+                claim_options.update(
+                    capacity_guard=True, existing_posts_only=existing_only,
+                    reserved_posts_allowed=existing_only and schema_available,
+                )
             claim = self.repository.claim_next(
                 timeout_minutes=self.claim_timeout_minutes,
                 fresh_start_after=self.fresh_start_after,
                 exclude_rich_article_ids=tuple(sorted(attempted_rich_ids)),
+                **claim_options,
             )
             if claim is None:
                 break
@@ -116,13 +156,21 @@ class PublishingService:
                         result[name] += count
             if isinstance(outcome, DuplicateDecision):
                 result["duplicates_rejected" if outcome.reject else "duplicate_guard_deferred"] += 1
-            elif outcome:
+            elif outcome is True:
                 result["succeeded"] += 1
+            elif outcome is None:
+                if self._last_deferral == STALE_BACKLOG:
+                    result['freshness_deferred'] += 1
+                else:
+                    result['quota_deferred'] += 1
+                    if self._last_deferral == CAPACITY_UNAVAILABLE:
+                        result['capacity_unavailable'] = 1
             else:
                 result["failed"] += 1
         return result
 
-    def _publish_claim(self, claim: PublicationClaim, *, duplicate_guard: PublicationDuplicateGuard | None = None) -> bool | DuplicateDecision:
+    def _publish_claim(self, claim: PublicationClaim, *, duplicate_guard: PublicationDuplicateGuard | None = None) -> bool | DuplicateDecision | None:
+        self._last_deferral = None
         row = claim.article
         rich_id = int(row["id"])
         raw_id_value = row.get("raw_article_id") or row.get("durable_raw_article_id")
@@ -159,6 +207,15 @@ class PublishingService:
                     post_url,
                 ):
                     raise RuntimeError("publication claim ownership was lost while saving post ID")
+                if self.capacity_enabled:
+                    try:
+                        self.capacity.record_created(rich_id, key, post_id)
+                    except CapacityUnavailable:
+                        # Existing pre-activation IDs may have no ledger entry.
+                        logger.info('[PUBLICATION-CAPACITY] rich_article_id=%s decision=identity-record-pending', rich_id)
+
+            def authorize_capacity_create() -> datetime | None:
+                return self.capacity.begin_create(rich_id, key)
 
             context = PublicationContext(
                 published_at_utc=datetime.now(timezone.utc),
@@ -173,6 +230,7 @@ class PublishingService:
                     claim.attempt == 1 and not claim.recovered
                     and is_fresh_publication_state(row)
                 ),
+                authorize_capacity_create=(authorize_capacity_create if self.capacity_enabled else None),
             )
             article = PublicationArticle.from_mapping(row)
 
@@ -183,6 +241,25 @@ class PublishingService:
             if duplicate_guard is not None:
                 duplicate_guard.check()
                 context = replace(context, pre_create_duplicate_guard=duplicate_guard.check)
+            if self.capacity_enabled:
+                if needs_freshness_review(row):
+                    return self._complete_result(claim, PublicationResult(
+                        success=False, deferred=True, error=STALE_BACKLOG,
+                    ))
+                try:
+                    reservation = self.capacity.reserve(rich_id, key)
+                except CapacityAlreadyAttempted:
+                    return self._complete_result(claim, PublicationResult(
+                        success=False, error='post_identity_manual_reconciliation_required',
+                    ))
+                except CapacityUnavailable:
+                    return self._complete_result(claim, PublicationResult(
+                        success=False, deferred=True, error=CAPACITY_UNAVAILABLE,
+                    ))
+                if reservation is None:
+                    return self._complete_result(claim, PublicationResult(
+                        success=False, deferred=True, error=QUOTA_EXHAUSTED,
+                    ))
             image = self._prepare_image(claim, key)
             publish_result = self.publisher.publish(article, image, context)
             return self._complete_result(claim, publish_result)
@@ -295,9 +372,26 @@ class PublishingService:
         self,
         claim: PublicationClaim,
         result: PublicationResult,
-    ) -> bool:
+    ) -> bool | None:
         rich_id = int(claim.article["id"])
         if not result.success:
+            if result.deferred:
+                self._last_deferral = result.error
+                if result.error == STALE_BACKLOG:
+                    changed = self.repository.require_manual_reconciliation(
+                        rich_id, claim.token, STALE_BACKLOG,
+                    )
+                else:
+                    changed = self.repository.defer_capacity(
+                        rich_id, claim.token, result.error or QUOTA_EXHAUSTED,
+                    )
+                if not changed:
+                    raise RuntimeError('publication claim ownership was lost while deferring creation')
+                logger.info(
+                    '[PUBLICATION-CAPACITY] rich_article_id=%s decision=deferred reason=%s',
+                    rich_id, result.error,
+                )
+                return None
             if result.error == 'post_identity_manual_reconciliation_required':
                 if not self.repository.require_manual_reconciliation(
                     rich_id, claim.token, result.error,

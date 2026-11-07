@@ -534,10 +534,16 @@ new or separately reviewed environments, not an instruction to rebuild the
 working DEV schema.
 
 Normal application sequence: `app-001`, `app-002`, `app-003`, `app-004`,
-`app-006`, `app-007`; the preflight entries are 001, 003, and 006. No application
-migration APPLY runs during initial setup. Explicitly exclude `app-005` recovery,
-fresh-start utilities, disposable test baseline, and legacy `crypto_news_db.sql`.
-Use the generic runbook's approved application migration procedure later.
+`app-006`, `app-007`, `app-008`; the preflight entries are 001, 003, and 006.
+`app-008` adds UTC daily publication capacity schema and depends on `app-004`.
+No application migration APPLY runs during initial setup. Explicitly exclude
+`app-005` recovery, fresh-start utilities, disposable test baseline, and legacy
+`crypto_news_db.sql`. Use the generic runbook's approved application migration
+procedure later. `migration_apply app` includes every pending forward migration
+in its plan; approve the entire planned set and stop if any pending migration is
+outside the approved scope. Keep `PUBLISH_DAILY_HARD_CAP_ENABLED=false` until the
+separate [daily-cap activation procedure](GETNEWSAPI_DAILY_PUBLICATION_CAP.md)
+establishes the verified UTC baseline and coordinated publisher activation.
 
 Future authorized vector sequence, inside `/app`:
 
