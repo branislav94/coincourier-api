@@ -33,6 +33,33 @@ AUM_EVIDENCE = (
     'October 16, 2026 at 09:00 UTC: a later issuer announcement reports $700 million, after the research cutoff. '
     'A separate source claims $900 million without a compatible definition, platform or as-of date.'
 )
+LIQUIDATION_REPLAY_INPUTS = (
+    {
+        'title': 'Crypto liquidation flash as Bitcoin drops',
+        'news_url': 'https://www.tokenpost.com/news/investing/57533',
+        'source_name': 'TokenPost',
+        'full_text': (
+            'In a one-hour interval, liquidations across the crypto market totaled $691 million. '
+            'The long-position component was $671 million. Bitcoin traded below $64,000 during '
+            'the event; the liquidation aggregate includes the crypto market, not only BTC positions.'
+        ),
+        'extra_context': (
+            '- A separate BTC-only dashboard observation uses a rolling 24-hour window and '
+            'a different snapshot. It supplies no BTC breakdown for this one-hour market total.'
+        ),
+    },
+    {
+        'title': 'BTC futures liquidation snapshot over 24 hours',
+        'news_url': 'https://www.tokenpost.com/news/investing/56458',
+        'source_name': 'TokenPost',
+        'full_text': (
+            'At 07:18 UTC on November 13, 2026, BTC futures liquidations totaled $912.53 million '
+            'for the preceding rolling 24 hours. This measures BTC futures positions exclusively. '
+            'Of that total, longs were $870.24 million and shorts were $42.29 million.'
+        ),
+        'extra_context': '',
+    },
+)
 
 
 class FixedDatetime(datetime):
@@ -203,6 +230,31 @@ class ArticleQualityV12PromptTests(unittest.TestCase):
         self.assertIn(research, payload)
         self.assertIn('450-word hard minimum', system)
         self.assertIn('usually 2-5 words', system)
+
+    def test_liquidation_replay_inputs_reach_writer_with_metric_window_and_population_rule(self) -> None:
+        '''Source paraphrases exercise prompt delivery, not generated-copy accuracy.'''
+        for replay in LIQUIDATION_REPLAY_INPUTS:
+            with self.subTest(source=replay['news_url']):
+                original = {key: value for key, value in replay.items() if key != 'extra_context'}
+                messages = self._writer_messages(original, replay['extra_context'])
+                system, payload = messages[0]['content'], messages[1]['content']
+                markets = system.split('• Markets:', 1)[1].split('\n', 1)[0]
+                for required in (
+                    'what each financial figure measures', 'reporting window and population',
+                    'headline, lead and SEO description', 'market-wide or asset-specific',
+                    'price move does not make', 'liquidation total asset-specific',
+                    'Similar values from dashboards', 'incompatible scopes or windows',
+                    'cannot confirm that total or establish its asset composition',
+                    'retain genuinely asset-specific figures as such',
+                ):
+                    self.assertIn(required, markets)
+                self.assertEqual(system.count('• Markets:'), 1)
+                source = json.loads(payload.split(EVIDENCE_MARKER, 1)[1])
+                self.assertEqual(source['available_source_text'], replay['full_text'])
+                self.assertEqual(source['source_url'], replay['news_url'])
+                self.assertEqual(source['source_publisher'], 'TokenPost')
+                self.assertFalse(source['source_text_truncated'])
+                self.assertIn(replay['extra_context'], payload)
 
 
 if __name__ == '__main__':

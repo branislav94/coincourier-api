@@ -208,7 +208,7 @@ class PublicationGuardTests(unittest.TestCase):
         with ExitStack() as stack:
             stack.enter_context(patch.object(publisher.session, "post", side_effect=post))
             stack.enter_context(patch.object(publisher, "ensure_category", return_value=1))
-            stack.enter_context(patch.object(publisher, "link_markets", side_effect=lambda value: value))
+            stack.enter_context(patch.object(publisher, "link_markets", side_effect=lambda value, *, primary_category: value))
             stack.enter_context(patch.object(publisher.WordPressPublisher, "_validate_yoast"))
             stack.enter_context(patch.object(publisher.WordPressPublisher, "_write_yoast"))
             usage = stack.enter_context(patch.object(publisher, "record_image_usage"))
