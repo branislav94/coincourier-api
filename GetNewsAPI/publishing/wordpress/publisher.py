@@ -2,6 +2,7 @@ import base64
 import logging
 import os
 from datetime import datetime
+from html.parser import HTMLParser
 import re
 import requests
 import mysql.connector
@@ -1728,26 +1729,90 @@ def _upload_prepared_image(
         return None, image_meta
 
 
-def link_markets(text: str) -> str:
-    """
-    Wrap occurrences of known exchange names with outbound <a> links.
+class _LinkableText(HTMLParser):
+    '''Locate prose without reserializing source markup or existing citations.'''
 
-    Uses a word-boundary regex replacement per exchange in MARKET_LINKS.
-    Attempts to avoid replacing inside existing tags/attributes using a negative
-    lookbehind for quote/angle-bracket patterns.
+    _IGNORED = frozenset({
+        'a', 'script', 'style', 'noscript', 'template', 'iframe', 'object',
+        'svg', 'math', 'textarea', 'title', 'head',
+    })
+    _VOID = frozenset({
+        'area', 'base', 'br', 'col', 'embed', 'hr', 'img', 'input', 'link',
+        'meta', 'param', 'source', 'track', 'wbr',
+    })
 
-    Args:
-        text: HTML string to modify.
+    def __init__(self, text: str, category_url: str | None) -> None:
+        super().__init__(convert_charrefs=False)
+        self._line_offsets = [0] + [match.end() for match in re.finditer('\n', text)]
+        self._ignored: list[str] = []
+        self.category_url = category_url
+        self.category_linked = False
+        self.spans: list[tuple[int, int]] = []
 
-    Returns:
-        str:
-            HTML with linked exchange names.
-    """
-    for name, url in MARKET_LINKS.items():
-        # \b will match at word boundaries, except for names with punctuation (Crypto.com, OKX)
-        pattern = r'(?<!["\'>])\b' + re.escape(name) + r'\b'
-        replacement = f'<a href="{url}" target="_blank" rel="noopener">{name}</a>'
-        text = re.sub(pattern, replacement, text)
+    def handle_starttag(self, tag: str, attrs: list[tuple[str, str | None]]) -> None:
+        attributes = dict(attrs)
+        if not self._ignored and tag == 'a' and self.category_url is not None:
+            href = attributes.get('href')
+            if href == self.category_url or (
+                isinstance(href, str)
+                and WordPressPublisher._same_wordpress_origin(href)
+                and urlsplit(href).path == self.category_url
+            ):
+                self.category_linked = True
+        if tag not in self._VOID and (self._ignored or tag in self._IGNORED or 'hidden' in attributes):
+            self._ignored.append(tag)
+
+    def handle_endtag(self, tag: str) -> None:
+        for index in range(len(self._ignored) - 1, -1, -1):
+            if self._ignored[index] == tag:
+                del self._ignored[index:]
+                break
+
+    def handle_startendtag(self, tag: str, attrs: list[tuple[str, str | None]]) -> None:
+        self.handle_starttag(tag, attrs)
+        self.handle_endtag(tag)
+
+    def handle_data(self, data: str) -> None:
+        if not self._ignored:
+            line, column = self.getpos()
+            start = self._line_offsets[line - 1] + column
+            self.spans.append((start, start + len(data)))
+
+
+def link_markets(text: str, *, primary_category: str | None = None) -> str:
+    '''Link exchange names and at most one category mention in unlinked prose.
+
+    Apply offset edits to text nodes only, keeping all other HTML byte-for-byte.
+    Inspect existing category destinations before inserting so a repeated pass
+    leaves later category mentions alone, even when the existing link is last.
+    '''
+    category_url = f'/category/{slugify(primary_category)}/' if primary_category else None
+    parser = _LinkableText(text, category_url)
+    parser.feed(text)
+    parser.close()
+    category_linked = parser.category_linked
+    market_pattern = re.compile(r'\b(?:' + '|'.join(map(re.escape, MARKET_LINKS)) + r')\b')
+    replacements: list[tuple[int, int, str]] = []
+    for start, end in parser.spans:
+        prose = text[start:end]
+        category_start = prose.find(primary_category) if primary_category and not category_linked else -1
+        category_end = category_start + len(primary_category or '')
+        if category_start >= 0:
+            replacements.append((
+                start + category_start, start + category_end,
+                f'<a href="{category_url}">{primary_category}</a>',
+            ))
+            category_linked = True
+        for match in market_pattern.finditer(prose):
+            if category_start >= 0 and match.start() < category_end and match.end() > category_start:
+                continue
+            name = match.group()
+            replacements.append((
+                start + match.start(), start + match.end(),
+                f'<a href="{MARKET_LINKS[name]}" target="_blank" rel="noopener">{name}</a>',
+            ))
+    for start, end, replacement in sorted(replacements, reverse=True):
+        text = text[:start] + replacement + text[end:]
     return text
 
 
@@ -1982,13 +2047,7 @@ class WordPressPublisher:
         category_ids = [ensure_category(name) for name in cat_names]
 
         slug_source = article.slug_candidate or article.title
-        with_links_content = link_markets(article.html_content)
-        category_url = f"/category/{slugify(cat_names[0])}/"
-        with_links_content = with_links_content.replace(
-            cat_names[0],
-            f'<a href="{category_url}">{cat_names[0]}</a>',
-            1,
-        )
+        with_links_content = link_markets(article.html_content, primary_category=cat_names[0])
 
         schedule_at_utc = context.published_at_utc
 

@@ -252,7 +252,7 @@ def wordpress_boundaries(http):
         stack.enter_context(patch.object(publisher, "PUBLISH_DAILY_HARD_CAP_ENABLED", False))
         stack.enter_context(patch.object(publisher, "ensure_category", return_value=1))
         stack.enter_context(patch.object(publisher, "ensure_term", return_value=2))
-        stack.enter_context(patch.object(publisher, "link_markets", side_effect=lambda value: value))
+        stack.enter_context(patch.object(publisher, "link_markets", side_effect=lambda value, *, primary_category: value))
         stack.enter_context(patch.object(publisher.mysql.connector, "connect",
                                         side_effect=AssertionError("No real database access permitted")))
         yield

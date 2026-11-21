@@ -259,7 +259,7 @@ class PublicationCapacityMariaDBTests(unittest.TestCase):
             patch.object(publisher, 'PUBLISH_DAILY_HARD_CAP_ENABLED', False),
             patch.object(publisher, 'ensure_category', return_value=1),
             patch.object(publisher, 'ensure_term', return_value=2),
-            patch.object(publisher, 'link_markets', side_effect=lambda value: value),
+            patch.object(publisher, 'link_markets', side_effect=lambda value, *, primary_category: value),
         ):
             first = service.publish_due(3)
             self.assertEqual(first['failed'], 1)
@@ -374,7 +374,7 @@ class PublicationCapacityMariaDBTests(unittest.TestCase):
             patch.object(publisher, 'PUBLISH_DAILY_HARD_CAP_ENABLED', False),
             patch.object(publisher, 'ensure_category', return_value=1),
             patch.object(publisher, 'ensure_term', return_value=2),
-            patch.object(publisher, 'link_markets', side_effect=lambda value: value),
+            patch.object(publisher, 'link_markets', side_effect=lambda value, *, primary_category: value),
         ):
             result = service.publish_due(2)
             retry = service.publish_due(2)
