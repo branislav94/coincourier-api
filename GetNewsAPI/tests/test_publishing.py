@@ -724,6 +724,81 @@ class WordPressPublisherTests(unittest.TestCase):
         self.assertTrue(result.success)
         self.assertEqual(mocks[2].call_args.kwargs['json']['content'], original)
 
+    def test_absolute_wordpress_category_link_prevents_another_insertion(self) -> None:
+        for href in (
+            'https://wordpress.example.invalid/category/bitcoin/',
+            'https://WORDPRESS.example.invalid:443/category/bitcoin/?source=topic#latest',
+        ):
+            with self.subTest(href=href), patch.object(
+                publisher, 'WP_API_URL', 'https://wordpress.example.invalid',
+            ):
+                anchor = (
+                    f'<a class="topic" href="{href}" data-label="Bitcoin">'
+                    '<strong>Bitcoin</strong> <em>news</em></a>'
+                )
+                original = f'<p>Bitcoin and Bitcoin precede {anchor}.</p>'
+                self.article = PublicationArticle.from_mapping({
+                    **ARTICLE_ROW, 'category': 'Bitcoin', 'schema_jsonld': None,
+                    'full_text': original,
+                })
+                first, mocks, _connection, _events = self.publish_with_mocks()
+                content = mocks[2].call_args.kwargs['json']['content']
+                self.assertTrue(first.success)
+                self.assertEqual(content, original)
+                parsed = AnchorLabels()
+                parsed.feed(content)
+                self.assertEqual(
+                    [(attrs.get('href'), ''.join(label)) for attrs, label in parsed.anchors],
+                    [(href, 'Bitcoin news')],
+                )
+                self.article = PublicationArticle.from_mapping({
+                    **ARTICLE_ROW, 'category': 'Bitcoin', 'schema_jsonld': None,
+                    'full_text': content,
+                })
+                second, mocks, _connection, _events = self.publish_with_mocks()
+                self.assertTrue(second.success)
+                self.assertEqual(mocks[2].call_args.kwargs['json']['content'], content)
+
+    def test_foreign_category_path_still_allows_one_internal_link(self) -> None:
+        for href in (
+            'https://external.example.invalid/category/bitcoin/',
+            'http://wordpress.example.invalid/category/bitcoin/',
+            'https://wordpress.example.invalid:444/category/bitcoin/',
+            'https://reader@wordpress.example.invalid/category/bitcoin/',
+            'https://wordpress.example.invalid:invalid/category/bitcoin/',
+        ):
+            with self.subTest(href=href), patch.object(
+                publisher, 'WP_API_URL', 'https://wordpress.example.invalid',
+            ):
+                anchor = (
+                    f'<a class="source" href="{href}" rel="nofollow">'
+                    '<strong>Bitcoin</strong> <em>news</em></a>'
+                )
+                self.article = PublicationArticle.from_mapping({
+                    **ARTICLE_ROW, 'category': 'Bitcoin', 'schema_jsonld': None,
+                    'full_text': f'<p>Bitcoin and Bitcoin precede {anchor}.</p>',
+                })
+                first, mocks, _connection, _events = self.publish_with_mocks()
+                content = mocks[2].call_args.kwargs['json']['content']
+                self.assertTrue(first.success)
+                self.assertEqual(content, (
+                    '<p><a href="/category/bitcoin/">Bitcoin</a> and Bitcoin precede '
+                    f'{anchor}.</p>'
+                ))
+                parsed = AnchorLabels()
+                parsed.feed(content)
+                self.assertEqual(
+                    [(attrs.get('href'), ''.join(label)) for attrs, label in parsed.anchors],
+                    [('/category/bitcoin/', 'Bitcoin'), (href, 'Bitcoin news')],
+                )
+                self.article = PublicationArticle.from_mapping({
+                    **ARTICLE_ROW, 'category': 'Bitcoin', 'schema_jsonld': None,
+                    'full_text': content,
+                })
+                second, mocks, _connection, _events = self.publish_with_mocks()
+                self.assertTrue(second.success)
+                self.assertEqual(mocks[2].call_args.kwargs['json']['content'], content)
+
     def test_all_exchange_destinations_and_text_node_boundaries_are_preserved(self) -> None:
         original = '<p>' + ' &amp; '.join(
             f'<em>{name}</em>' for name in publisher.MARKET_LINKS

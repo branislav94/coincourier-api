@@ -1752,7 +1752,12 @@ class _LinkableText(HTMLParser):
     def handle_starttag(self, tag: str, attrs: list[tuple[str, str | None]]) -> None:
         attributes = dict(attrs)
         if not self._ignored and tag == 'a' and self.category_url is not None:
-            if attributes.get('href') == self.category_url:
+            href = attributes.get('href')
+            if href == self.category_url or (
+                isinstance(href, str)
+                and WordPressPublisher._same_wordpress_origin(href)
+                and urlsplit(href).path == self.category_url
+            ):
                 self.category_linked = True
         if tag not in self._VOID and (self._ignored or tag in self._IGNORED or 'hidden' in attributes):
             self._ignored.append(tag)
