@@ -1,5 +1,6 @@
 import base64
-from html import escape
+from collections.abc import Iterator, Mapping
+from html import escape, unescape
 import ipaddress
 import logging
 import os
@@ -200,23 +201,60 @@ def _referral_url_error(value: str) -> str | None:
     return None
 
 
-def _load_market_referral_urls() -> dict[str, str]:
-    '''Read optional overrides once; a bad brand setting never blocks publishing.'''
-    referrals: dict[str, str] = {}
+def _configured_referral(value: str, key: str, fallback: str) -> str | None:
+    '''Use the existing URL policy and log only the setting name and fixed reason.'''
+    if not value.strip():
+        return None
+    reason = _referral_url_error(value)
+    if reason:
+        logger.warning('[WP-REFERRAL] key=%s reason=%s decision=%s', key, reason, fallback)
+        return None
+    return value
+
+
+def _load_market_referral_urls(environment: Mapping[str, str]) -> dict[str, str]:
+    '''Read optional URL overrides for brands with public fallbacks.'''
+    referrals = {}
     for name, (_fallback, key) in MARKET_LINK_SETTINGS.items():
-        value = os.getenv(key)
-        if not value or not value.strip():
+        if url := _configured_referral(environment.get(key, ''), key, 'public_fallback'):
+            referrals[name] = url
+    return referrals
+
+
+def _load_custom_referrals(environment: Mapping[str, str]) -> list[tuple[re.Pattern[str], str]]:
+    '''Discover custom names and their validated destinations once at startup.'''
+    built_in_keys = {key for _fallback, key in MARKET_LINK_SETTINGS.values()}
+    names = {name.casefold() for name in MARKET_LINK_SETTINGS}
+    referrals = []
+    for key in sorted(environment):
+        if not key.startswith('REFERRAL_URL_') or key.upper() in built_in_keys:
             continue
-        reason = _referral_url_error(value)
-        if reason:
-            logger.warning('[WP-REFERRAL] key=%s reason=%s decision=public_fallback', key, reason)
-        else:
-            referrals[name] = value
+        brand_id = key.removeprefix('REFERRAL_URL_')
+        if not re.fullmatch(r'[A-Za-z0-9]+(?:_[A-Za-z0-9]+)*', brand_id):
+            continue
+        url = _configured_referral(environment[key], key, 'plain_text')
+        if url is None:
+            continue
+        display_name = environment.get(f'REFERRAL_NAME_{brand_id}', '').strip()
+        name = display_name or brand_id
+        if any(unicodedata.category(character) in {'Cc', 'Cf', 'Cs'} for character in name):
+            logger.warning('[WP-REFERRAL] key=%s reason=invalid_name decision=plain_text', key)
+            continue
+        if name.casefold() in names:
+            logger.warning('[WP-REFERRAL] key=%s reason=name_conflict decision=plain_text', key)
+            continue
+        names.add(name.casefold())
+        literal = re.escape(name)
+        if not display_name:
+            literal = f'(?ai:{literal})'
+        # Look ahead so repeated phrases can contribute overlapping candidates.
+        referrals.append((re.compile(rf'(?<!\w)(?=({literal})(?!\w))'), url))
     return referrals
 
 
 MARKET_LINKS = {name: fallback for name, (fallback, _key) in MARKET_LINK_SETTINGS.items()}
-MARKET_REFERRAL_URLS = _load_market_referral_urls()
+MARKET_REFERRAL_URLS = _load_market_referral_urls(os.environ)
+_CUSTOM_REFERRALS = _load_custom_referrals(os.environ)
 
 IMG_MODEL   = OPENAI_IMAGE_MODEL
 IMG_SIZE    = os.getenv("IMAGE_SIZE", "1024x1024")   # input square
@@ -1809,9 +1847,17 @@ class _LinkableText(HTMLParser):
         self.category_url = category_url
         self.category_linked = False
         self.spans: list[tuple[int, int]] = []
+        self._text = text
+        self._visible_parts: list[tuple[int, int, str]] = []
+        self._anchor_start: tuple[int, int] | None = None
+        self._anchor_edges: dict[int, str] = {}
 
     def handle_starttag(self, tag: str, attrs: list[tuple[str, str | None]]) -> None:
         attributes = dict(attrs)
+        if tag == 'a' and not self._ignored and _CUSTOM_REFERRALS:
+            line, column = self.getpos()
+            start = self._line_offsets[line - 1] + column
+            self._anchor_start = (start, start + len(self.get_starttag_text()))
         if not self._ignored and tag == 'a' and self.category_url is not None:
             href = attributes.get('href')
             if href == self.category_url or (
@@ -1824,6 +1870,17 @@ class _LinkableText(HTMLParser):
             self._ignored.append(tag)
 
     def handle_endtag(self, tag: str) -> None:
+        if tag == 'a' and self._anchor_start is not None and self._ignored == ['a']:
+            line, column = self.getpos()
+            close = self._line_offsets[line - 1] + column
+            start, label_start = self._anchor_start
+            label = self._text[label_start:close]
+            if label and '<' not in label:
+                visible = unescape(label)
+                if visible:
+                    self._anchor_edges[start] = visible[0]
+                    self._anchor_edges[self._text.index('>', close) + 1] = visible[-1]
+            self._anchor_start = None
         for index in range(len(self._ignored) - 1, -1, -1):
             if self._ignored[index] == tag:
                 del self._ignored[index:]
@@ -1838,10 +1895,65 @@ class _LinkableText(HTMLParser):
             line, column = self.getpos()
             start = self._line_offsets[line - 1] + column
             self.spans.append((start, start + len(data)))
+            if _CUSTOM_REFERRALS:
+                self._visible_parts.append((start, start + len(data), data))
+
+    def _handle_reference(self, reference: str) -> None:
+        if self._ignored or not _CUSTOM_REFERRALS:
+            return
+        line, column = self.getpos()
+        start = self._line_offsets[line - 1] + column
+        end = start + len(reference)
+        if self._text[end:end + 1] == ';':
+            end += 1
+        self._visible_parts.append((start, end, unescape(self._text[start:end])))
+
+    def handle_entityref(self, name: str) -> None:
+        self._handle_reference(f'&{name}')
+
+    def handle_charref(self, name: str) -> None:
+        self._handle_reference(f'&#{name}')
+
+    def visible_runs(self) -> Iterator[tuple[str, list[int | None]]]:
+        '''Map decoded custom-name candidates back to their original HTML offsets.'''
+        parts: list[str] = []
+        offsets: list[int | None] = []
+        for start, end, visible in self._visible_parts:
+            if not offsets or offsets[-1] != start:
+                if parts:
+                    yield self._with_link_context(''.join(parts), offsets)
+                parts, offsets = [], [start]
+            parts.append(visible)
+            if len(visible) == end - start:
+                offsets.extend(range(start + 1, end + 1))
+            elif visible:
+                offsets.extend([None] * (len(visible) - 1))
+                offsets.append(end)
+            else:
+                offsets[-1] = end
+        if parts:
+            yield self._with_link_context(''.join(parts), offsets)
+
+    def _with_link_context(self, visible: str, offsets: list[int | None]) -> tuple[str, list[int | None]]:
+        '''Keep word boundaries next to links created on an earlier pass.'''
+        before, after = self._anchor_edges.get(offsets[0]), self._anchor_edges.get(offsets[-1])
+        if before:
+            visible = before + visible
+            offsets.insert(0, None)
+        if after:
+            visible += after
+            offsets.append(None)
+        return visible, offsets
+
+
+def _brand_anchor(label: str, destination: str, *, sponsored: bool) -> str:
+    '''Wrap original label HTML with the validated, escaped destination.'''
+    rel = 'noopener sponsored' if sponsored else 'noopener'
+    return f'<a href="{escape(destination, quote=True)}" target="_blank" rel="{rel}">{label}</a>'
 
 
 def link_markets(text: str, *, primary_category: str | None = None) -> str:
-    '''Link exchange names and at most one category mention in unlinked prose.
+    '''Link configured brands and at most one category mention in unlinked prose.
 
     Apply offset edits to text nodes only, keeping all other HTML byte-for-byte.
     Inspect existing category destinations before inserting so a repeated pass
@@ -1854,6 +1966,7 @@ def link_markets(text: str, *, primary_category: str | None = None) -> str:
     category_linked = parser.category_linked
     market_pattern = re.compile(r'\b(?:' + '|'.join(map(re.escape, MARKET_LINKS)) + r')\b')
     replacements: list[tuple[int, int, str]] = []
+    brand_matches: list[tuple[int, int, int, str]] = []
     for start, end in parser.spans:
         prose = text[start:end]
         category_start = prose.find(primary_category) if primary_category and not category_linked else -1
@@ -1865,15 +1978,29 @@ def link_markets(text: str, *, primary_category: str | None = None) -> str:
             ))
             category_linked = True
         for match in market_pattern.finditer(prose):
-            if category_start >= 0 and match.start() < category_end and match.end() > category_start:
-                continue
             name = match.group()
             destination = MARKET_REFERRAL_URLS.get(name, MARKET_LINKS[name])
-            rel = 'noopener sponsored' if name in MARKET_REFERRAL_URLS else 'noopener'
-            replacements.append((
-                start + match.start(), start + match.end(),
-                f'<a href="{escape(destination, quote=True)}" target="_blank" rel="{rel}">{name}</a>',
+            brand_matches.append((
+                len(name), start + match.start(), start + match.end(),
+                _brand_anchor(name, destination, sponsored=name in MARKET_REFERRAL_URLS),
             ))
+    for prose, offsets in parser.visible_runs():
+        for pattern, destination in _CUSTOM_REFERRALS:
+            for match in pattern.finditer(prose):
+                start, end = offsets[match.start(1)], offsets[match.end(1)]
+                if start is not None and end is not None:
+                    brand_matches.append((
+                        len(match[1]), start, end,
+                        _brand_anchor(text[start:end], destination, sponsored=True),
+                    ))
+    # Reserve the category first, then choose the longest disjoint brand matches.
+    occupied = bytearray(len(text))
+    for start, end, _anchor in replacements:
+        occupied[start:end] = b'\x01' * (end - start)
+    for _length, start, end, anchor in sorted(brand_matches, key=lambda item: (-item[0], item[1])):
+        if not any(occupied[start:end]):
+            replacements.append((start, end, anchor))
+            occupied[start:end] = b'\x01' * (end - start)
     for start, end, replacement in sorted(replacements, reverse=True):
         text = text[:start] + replacement + text[end:]
     return text
