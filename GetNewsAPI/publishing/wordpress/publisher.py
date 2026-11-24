@@ -59,6 +59,7 @@ from image_search.models import ImageSearchResult, RescueValidationResult
 from .attribution import build_public_attribution
 from image_search.license_policy import normalize_license_name
 from image_search.reuse import record_image_usage
+from image_search.subject_policy import article_correlation_id
 from duplicate_detection.enforcement import DUPLICATE_COUNTER_NAMES
 from duplicate_detection.publication import (
     PublicationDuplicateGuard, PublicationDuplicateRejected, PublicationDuplicateUnavailable,
@@ -1669,6 +1670,7 @@ def upload_image(
     selected: tuple[bytes, str, dict[str, Any]] | None = None
     search_exhausted = True
     generation_allowed = True
+    stock_search_attempted = False
     logger.info(
         "[IMG] mode=%s priority=%s use_source_images=%s primary=%s fallback=%s",
         mode,
@@ -1697,6 +1699,7 @@ def upload_image(
         if priority == "source_first":
             selected = _maybe_source_image_content(url)
         if not selected:
+            stock_search_attempted = True
             selected, search_exhausted = _search_stock_image_content(article_context)
         if not selected:
             generation_allowed = _generation_allowed_after_search(search_exhausted)
@@ -1708,6 +1711,7 @@ def upload_image(
             selected = _maybe_source_image_content(url)
 
         if not selected:
+            stock_search_attempted = True
             selected, search_exhausted = _search_stock_image_content(article_context)
 
         if not selected:
@@ -1752,9 +1756,17 @@ def upload_image(
 
     if not selected:
         print("No image available - posting without featured image.")
-        return None, image_meta
+        media_id, final_meta = None, image_meta
+    else:
+        media_id, final_meta = _upload_prepared_image(selected, article_context, image_meta)
 
-    return _upload_prepared_image(selected, article_context, image_meta)
+    if stock_search_attempted:
+        logger.info(
+            '[IMG] stock_terminal article=%s final_image_source=%s selected_asset_key=%s final_image_failure=%s',
+            article_correlation_id(article_context), (final_meta.get('provider') or '') if media_id else '',
+            final_meta.get('asset_key') or '', not bool(media_id),
+        )
+    return media_id, final_meta
 
 
 def _upload_prepared_image(

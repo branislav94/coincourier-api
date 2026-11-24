@@ -66,6 +66,16 @@ DEV verification** and return evidence to the application team. DevOps owns
 `dev -> main` and production deployment. No production activation, merge,
 deployment, migration or schedule change is authorized by this handoff addition.
 
+## Stock-image subject check
+
+Use `STOCK_IMAGE_SUBJECT_MODE=shadow` on the existing DEV resource. Luka collects
+50 consecutive articles reaching stock selection, including unsuccessful
+selections, and reviews false rejections, missing featured images and fallback
+or generation use before enabling enforcement. Use the
+[DEV stock-image subject procedure](GETNEWSAPI_DEPLOYMENT_RUNBOOK.md#stock-image-subject-validation-in-dev)
+to correlate logs and record the outcome. Set `STOCK_IMAGE_SUBJECT_MODE=off` and
+restart DEV to roll back the new rule.
+
 ## Git and Dokploy Compose contract
 
 | Setting | Required contract |

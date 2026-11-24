@@ -160,6 +160,21 @@ class WikimediaRequestTests(unittest.TestCase):
         self.assertEqual(items[0].asset_key, "wikimedia:123")
         self.assertEqual(provider.last_search_stats, {"raw": 1, "normalized": 1})
 
+    def test_subject_text_uses_visible_provider_description(self) -> None:
+        """Keep the descriptive label and exclude link destinations and filenames."""
+        raw = page()
+        metadata = raw['imageinfo'][0]['extmetadata']
+        metadata['ImageDescription']['value'] = '<a href="https://example.org/ethereum">Trading desk</a>'
+        provider = WikimediaProvider(enabled=False)
+        item = provider.normalize_candidate(raw, 'ethereum', 0)
+        assert item is not None
+        self.assertEqual(item.subject_text, 'Bitcoin ETF liquidity Trading desk')
+        metadata.pop('ObjectName')
+        metadata['ImageDescription']['value'] = {'unrecognized': 'ethereum'}
+        item = provider.normalize_candidate(raw, 'ethereum', 0)
+        assert item is not None
+        self.assertEqual(item.subject_text, '')
+
     def test_disabled_provider_makes_no_request(self) -> None:
         client = PayloadClient({})
         self.assertEqual(WikimediaProvider(client=client, enabled=False).search("bitcoin"), [])

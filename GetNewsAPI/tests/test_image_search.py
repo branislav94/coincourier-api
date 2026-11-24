@@ -227,6 +227,11 @@ class AdapterTests(unittest.TestCase):
         self.assertEqual(item.creator_name, "Ada")
         self.assertEqual(item.license_name, "pexels-license")
         self.assertIn(raw["url"], item.attribution_text)
+        self.assertEqual(item.subject_text, 'Bitcoin market trading')
+        raw.pop('alt')
+        item = PexelsProvider(enabled=False).normalize_candidate(raw, 'ethereum', 0)
+        assert item is not None
+        self.assertEqual(item.subject_text, '')
 
     def test_pixabay_adapter_normalization_and_stable_key(self) -> None:
         raw = {
@@ -248,6 +253,11 @@ class AdapterTests(unittest.TestCase):
         self.assertEqual(item.asset_key, "pixabay:456")
         self.assertEqual(item.creator_name, "Grace")
         self.assertEqual(item.license_name, "pixabay-content-license")
+        self.assertEqual(item.subject_text, 'bitcoin, market')
+        raw.pop('tags')
+        item = PixabayProvider(enabled=False).normalize_candidate(raw, 'ethereum', 0)
+        assert item is not None
+        self.assertEqual(item.subject_text, '')
 
     def test_openverse_adapter_normalization(self) -> None:
         raw = {
@@ -278,6 +288,12 @@ class AdapterTests(unittest.TestCase):
         self.assertEqual(item.provider_rank, 2)
         self.assertIn(raw["foreign_landing_url"], item.attribution_text)
         self.assertIn(raw["license_url"], item.attribution_text)
+        self.assertEqual(item.subject_text, 'Bitcoin network bitcoin')
+        raw.pop('title')
+        raw['tags'] = [{'name': None}, {'name': {'unrecognized': 'ethereum'}}]
+        item = OpenverseProvider(enabled=False).normalize_candidate(raw, 'ethereum', 2)
+        assert item is not None
+        self.assertEqual(item.subject_text, '')
 
     def test_openverse_cc_by_unknown_creator_without_authoritative_attribution_is_rejected(self) -> None:
         raw = {
@@ -450,6 +466,114 @@ class ParityAndPolicyTests(unittest.TestCase):
         pixabay.final_score = 0.88
         ranked = rank_candidates([pixabay, pexels])
         self.assertEqual(ranked[0].asset_key, "pexels:p")
+
+
+class LegacySubjectSelectionTests(unittest.TestCase):
+    '''Exercise the V1 subject rule with provider-shaped responses.'''
+
+    article = {
+        'id': 42,
+        'title': 'XRP long liquidations increase',
+        'full_text': 'XRP futures traders saw their long positions liquidated.',
+        'seo_focus': 'trading screen',
+        'tickers': 'XRP',
+    }
+
+    def setUp(self) -> None:
+        '''Fix the provider configuration and isolate both usage stores.'''
+        self.enterContext(patch.multiple(
+            stock_images, PEXELS_ENABLED=True, PEXELS_API_KEY='test-pexels', PEXELS_MIN_SCORE=0.72,
+            PIXABAY_ENABLED=True, PIXABAY_API_KEY='test-pixabay', PIXABAY_MIN_SCORE=0.78,
+        ))
+        self.enterContext(patch.object(stock_images, 'load_stock_image_usage', return_value=[]))
+        self.enterContext(patch.object(stock_images, 'load_recent_wp_stock_usage', return_value=[]))
+
+    @staticmethod
+    def _pexels_photo(asset_id: int, description: str, *, liked: bool = False) -> dict[str, object]:
+        '''Supply Pexels alt text separately from creator and source URL.'''
+        return {
+            'id': asset_id,
+            'width': 1920,
+            'height': 1080,
+            'alt': description,
+            'liked': liked,
+            'photographer': 'Bitcoin Photography',
+            'url': f'https://www.pexels.com/photo/{asset_id}/',
+            'src': {'large2x': f'https://images.pexels.com/photos/{asset_id}.jpg'},
+        }
+
+    def test_shadow_keeps_winner_and_requests_while_enforce_uses_next_photo(self) -> None:
+        '''Run real query building, provider normalization, and candidate selection.'''
+        payload = {'photos': [
+            self._pexels_photo(10, 'Bitcoin/Tether trading screen', liked=True),
+            self._pexels_photo(11, 'Neutral trading screen'),
+        ]}
+        request_calls = {}
+        winners = {}
+        for mode in ('off', 'shadow', 'enforce'):
+            with (
+                self.subTest(mode=mode),
+                patch.object(stock_images, 'STOCK_IMAGE_SUBJECT_MODE', mode),
+                patch.object(stock_images, '_get_json', return_value=payload) as request,
+            ):
+                if mode == 'off':
+                    with self.assertNoLogs('image_search.subject_policy', level='INFO'):
+                        winners[mode] = stock_images.find_stock_image(self.article)
+                else:
+                    with self.assertLogs('image_search.subject_policy', level='INFO') as captured:
+                        winners[mode] = stock_images.find_stock_image(self.article)
+                    decision = 'would_reject' if mode == 'shadow' else 'reject'
+                    self.assertIn(
+                        f'provider=pexels asset_id=10 route=legacy mode={mode} decision={decision}',
+                        captured.output[0],
+                    )
+                request_calls[mode] = request.call_args_list
+                request.assert_called_once()
+        self.assertEqual(winners['off'], winners['shadow'])
+        for mode, asset_id in (('off', '10'), ('shadow', '10'), ('enforce', '11')):
+            item = winners[mode]
+            assert item is not None
+            self.assertEqual(item.provider_asset_id, asset_id)
+        self.assertEqual(request_calls['off'], request_calls['shadow'])
+        self.assertEqual(request_calls['off'], request_calls['enforce'])
+
+    def test_enforce_checks_each_fetched_query_and_next_provider(self) -> None:
+        '''Reject a reappearing photo and evaluate the next provider's tags.'''
+        pexels_response = {'photos': [self._pexels_photo(10, 'Bitcoin/Tether trading screen')]}
+        pixabay_response = {'hits': [
+            {
+                'id': asset_id,
+                'imageWidth': 1920,
+                'imageHeight': 1080,
+                'tags': tags,
+                'views': views,
+                'user': 'Bitcoin Photography',
+                'pageURL': f'https://pixabay.com/photos/{asset_id}/',
+                'largeImageURL': f'https://cdn.pixabay.com/{asset_id}.jpg',
+            }
+            for asset_id, tags, views in (
+                (20, 'bitcoin, tether, trading screen', 50000),
+                (21, 'trading screen, candlesticks', 5000),
+            )
+        ]}
+        queries = stock_images.build_stock_queries(self.article)
+        with (
+            patch.object(stock_images, 'STOCK_IMAGE_SUBJECT_MODE', 'enforce'),
+            patch.object(
+                stock_images, '_get_json',
+                side_effect=[pexels_response] * len(queries) + [pixabay_response],
+            ) as request,
+            self.assertLogs('image_search.subject_policy', level='INFO') as captured,
+        ):
+            item = stock_images.find_stock_image(self.article)
+        assert item is not None
+        self.assertEqual(item.asset_key, 'pixabay:21')
+        self.assertEqual(
+            [call.args[:2] for call in request.call_args_list],
+            [('pexels', query) for query in queries] + [('pixabay', queries[0])],
+        )
+        self.assertEqual(sum('provider=pexels asset_id=10' in line for line in captured.output), len(queries))
+        self.assertEqual(sum('provider=pixabay asset_id=20' in line for line in captured.output), 1)
 
 
 class SearchSemanticsTests(unittest.TestCase):

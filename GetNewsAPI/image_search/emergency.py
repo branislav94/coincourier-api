@@ -13,6 +13,7 @@ from config import (
     IMAGE_EMERGENCY_STOCK_RESCUE_LIMIT,
     IMAGE_MIN_HEIGHT,
     IMAGE_MIN_WIDTH,
+    STOCK_IMAGE_SUBJECT_MODE,
 )
 
 from .downloader import ImageDownloadError, ImageDownloader, MAX_IMAGE_BYTES
@@ -27,6 +28,8 @@ from .reuse import (
 )
 from .scoring import rank_candidates
 from .context import context_rejection_reason, image_article_context
+from .subject import subject_article_lead
+from .subject_policy import rejected_subject_assets, subject_rejection_reason
 
 
 logger = logging.getLogger(__name__)
@@ -85,10 +88,12 @@ def _public_http_url(value: str) -> bool:
         return False
 
 
-def _hard_safety_reason(candidate: ImageCandidate, policy: ImageLicensePolicy, article_context: dict | None = None) -> str:
-    context_reason = context_rejection_reason(candidate, article_context or {})
+def _hard_safety_reason(candidate: ImageCandidate, context: StockRescueContext) -> str:
+    '''Apply hard context and safety checks before offering or downloading stock.'''
+    context_reason = context_rejection_reason(candidate, context.article_context)
     if context_reason:
         return context_reason
+    policy = context.license_policy
     license_valid, _reason = policy.validate(candidate)
     if not license_valid:
         return "license_rejected"
@@ -156,11 +161,20 @@ def create_rescue_context(
     article_context: dict | None = None,
 ) -> StockRescueContext:
     """Check every observed candidate independently of its relevance score."""
+    retained_context = image_article_context(article_context or {})
+    if STOCK_IMAGE_SUBJECT_MODE != 'off':
+        lead = subject_article_lead(article_context or {})
+        if lead:
+            retained_context['lead'] = lead
     context = StockRescueContext(
         provider_precedence=provider_precedence, downloader=downloader,
         license_policy=license_policy, article_correlation_id=article_correlation_id,
         local_usage=list(local_usage),
-        article_context=image_article_context(article_context or {}),
+        article_context=retained_context,
+    )
+    subject_rejected = rejected_subject_assets(
+        candidates, retained_context, mode=STOCK_IMAGE_SUBJECT_MODE, route='rescue',
+        correlation=article_correlation_id,
     )
     parents = list(range(len(candidates)))
 
@@ -186,7 +200,9 @@ def create_rescue_context(
             group_reuse[root] = "wordpress_history_reuse"
     for index, candidate in enumerate(candidates):
         try:
-            hard_reason = _hard_safety_reason(candidate, license_policy, context.article_context)
+            hard_reason = 'context_mismatch' if candidate.asset_key in subject_rejected else ''
+            if not hard_reason:
+                hard_reason = _hard_safety_reason(candidate, context)
         except Exception:
             hard_reason = "required_fields"
         if hard_reason:
@@ -350,7 +366,10 @@ def rescue_images(
         candidate = entry.candidate
         key = transport_key(candidate)
         try:
-            reason = _hard_safety_reason(candidate, context.license_policy, context.article_context)
+            reason = _hard_safety_reason(candidate, context) or subject_rejection_reason(
+                candidate, context.article_context, mode=STOCK_IMAGE_SUBJECT_MODE,
+                route='rescue', correlation=context.article_correlation_id,
+            )
         except Exception:
             reason = "required_fields"
         if reason:

@@ -65,6 +65,7 @@ class PixabayProvider(ImageSearchProvider):
         creator_url = ""
         if creator and raw.get("user_id"):
             creator_url = f"https://pixabay.com/users/{creator}-{raw['user_id']}/"
+        tags = raw.get('tags')
         metadata_text = " ".join(str(raw.get(key) or "") for key in ("tags", "pageURL", "user"))
         return ImageCandidate(
             provider=self.provider_name,
@@ -88,4 +89,5 @@ class PixabayProvider(ImageSearchProvider):
                 "downloads": raw.get("downloads"),
                 "likes": raw.get("likes"),
             },
+            subject_text=tags if isinstance(tags, str) else '',
         )

@@ -331,6 +331,12 @@ class WikimediaProvider(ImageSearchProvider):
         parts = [_text(title)]
         parts.extend(f"{name}: {value}." for name, value in (("Artist", artist), ("Credit", credit), ("Attribution", custom)) if value)
         parts.extend((f"Source: {source_page}.", f"License: {label} {license_version} ({license_url})."))
+        subject_fields = (metadata.get(key) for key in ('ObjectName', 'ImageDescription'))
+        subject_text = ' '.join(
+            _text(field['value'], preserve_links=False)[:4000]
+            for field in subject_fields
+            if isinstance(field, dict) and isinstance(field.get('value'), str)
+        ).strip()
         return ImageCandidate(
             provider=self.provider_name, asset_id=str(pageid), asset_key=f"wikimedia:{pageid}",
             image_url=image_url, source_page_url=source_page, canonical_source=canonical,
@@ -346,4 +352,5 @@ class WikimediaProvider(ImageSearchProvider):
                 "attribution_notice": custom,
                 "attribution_authoritative": False,
             },
+            subject_text=subject_text,
         )
