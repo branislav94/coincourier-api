@@ -226,7 +226,8 @@ class OpenverseProvider(ImageSearchProvider):
             license_name = "cc-by"
         license_version = str(raw.get("license_version") or "")
         license_url = str(raw.get("license_url") or "")
-        title = str(raw.get("title") or "Untitled work").strip()
+        raw_title = raw.get('title')
+        title = str(raw_title or "Untitled work").strip()
         raw_attribution = str(raw.get("attribution") or "").strip()
         authoritative_complete = _authoritative_attribution_is_complete(
             raw_attribution,
@@ -270,6 +271,12 @@ class OpenverseProvider(ImageSearchProvider):
             canonical_source = commons_source
         else:
             identity_aliases = []
+        subject_parts = [raw_title.strip()] if isinstance(raw_title, str) and raw_title.strip() else []
+        if isinstance(tags, list):
+            for tag in tags:
+                name = tag.get('name') if isinstance(tag, dict) else tag
+                if isinstance(name, str) and name.strip():
+                    subject_parts.append(name.strip())
         return ImageCandidate(
             provider=self.provider_name,
             asset_id=asset_id,
@@ -299,4 +306,5 @@ class OpenverseProvider(ImageSearchProvider):
                 "attribution_authoritative": authoritative_complete,
                 "attribution_complete": bool(authoritative_complete or (attribution and can_generate_attribution)),
             },
+            subject_text=' '.join(subject_parts),
         )

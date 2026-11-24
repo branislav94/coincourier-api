@@ -138,6 +138,46 @@ DEV verification must finish before any production consideration. **Stop after
 DEV verification** and return the evidence for review. DevOps owns `dev -> main`
 and production deployment; this procedure does not authorize either action.
 
+## Stock-image subject validation in DEV
+
+Luka deploys the reviewed `dev` revision to `getnewsapi-dev` with
+`STOCK_IMAGE_SUBJECT_MODE=shadow` in its Dokploy runtime environment. Keep the
+current stock engine, providers, limits, fallback settings and storage. Record the
+deployed SHA, image digest and UTC start time. Shadow assesses already fetched
+candidates and preserves the current selection and fallback behavior.
+
+1. Collect 50 consecutive distinct articles that reach stock selection after
+   restart. Count each once using the `article` correlation ID in `[IMG] stock`
+   (V1) or `[IMG-V2] image` (V2). Keep zero-result searches, failures, rescue and
+   generation outcomes in the cohort. Use the same existing jobs and schedules.
+2. For each article, review `[IMG-SUBJECT]` `decision=would_reject` records.
+   Group them by `article`, `provider`, `asset_id` and `route`. Compare the
+   candidate image and its descriptive provider metadata with the headline and
+   lead. Record false rejections, the reason for each, and whether the candidate
+   would have been selected under the baseline. A rescue pool assessment can be
+   logged before any actual rescue download. A candidate rejected by existing
+   context, licensing or other checks does not represent an additional loss.
+3. Join V1 `stock_terminal` or V2 `terminal` and `image_terminal` with rescue
+   logs, final upload and publication outcomes. Capture the selected asset and
+   source, images missing after upload/publication, provider failures, stock
+   fallback, emergency rescue, and generated image use. Check remaining eligible
+   stock candidates when a would-reject record matches the selected asset.
+   Record uncertainty if logs cannot establish which alternative would succeed.
+4. Review the 50-article counts and examples before setting `enforce`. Resolve
+   false rejections and review any expected increase in missing images or
+   generation with the application team. If approved, set
+   `STOCK_IMAGE_SUBJECT_MODE=enforce`, restart DEV, and compare the same outcome
+   fields. Roll back the new rule by setting `STOCK_IMAGE_SUBJECT_MODE=off` and
+   restarting DEV. Existing context checks and persisted usage remain active.
+
+```text
+[IMG-SUBJECT] article=2740f81654ac provider=pexels asset_id=18659 route=strict mode=shadow decision=would_reject article_subject=xrp image_subject=bitcoin reason=asset_mismatch
+```
+
+WP IDs in offline fixtures refer to visual audit examples. The fixtures
+reconstruct provider descriptions. Images with sparse or misleading metadata
+can remain eligible, so review the actual image alongside the decision logs.
+
 ## Environment Types
 
 | Environment | Execution | Services | Intended use |

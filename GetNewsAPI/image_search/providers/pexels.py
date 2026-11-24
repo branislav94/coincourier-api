@@ -57,6 +57,7 @@ class PexelsProvider(ImageSearchProvider):
         creator = str(raw.get("photographer") or "")
         if not image_url or not source_page:
             return None
+        alt = raw.get('alt')
         metadata_text = " ".join(str(raw.get(key) or "") for key in ("alt", "url", "photographer"))
         return ImageCandidate(
             provider=self.provider_name,
@@ -75,4 +76,5 @@ class PexelsProvider(ImageSearchProvider):
             provider_rank=provider_rank,
             provider_threshold=self.candidate_threshold,
             metadata={"metadata_text": metadata_text, "liked": bool(raw.get("liked"))},
+            subject_text=alt if isinstance(alt, str) else '',
         )

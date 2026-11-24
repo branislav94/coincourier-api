@@ -1,6 +1,5 @@
 from __future__ import annotations
 
-import hashlib
 import logging
 from collections import Counter
 from concurrent.futures import ThreadPoolExecutor, as_completed
@@ -15,6 +14,7 @@ from config import (
     IMAGE_LICENSE_ALLOWLIST,
     IMAGE_MIN_HEIGHT,
     IMAGE_MIN_WIDTH,
+    STOCK_IMAGE_SUBJECT_MODE,
 )
 
 from .downloader import ImageDownloadError, ImageDownloader, perceptual_hash_distance
@@ -38,6 +38,7 @@ from .reuse import (
 )
 from .scoring import rank_candidates, score_candidate
 from .context import context_rejection_reason
+from .subject_policy import article_correlation_id, rejected_subject_assets
 
 
 logger = logging.getLogger(__name__)
@@ -190,10 +191,12 @@ def search_images(
 ) -> ImageSearchResult:
     provider_list = list(providers) if providers is not None else build_provider_registry()
     provider_names = tuple(provider.provider_name for provider in provider_list)
-    stable_field = article.get("id") or article.get("news_url") or article.get("url") or article.get("title") or "unknown"
-    correlation = hashlib.sha256(str(stable_field).encode("utf-8")).hexdigest()[:12]
+    correlation = article_correlation_id(article)
     queries = build_image_queries(article)
-    logger.info("[IMG-V2] image article=%s queries=%s providers=%s", correlation, queries, provider_names)
+    logger.info(
+        '[IMG-V2] image article=%s queries=%s providers=%s subject_mode=%s',
+        correlation, queries, provider_names, STOCK_IMAGE_SUBJECT_MODE,
+    )
     failures: dict[str, str] = {}
     collected: dict[str, list[ImageCandidate]] = {}
     provider_stats = {
@@ -240,13 +243,17 @@ def search_images(
     wp_entries = load_recent_wp_image_usage() if recent_wp_usage is None and provider_list else (recent_wp_usage or [])
     rejection_counts: Counter[str] = Counter()
     ordered: list[ImageCandidate] = []
+    observed = [candidate for name in provider_names for candidate in collected.get(name, [])]
+    subject_rejected = rejected_subject_assets(
+        observed, article, mode=STOCK_IMAGE_SUBJECT_MODE, route='strict', correlation=correlation,
+    )
     for provider_name in provider_names:
         accepted: list[ImageCandidate] = []
         for candidate in collected.get(provider_name, []):
             score_candidate(candidate, article)
             context_reason = context_rejection_reason(candidate, article)
-            if context_reason:
-                _reject(candidate, context_reason, rejection_counts, provider_stats, correlation)
+            if context_reason or candidate.asset_key in subject_rejected:
+                _reject(candidate, context_reason or 'context_mismatch', rejection_counts, provider_stats, correlation)
                 continue
             reason = ""
             if candidate.final_score < candidate.provider_threshold:
@@ -274,12 +281,10 @@ def search_images(
         # Provider precedence is stronger than any cross-provider score difference.
         ordered.extend(rank_candidates(accepted))
 
-    groups = _group_ranked_candidates(
-        ordered, [candidate for name in provider_names for candidate in collected.get(name, [])],
-    )
+    groups = _group_ranked_candidates(ordered, observed)
     image_downloader = downloader or ImageDownloader()
     rescue_context = create_rescue_context(
-        [candidate for name in provider_names for candidate in collected.get(name, [])],
+        observed,
         provider_precedence=provider_names, downloader=image_downloader, license_policy=policy,
         local_usage=local_entries, recent_wp_usage=wp_entries, article_correlation_id=correlation,
         article_context=article,

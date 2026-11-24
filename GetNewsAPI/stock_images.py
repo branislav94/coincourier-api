@@ -28,10 +28,12 @@ from config import (
     STOCK_IMAGE_CACHE_HOURS,
     STOCK_IMAGE_REUSE_CHECK_WP_HISTORY,
     STOCK_IMAGE_REUSE_WINDOW_DAYS,
+    STOCK_IMAGE_SUBJECT_MODE,
     STOCK_IMAGE_TIMEOUT_SECONDS,
     STOCK_IMAGE_USAGE_PATH,
     WP_DB_CONFIG,
 )
+from image_search.subject_policy import article_correlation_id, rejected_subject_assets
 
 
 logger = logging.getLogger(__name__)
@@ -123,6 +125,7 @@ class StockImageCandidate:
     asset_key: str = ""
     metadata_text: str = ""
     score_parts: dict[str, float] = field(default_factory=dict)
+    subject_text: str = ''
 
     def __post_init__(self) -> None:
         if self.asset_key:
@@ -132,6 +135,11 @@ class StockImageCandidate:
             return
         image_hash = hashlib.sha256((self.image_url or self.credit_url or "").encode("utf-8")).hexdigest()
         self.asset_key = f"{self.provider}:url:{image_hash}"
+
+    @property
+    def asset_id(self) -> str:
+        '''Return the identifier used by this stock provider.'''
+        return self.provider_asset_id
 
     @property
     def credit_text(self) -> str:
@@ -565,6 +573,7 @@ def _pexels_candidates(query: str, article: dict[str, Any]) -> list[StockImageCa
         metadata_text = " ".join(
             str(photo.get(key) or "") for key in ("alt", "url", "photographer")
         )
+        subject_text = photo.get('alt')
         score, parts = _score_candidate(
             "pexels",
             query,
@@ -588,6 +597,7 @@ def _pexels_candidates(query: str, article: dict[str, Any]) -> list[StockImageCa
                 provider_asset_id=str(photo.get("id") or ""),
                 metadata_text=metadata_text,
                 score_parts=parts,
+                subject_text=subject_text if isinstance(subject_text, str) else '',
             )
         )
     return candidates
@@ -620,6 +630,7 @@ def _pixabay_candidates(query: str, article: dict[str, Any]) -> list[StockImageC
         metadata_text = " ".join(
             str(hit.get(key) or "") for key in ("tags", "pageURL", "user")
         )
+        subject_text = hit.get('tags')
         score, parts = _score_candidate(
             "pixabay",
             query,
@@ -643,6 +654,7 @@ def _pixabay_candidates(query: str, article: dict[str, Any]) -> list[StockImageC
                 provider_asset_id=str(hit.get("id") or ""),
                 metadata_text=metadata_text,
                 score_parts=parts,
+                subject_text=subject_text if isinstance(subject_text, str) else '',
             )
         )
     return candidates
@@ -655,16 +667,23 @@ def _best_for_provider(
     *,
     local_usage: list[dict[str, Any]],
     recent_wp_usage: list[dict[str, Any]],
+    correlation: str,
 ) -> StockImageCandidate | None:
     search_fn = _pexels_candidates if provider == "pexels" else _pixabay_candidates
     best: StockImageCandidate | None = None
+    subject_rejected: set[str] = set()
 
     for query in queries[:3]:
         candidates = sorted(search_fn(query, article), key=lambda c: c.score, reverse=True)
         if not candidates:
             logger.info("[IMG] %s returned no stock candidates query=%r", provider, query)
             continue
+        subject_rejected.update(rejected_subject_assets(
+            candidates, article, mode=STOCK_IMAGE_SUBJECT_MODE, route='legacy', correlation=correlation,
+        ))
         for candidate in candidates:
+            if candidate.asset_key in subject_rejected:
+                continue
             if not best or candidate.score > best.score:
                 best = candidate
             if candidate.score < candidate.threshold:
@@ -744,7 +763,8 @@ def find_stock_image(
     providers: tuple[str, ...] = ("pexels", "pixabay"),
 ) -> StockImageCandidate | None:
     queries = build_stock_queries(article)
-    logger.info("[IMG] stock queries=%s", queries)
+    correlation = article_correlation_id(article)
+    logger.info('[IMG] stock article=%s queries=%s subject_mode=%s', correlation, queries, STOCK_IMAGE_SUBJECT_MODE)
     local_usage = load_stock_image_usage()
     recent_wp_usage = load_recent_wp_stock_usage()
     for provider in providers:
@@ -754,6 +774,7 @@ def find_stock_image(
             queries,
             local_usage=local_usage,
             recent_wp_usage=recent_wp_usage,
+            correlation=correlation,
         )
         if candidate:
             return candidate

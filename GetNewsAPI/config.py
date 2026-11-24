@@ -189,6 +189,10 @@ IMAGE_SEARCH_ENGINE = os.getenv("IMAGE_SEARCH_ENGINE", "v1").strip().lower()
 if IMAGE_SEARCH_ENGINE not in {"v1", "v2"}:
     raise ValueError("IMAGE_SEARCH_ENGINE must be v1 or v2")
 
+STOCK_IMAGE_SUBJECT_MODE = os.getenv('STOCK_IMAGE_SUBJECT_MODE', 'shadow').strip().lower()
+if STOCK_IMAGE_SUBJECT_MODE not in {'off', 'shadow', 'enforce'}:
+    raise ValueError('STOCK_IMAGE_SUBJECT_MODE must be off, shadow, or enforce')
+
 IMAGE_SEARCH_PROVIDERS = tuple(
     provider.strip().lower()
     for provider in os.getenv(

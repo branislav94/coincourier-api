@@ -38,6 +38,8 @@ class ImageCandidate:
     perceptual_hash: str = ""
     metadata: dict[str, Any] = field(default_factory=dict)
     identity_aliases: list[str] = field(default_factory=list)
+    # Provider-supplied descriptions of the image, separate from ranking metadata.
+    subject_text: str = ''
 
     def __post_init__(self) -> None:
         self.provider = (self.provider or "").strip().lower()
