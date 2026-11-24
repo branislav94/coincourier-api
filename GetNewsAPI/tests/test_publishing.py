@@ -71,9 +71,24 @@ PUBLIC_BRAND_URLS = {
 
 
 def load_referrals(values: dict[str, str]) -> dict[str, str]:
-    '''Load synthetic optional settings through the publisher's configuration lookup.'''
-    with patch.object(publisher.os, 'getenv', side_effect=values.get):
-        return publisher._load_market_referral_urls()
+    '''Load synthetic settings, including invalid values an OS cannot store.'''
+    return publisher._load_market_referral_urls(values)
+
+
+def load_publisher(values: dict[str, str]) -> types.ModuleType:
+    '''Import a fresh publisher under synthetic startup settings.'''
+    spec = importlib.util.spec_from_file_location(
+        'publishing.wordpress.referral_import_test', publisher.__file__,
+    )
+    assert spec is not None and spec.loader is not None
+    module = importlib.util.module_from_spec(spec)
+    environment = {
+        key: value for key, value in os.environ.items()
+        if not key.startswith(('REFERRAL_URL_', 'REFERRAL_NAME_'))
+    }
+    with patch.dict(os.environ, environment | values, clear=True):
+        spec.loader.exec_module(module)
+    return module
 
 
 def context_connection(*, rows=None, first=None):
@@ -123,17 +138,12 @@ class AnchorLabels(HTMLParser):
 class ReferralConfigurationTests(unittest.TestCase):
     def test_normal_publisher_import_loads_environment_once(self) -> None:
         name = 'publishing.wordpress.referral_import_test'
-        spec = importlib.util.spec_from_file_location(name, publisher.__file__)
-        self.assertIsNotNone(spec)
-        assert spec is not None and spec.loader is not None
-        module = importlib.util.module_from_spec(spec)
         referral = 'https://partner.example.invalid/join?ref=cc&campaign=test#terms'
-        defaults = {key: '' for _url, key in publisher.MARKET_LINK_SETTINGS.values()}
-        with patch.dict(os.environ, defaults | {
-            'REFERRAL_URL_BINANCE': referral,
-            'REFERRAL_URL_COINDESK': 'http://partner.example.invalid/private-code',
-        }), self.assertLogs(name, level='WARNING') as logs:
-            spec.loader.exec_module(module)
+        with self.assertLogs(name, level='WARNING') as logs:
+            module = load_publisher({
+                'REFERRAL_URL_BINANCE': referral,
+                'REFERRAL_URL_COINDESK': 'http://partner.example.invalid/private-code',
+            })
         self.assertEqual(module.MARKET_REFERRAL_URLS, {'Binance': referral})
         self.assertEqual(len(logs.output), 1)
         self.assertIn('key=REFERRAL_URL_COINDESK reason=', logs.output[0])
@@ -696,24 +706,24 @@ class WordPressPublisherTests(unittest.TestCase):
         self.article = PublicationArticle.from_mapping(ARTICLE_ROW)
         self.context = PublicationContext(published_at_utc=PUBLISHED_AT, creation_is_fresh=True)
 
-    def publish_with_mocks(self, *, image=None, post_response=None, events=None):
+    def publish_with_mocks(self, *, image=None, post_response=None, events=None, publisher_module=publisher):
         post_response = post_response or response(body={"id": 101})
         wp_connection = MagicMock()
         wp_connection.__enter__.return_value = wp_connection
         wp_connection.__exit__.return_value = False
         event_log = [] if events is None else events
         patches = [
-            patch.object(publisher, "ensure_category", side_effect=[21, 22]),
-            patch.object(publisher, "ensure_term", side_effect=[31, 32]),
-            patch.object(publisher.session, "post", return_value=post_response),
-            patch.object(publisher.mysql.connector, "connect", return_value=wp_connection),
+            patch.object(publisher_module, "ensure_category", side_effect=[21, 22]),
+            patch.object(publisher_module, "ensure_term", side_effect=[31, 32]),
+            patch.object(publisher_module.session, "post", return_value=post_response),
+            patch.object(publisher_module.mysql.connector, "connect", return_value=wp_connection),
             patch.object(
-                publisher,
+                publisher_module,
                 "record_image_usage",
                 side_effect=lambda *_args: event_log.append("usage"),
             ),
             patch.object(
-                publisher,
+                publisher_module,
                 "write_yoast_metadata",
                 side_effect=lambda *_args, **_kwargs: event_log.append("yoast"),
             ),
@@ -721,12 +731,121 @@ class WordPressPublisherTests(unittest.TestCase):
         mocks = [item.start() for item in patches]
         self.addCleanup(lambda: [item.stop() for item in reversed(patches)])
         with patch("builtins.print"):
-            result = publisher.WordPressPublisher().publish(
+            result = publisher_module.WordPressPublisher().publish(
                 self.article,
                 image,
                 self.context,
             )
         return result, mocks, wp_connection, event_log
+
+    def publish_referral_html(self, html: str, module: types.ModuleType, *, category: str = 'Bitcoin') -> str:
+        '''Capture the HTML sent to WordPress by a freshly configured publisher.'''
+        self.article = PublicationArticle.from_mapping({
+            **ARTICLE_ROW, 'category': category, 'schema_jsonld': None, 'full_text': html,
+        })
+        result, mocks, _connection, _events = self.publish_with_mocks(publisher_module=module)
+        self.assertTrue(result.success)
+        return mocks[2].call_args.kwargs['json']['content']
+
+    def test_custom_id_links_the_one_line_example_and_stops_after_removal(self) -> None:
+        url = 'https://example.com/?ref=coincourier-dev'
+        module = load_publisher({'REFERRAL_URL_COINMARKETTEST': url})
+        one_line = '<p>CoinMarketTest trades increased</p>'
+        link = f'<a href="{url}" target="_blank" rel="noopener sponsored">CoinMarketTest</a>'
+        self.assertEqual(
+            self.publish_referral_html(one_line, module),
+            f'<p>{link} trades increased</p>',
+        )
+        self.assertEqual(
+            self.publish_referral_html(one_line, load_publisher({})),
+            one_line,
+        )
+
+        citation = '<a href="https://source.example/report"><em>CoinMarketTest</em> report</a>'
+        original = (
+            f'<p>{citation}. coinmarkettest and CoinMarketTestPro. Binance and binance.</p>'
+        )
+        content = self.publish_referral_html(original, module)
+        self.assertEqual(content, (
+            f'<p>{citation}. {link.replace("CoinMarketTest", "coinmarkettest")} and CoinMarketTestPro. '
+            '<a href="https://www.binance.com" target="_blank" rel="noopener">Binance</a> and binance.</p>'
+        ))
+        self.assertEqual(self.publish_referral_html(content, module), content)
+        self.assertEqual(self.publish_referral_html(content, load_publisher({})), content)
+
+    def test_custom_literal_names_prefer_longer_overlapping_matches(self) -> None:
+        module = load_publisher({
+            'REFERRAL_URL_ACME': 'https://example.com/short',
+            'REFERRAL_NAME_ACME': 'Acme Markets',
+            'REFERRAL_URL_LONG': 'https://example.com/long',
+            'REFERRAL_NAME_LONG': 'Acme Markets Ltd',
+            'REFERRAL_URL_INTERNATIONAL': 'https://example.com/shifted',
+            'REFERRAL_NAME_INTERNATIONAL': 'Markets International',
+            'REFERRAL_URL_PUNCT': 'https://example.com/join?ref=a&campaign=b#terms',
+            'REFERRAL_NAME_PUNCT': 'Acme & Markets C++',
+        })
+        original = (
+            '<p>Acme Markets Ltd; Acme Markets International; Acme &amp; Markets C++; '
+            'acme markets; Acme Marketswide.</p>'
+            '<p hidden>Acme Markets</p><p title="Acme Markets">Ordinary text.</p>'
+        )
+        content = self.publish_referral_html(original, module)
+        parsed = AnchorLabels()
+        parsed.feed(content)
+        self.assertEqual(
+            [(attrs['href'], ''.join(label)) for attrs, label in parsed.anchors],
+            [
+                ('https://example.com/long', 'Acme Markets Ltd'),
+                ('https://example.com/shifted', 'Markets International'),
+                ('https://example.com/join?ref=a&campaign=b#terms', 'Acme & Markets C++'),
+            ],
+        )
+        self.assertIn('>Acme &amp; Markets C++</a>', content)
+        self.assertIn('<p hidden>Acme Markets</p><p title="Acme Markets">Ordinary text.</p>', content)
+        self.assertEqual(self.publish_referral_html(content, module), content)
+
+    def test_invalid_custom_url_keeps_plain_text_and_builtin_name_is_reserved(self) -> None:
+        with self.assertLogs('publishing.wordpress.referral_import_test', level='WARNING') as logs:
+            module = load_publisher({
+                'REFERRAL_NAME_ACME': 'Acme Markets',
+                'REFERRAL_URL_ACME': 'http://example.com/private-code',
+                'REFERRAL_NAME_OTHER': 'binance',
+                'REFERRAL_URL_OTHER': 'https://example.com/join',
+                'REFERRAL_NAME_BINANCE': 'Renamed',
+                'REFERRAL_NAME_UNUSED': 'Name Only',
+            })
+        self.assertEqual(len(logs.output), 2)
+        self.assertIn('key=REFERRAL_URL_ACME reason=absolute_https_required decision=plain_text', logs.output[0])
+        self.assertIn('key=REFERRAL_URL_OTHER reason=name_conflict decision=plain_text', logs.output[1])
+        self.assertNotIn('private-code', ''.join(logs.output))
+        content = self.publish_referral_html('<p>Acme Markets and Name Only. binance and Binance.</p>', module)
+        self.assertEqual(content, (
+            '<p>Acme Markets and Name Only. binance and '
+            '<a href="https://www.binance.com" target="_blank" rel="noopener">Binance</a>.</p>'
+        ))
+
+    def test_category_takes_precedence_over_custom_brand_match(self) -> None:
+        module = load_publisher({'REFERRAL_URL_COINMARKETTEST': 'https://example.com/join'})
+        original = '<p>CoinMarketTest and CoinMarketTest.</p>'
+        content = self.publish_referral_html(original, module, category='CoinMarketTest')
+        self.assertEqual(content, (
+            '<p><a href="/category/coinmarkettest/">CoinMarketTest</a> and '
+            '<a href="https://example.com/join" target="_blank" rel="noopener sponsored">CoinMarketTest</a>.</p>'
+        ))
+        self.assertEqual(self.publish_referral_html(content, module, category='CoinMarketTest'), content)
+
+    def test_new_anchors_do_not_create_custom_word_boundaries_on_repeat(self) -> None:
+        module = load_publisher({
+            'REFERRAL_URL_CPP': 'https://example.com/cpp',
+            'REFERRAL_NAME_CPP': 'C++',
+            'REFERRAL_URL_MARKETTEST': 'https://example.com/market',
+        })
+        content = self.publish_referral_html('<p>C++Binance and CoinMarketTest.</p>', module, category='Coin')
+        self.assertEqual(content, (
+            '<p>C++<a href="https://www.binance.com" target="_blank" rel="noopener">Binance</a> and '
+            '<a href="/category/coin/">Coin</a>MarketTest.</p>'
+        ))
+        self.assertEqual(self.publish_referral_html(content, module, category='Coin'), content)
 
     def test_wordpress_post_payload_remains_equivalent(self):
         image = PublicationImage(external_id=77, metadata={"provider": "openverse"})
