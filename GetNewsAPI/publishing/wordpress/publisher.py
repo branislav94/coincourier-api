@@ -1,4 +1,6 @@
 import base64
+from html import escape
+import ipaddress
 import logging
 import os
 from datetime import datetime
@@ -12,6 +14,7 @@ from openai import OpenAI
 import hashlib, random
 from datetime import datetime, timedelta, timezone
 from typing import Any
+import unicodedata
 from dataclasses import replace
 from urllib.parse import urlsplit
 from config import (
@@ -142,20 +145,78 @@ PALETTES_NEUTRAL = [
 ]
 
 
-MARKET_LINKS = {
-    "Binance":        "https://www.binance.com",
-    "OKX":            "https://www.okx.com",
-    "Coinbase":       "https://www.coinbase.com",
-    "Kraken":         "https://www.kraken.com",
-    "Bitfinex":       "https://www.bitfinex.com",
-    "KuCoin":         "https://www.kucoin.com",
-    "Huobi":          "https://www.huobi.com",
-    "Bitstamp":       "https://www.bitstamp.net",
-    "Gemini":         "https://www.gemini.com",
-    "Bybit":          "https://www.bybit.com",
-    "Crypto.com":     "https://crypto.com/exchange",
-    "Gate.io":        "https://www.gate.io",
+MARKET_LINK_SETTINGS = {
+    'Binance': ('https://www.binance.com', 'REFERRAL_URL_BINANCE'),
+    'OKX': ('https://www.okx.com', 'REFERRAL_URL_OKX'),
+    'Coinbase': ('https://www.coinbase.com', 'REFERRAL_URL_COINBASE'),
+    'Kraken': ('https://www.kraken.com', 'REFERRAL_URL_KRAKEN'),
+    'Bitfinex': ('https://www.bitfinex.com', 'REFERRAL_URL_BITFINEX'),
+    'KuCoin': ('https://www.kucoin.com', 'REFERRAL_URL_KUCOIN'),
+    'Huobi': ('https://www.huobi.com', 'REFERRAL_URL_HUOBI'),
+    'Bitstamp': ('https://www.bitstamp.net', 'REFERRAL_URL_BITSTAMP'),
+    'Gemini': ('https://www.gemini.com', 'REFERRAL_URL_GEMINI'),
+    'Bybit': ('https://www.bybit.com', 'REFERRAL_URL_BYBIT'),
+    'Crypto.com': ('https://crypto.com/exchange', 'REFERRAL_URL_CRYPTO_COM'),
+    'Gate.io': ('https://www.gate.io', 'REFERRAL_URL_GATE_IO'),
+    'CoinDesk': ('https://www.coindesk.com/', 'REFERRAL_URL_COINDESK'),
 }
+
+
+def _referral_url_error(value: str) -> str | None:
+    '''Validate a destination without normalizing its referral data or logging it.'''
+    if any(unicodedata.category(character) in {'Cc', 'Cf', 'Cs'} for character in value):
+        return 'control_characters'
+    if any(character.isspace() for character in value):
+        return 'whitespace'
+    if any(character in value for character in '\\<>"`') or re.search(r'%(?![0-9a-fA-F]{2})', value):
+        return 'invalid_url'
+    try:
+        parts = urlsplit(value)
+        if parts.scheme.lower() != 'https' or not parts.netloc:
+            return 'absolute_https_required'
+        if parts.username is not None or parts.password is not None:
+            return 'credentials_not_allowed'
+        if parts.port is not None and not 1 <= parts.port <= 65535:
+            return 'invalid_port'
+        host = parts.hostname or ''
+    except ValueError:
+        return 'invalid_url'
+    if not host or '%' in host:
+        return 'invalid_host'
+    try:
+        ipaddress.ip_address(host)
+    except ValueError:
+        if ':' in host or re.fullmatch(r'[0-9.]+', host):
+            return 'invalid_host'
+        try:
+            ascii_host = host.removesuffix('.').encode('idna').decode('ascii')
+        except UnicodeError:
+            return 'invalid_host'
+        if len(ascii_host) > 253 or not all(
+            re.fullmatch(r'[a-zA-Z0-9](?:[a-zA-Z0-9-]{0,61}[a-zA-Z0-9])?', label)
+            for label in ascii_host.split('.')
+        ):
+            return 'invalid_host'
+    return None
+
+
+def _load_market_referral_urls() -> dict[str, str]:
+    '''Read optional overrides once; a bad brand setting never blocks publishing.'''
+    referrals: dict[str, str] = {}
+    for name, (_fallback, key) in MARKET_LINK_SETTINGS.items():
+        value = os.getenv(key)
+        if not value or not value.strip():
+            continue
+        reason = _referral_url_error(value)
+        if reason:
+            logger.warning('[WP-REFERRAL] key=%s reason=%s decision=public_fallback', key, reason)
+        else:
+            referrals[name] = value
+    return referrals
+
+
+MARKET_LINKS = {name: fallback for name, (fallback, _key) in MARKET_LINK_SETTINGS.items()}
+MARKET_REFERRAL_URLS = _load_market_referral_urls()
 
 IMG_MODEL   = OPENAI_IMAGE_MODEL
 IMG_SIZE    = os.getenv("IMAGE_SIZE", "1024x1024")   # input square
@@ -1807,9 +1868,11 @@ def link_markets(text: str, *, primary_category: str | None = None) -> str:
             if category_start >= 0 and match.start() < category_end and match.end() > category_start:
                 continue
             name = match.group()
+            destination = MARKET_REFERRAL_URLS.get(name, MARKET_LINKS[name])
+            rel = 'noopener sponsored' if name in MARKET_REFERRAL_URLS else 'noopener'
             replacements.append((
                 start + match.start(), start + match.end(),
-                f'<a href="{MARKET_LINKS[name]}" target="_blank" rel="noopener">{name}</a>',
+                f'<a href="{escape(destination, quote=True)}" target="_blank" rel="{rel}">{name}</a>',
             ))
     for start, end, replacement in sorted(replacements, reverse=True):
         text = text[:start] + replacement + text[end:]

@@ -36,6 +36,11 @@ import tasks
 
 
 class EnvironmentIsolationTests(unittest.TestCase):
+    def test_ambient_referral_urls_cannot_override_test_isolation(self) -> None:
+        with patch.dict(os.environ, {'REFERRAL_URL_BINANCE': 'https://partner.example.invalid/private'}):
+            install_test_environment()
+            self.assertNotIn('REFERRAL_URL_BINANCE', os.environ)
+
     def test_ambient_editorial_modes_cannot_override_test_isolation(self):
         with patch.dict(os.environ, {
             "DUPLICATE_ENFORCE_MODE": "emforce",

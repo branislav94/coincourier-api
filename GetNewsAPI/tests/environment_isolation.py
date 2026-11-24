@@ -97,6 +97,9 @@ def install_test_environment() -> None:
     """Override connectivity settings and prevent dotenv reads in this test process."""
 
     os.environ.update(SAFE_TEST_ENVIRONMENT)
+    for name in tuple(os.environ):
+        if name.startswith('REFERRAL_URL_'):
+            os.environ.pop(name, None)
     os.environ.pop("DUPLICATE_ENFORCE_MODE", None)
     dotenv.load_dotenv = _disabled_test_dotenv
 

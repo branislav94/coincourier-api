@@ -3,6 +3,7 @@ from __future__ import annotations
 import base64
 import importlib.util
 import inspect
+import os
 import sys
 import types
 import unittest
@@ -52,6 +53,28 @@ ARTICLE_ROW = {
 }
 PUBLISHED_AT = datetime(2026, 8, 31, 12, 34, 56, tzinfo=timezone.utc)
 
+PUBLIC_BRAND_URLS = {
+    'Binance': 'https://www.binance.com',
+    'OKX': 'https://www.okx.com',
+    'Coinbase': 'https://www.coinbase.com',
+    'Kraken': 'https://www.kraken.com',
+    'Bitfinex': 'https://www.bitfinex.com',
+    'KuCoin': 'https://www.kucoin.com',
+    'Huobi': 'https://www.huobi.com',
+    'Bitstamp': 'https://www.bitstamp.net',
+    'Gemini': 'https://www.gemini.com',
+    'Bybit': 'https://www.bybit.com',
+    'Crypto.com': 'https://crypto.com/exchange',
+    'Gate.io': 'https://www.gate.io',
+    'CoinDesk': 'https://www.coindesk.com/',
+}
+
+
+def load_referrals(values: dict[str, str]) -> dict[str, str]:
+    '''Load synthetic optional settings through the publisher's configuration lookup.'''
+    with patch.object(publisher.os, 'getenv', side_effect=values.get):
+        return publisher._load_market_referral_urls()
+
 
 def context_connection(*, rows=None, first=None):
     connection = MagicMock()
@@ -95,6 +118,111 @@ class AnchorLabels(HTMLParser):
     def handle_data(self, data: str) -> None:
         if self.active is not None:
             self.active.append(data)
+
+
+class ReferralConfigurationTests(unittest.TestCase):
+    def test_normal_publisher_import_loads_environment_once(self) -> None:
+        name = 'publishing.wordpress.referral_import_test'
+        spec = importlib.util.spec_from_file_location(name, publisher.__file__)
+        self.assertIsNotNone(spec)
+        assert spec is not None and spec.loader is not None
+        module = importlib.util.module_from_spec(spec)
+        referral = 'https://partner.example.invalid/join?ref=cc&campaign=test#terms'
+        defaults = {key: '' for _url, key in publisher.MARKET_LINK_SETTINGS.values()}
+        with patch.dict(os.environ, defaults | {
+            'REFERRAL_URL_BINANCE': referral,
+            'REFERRAL_URL_COINDESK': 'http://partner.example.invalid/private-code',
+        }), self.assertLogs(name, level='WARNING') as logs:
+            spec.loader.exec_module(module)
+        self.assertEqual(module.MARKET_REFERRAL_URLS, {'Binance': referral})
+        self.assertEqual(len(logs.output), 1)
+        self.assertIn('key=REFERRAL_URL_COINDESK reason=', logs.output[0])
+        self.assertNotIn('private-code', logs.output[0])
+        with (
+            patch.dict(os.environ, {'REFERRAL_URL_BINANCE': 'https://changed.example.invalid/'}),
+            patch.object(module.logger, 'warning') as warning,
+        ):
+            content = module.link_markets('<p>Binance and CoinDesk.</p>')
+            self.assertEqual(module.link_markets(content), content)
+        warning.assert_not_called()
+        parsed = AnchorLabels()
+        parsed.feed(content)
+        self.assertEqual(
+            [(attrs.get('href'), attrs.get('rel')) for attrs, _label in parsed.anchors],
+            [(referral, 'noopener sponsored'), ('https://www.coindesk.com/', 'noopener')],
+        )
+
+    def test_blank_and_unset_referrals_use_public_defaults_without_warnings(self) -> None:
+        with self.assertNoLogs(publisher.logger, level='WARNING'):
+            self.assertEqual(load_referrals({}), {})
+            for value in ('', ' ', '\t\r\n'):
+                self.assertEqual(load_referrals({'REFERRAL_URL_BINANCE': value}), {})
+
+    def test_invalid_referrals_log_only_key_and_reason_once_per_load(self) -> None:
+        for value in (
+            '/partner/private-code', '//partner.example.invalid/private-code',
+            'http://partner.example.invalid/private-code', 'javascript:private-code',
+            'data:text/html,private-code', 'https:///private-code',
+            'https://reader:private-code@partner.example.invalid/',
+            'https://@partner.example.invalid/private-code',
+            'https://bad_host.example/private-code', 'https://-bad.example/private-code',
+            'https://bad..example/private-code', 'https://999.999.999.999/private-code',
+            'https://partner.example.invalid:70000/private-code',
+            'https://partner.example.invalid:invalid/private-code',
+            'https://partner.example.invalid:0/private-code',
+            'https://[invalid]/private-code', 'https://partner.example.invalid/private code',
+            'https://partner.example.invalid/"private-code',
+            'https://partner.example.invalid/\\private-code',
+            'https://partner.example.invalid/%zzprivate-code',
+            'https://partner.example.invalid/private-code\n',
+            '\x00https://partner.example.invalid/private-code',
+            'https://partner.example.invalid/pri\tvate-code',
+            'https://partner.example.invalid/private-code\x7f',
+            'https://partner.example.invalid/private-code\x85',
+            'https://partner.example.invalid/private-code\u200b',
+        ):
+            with self.subTest(value=repr(value)):
+                with self.assertLogs(publisher.logger, level='WARNING') as logs:
+                    referrals = load_referrals({'REFERRAL_URL_BINANCE': value})
+                self.assertEqual(referrals, {})
+                self.assertEqual(len(logs.output), 1)
+                message = logs.output[0]
+                self.assertIn('key=REFERRAL_URL_BINANCE reason=', message)
+                self.assertNotIn('private-code', message)
+                self.assertNotIn('partner.example', message)
+                self.assertNotIn(value, message)
+                with (
+                    patch.object(publisher, 'MARKET_REFERRAL_URLS', referrals),
+                    patch.object(publisher.logger, 'warning') as warning,
+                ):
+                    content = publisher.link_markets('<p>Binance and Binance.</p>')
+                    self.assertEqual(publisher.link_markets(content), content)
+                warning.assert_not_called()
+
+    def test_valid_https_partner_urls_are_retained_exactly(self) -> None:
+        for url in (
+            'https://partner.example.invalid/join/private-code?ref=a&campaign=b#terms',
+            'HTTPS://Partner.example.invalid:8443/a%2Fb?ref=a%26b&next=c#terms',
+            'https://[2001:db8::1]/join?ref=a#terms',
+            'https://b\u00fccher.example/join?ref=a#terms',
+        ):
+            with self.subTest(url=url), self.assertNoLogs(publisher.logger, level='WARNING'):
+                self.assertEqual(load_referrals({'REFERRAL_URL_BINANCE': url}), {'Binance': url})
+
+    def test_every_supported_env_key_is_documented_once_and_blank(self) -> None:
+        expected = {
+            'REFERRAL_URL_BINANCE', 'REFERRAL_URL_OKX', 'REFERRAL_URL_COINBASE',
+            'REFERRAL_URL_KRAKEN', 'REFERRAL_URL_BITFINEX', 'REFERRAL_URL_KUCOIN',
+            'REFERRAL_URL_HUOBI', 'REFERRAL_URL_BITSTAMP', 'REFERRAL_URL_GEMINI',
+            'REFERRAL_URL_BYBIT', 'REFERRAL_URL_CRYPTO_COM', 'REFERRAL_URL_GATE_IO',
+            'REFERRAL_URL_COINDESK',
+        }
+        self.assertEqual(set(publisher.MARKET_LINKS), set(PUBLIC_BRAND_URLS))
+        self.assertEqual({key for _url, key in publisher.MARKET_LINK_SETTINGS.values()}, expected)
+        lines = (PROJECT_DIR.parent / '.env.example').read_text(encoding='utf-8').splitlines()
+        documented = [line for line in lines if line.startswith('REFERRAL_URL_')]
+        self.assertEqual(len(documented), len(expected))
+        self.assertEqual(set(documented), {key + '=' for key in expected})
 
 
 class CompatibilityTests(unittest.TestCase):
@@ -632,6 +760,131 @@ class WordPressPublisherTests(unittest.TestCase):
         self.assertEqual(
             post.call_args.kwargs["timeout"],
             client.WP_HTTP_TIMEOUT,
+        )
+
+    def test_all_brand_public_destinations_reach_wordpress_without_configuration(self) -> None:
+        self.article = PublicationArticle.from_mapping({
+            **ARTICLE_ROW, 'full_text': '<p>' + ', '.join(PUBLIC_BRAND_URLS) + '.</p>',
+            'schema_jsonld': None,
+        })
+        with patch.object(publisher, 'MARKET_REFERRAL_URLS', load_referrals({})):
+            result, mocks, _connection, _events = self.publish_with_mocks()
+        self.assertTrue(result.success)
+        parsed = AnchorLabels()
+        parsed.feed(mocks[2].call_args.kwargs['json']['content'])
+        self.assertEqual(
+            [(attrs.get('href'), ''.join(label)) for attrs, label in parsed.anchors],
+            [(url, name) for name, url in PUBLIC_BRAND_URLS.items()],
+        )
+        self.assertTrue(all(attrs.get('rel') == 'noopener' for attrs, _label in parsed.anchors))
+        self.assertTrue(all(attrs.get('target') == '_blank' for attrs, _label in parsed.anchors))
+
+    def test_only_binance_override_changes_eligible_mentions_and_roundtrips_exactly(self) -> None:
+        referral = 'https://partner.example.invalid/join/abc?ref=coin&campaign=markets#terms'
+        self.article = PublicationArticle.from_mapping({
+            **ARTICLE_ROW, 'schema_jsonld': None,
+            'full_text': '<p>Binance and Binance; ' + ', '.join(list(PUBLIC_BRAND_URLS)[1:]) + '.</p>',
+        })
+        with patch.object(publisher, 'MARKET_REFERRAL_URLS', load_referrals({'REFERRAL_URL_BINANCE': referral})):
+            result, mocks, _connection, _events = self.publish_with_mocks()
+        self.assertTrue(result.success)
+        content = mocks[2].call_args.kwargs['json']['content']
+        self.assertIn('?ref=coin&amp;campaign=markets#terms', content)
+        parsed = AnchorLabels()
+        parsed.feed(content)
+        self.assertEqual(
+            [(attrs.get('href'), ''.join(label)) for attrs, label in parsed.anchors],
+            [(referral, 'Binance'), (referral, 'Binance')]
+            + [(url, name) for name, url in PUBLIC_BRAND_URLS.items() if name != 'Binance'],
+        )
+        self.assertEqual([attrs['rel'] for attrs, _label in parsed.anchors],
+                         ['noopener sponsored'] * 2 + ['noopener'] * 12)
+
+    def test_referrals_preserve_citations_categories_exclusions_and_repeated_pass(self) -> None:
+        binance = (
+            '<a href="https://binance.example.invalid/announcement?source=a&amp;id=b" '
+            'rel="nofollow" data-source="Binance"><em>Official</em> Binance announcement</a>'
+        )
+        coindesk = (
+            '<a class="citation" href="https://www.coindesk.com/markets/story/">'
+            '<strong>CoinDesk</strong> report</a>'
+        )
+        category = '<a href="https://wordpress.example.invalid/category/bitcoin/">Bitcoin</a>'
+        excluded = (
+            '<!-- Binance CoinDesk --><p hidden>Binance CoinDesk</p>'
+            '<script type="application/ld+json">{"name":"Binance CoinDesk"}</script>'
+            '<style>.Binance { content: "CoinDesk"; }</style>'
+            '<template>Binance CoinDesk</template>'
+            '<iframe src="https://example.invalid/Binance/CoinDesk"></iframe>'
+        )
+        original = (
+            f'<p>Read {binance} and {coindesk}. Bitcoin and Bitcoin follow {category}.</p>'
+            f'{excluded}<p data-label="Binance CoinDesk">Trading resumed on Binance; CoinDesk reports.</p>'
+        )
+        referrals = load_referrals({
+            'REFERRAL_URL_BINANCE': 'https://partner.example.invalid/binance?ref=a&campaign=b#terms',
+            'REFERRAL_URL_COINDESK': 'https://partner.example.invalid/coindesk?ref=c#story',
+        })
+        self.article = PublicationArticle.from_mapping({
+            **ARTICLE_ROW, 'category': 'Bitcoin', 'schema_jsonld': None, 'full_text': original,
+        })
+        with patch.object(publisher, 'MARKET_REFERRAL_URLS', referrals):
+            first, mocks, _connection, _events = self.publish_with_mocks()
+            content = mocks[2].call_args.kwargs['json']['content']
+            self.assertTrue(first.success)
+            for fragment in (binance, coindesk, category, excluded, 'data-label="Binance CoinDesk"'):
+                self.assertIn(fragment, content)
+            parsed = AnchorLabels()
+            parsed.feed(content)
+            self.assertEqual(
+                [(attrs.get('href'), ''.join(label)) for attrs, label in parsed.anchors],
+                [
+                    ('https://binance.example.invalid/announcement?source=a&id=b', 'Official Binance announcement'),
+                    ('https://www.coindesk.com/markets/story/', 'CoinDesk report'),
+                    ('https://wordpress.example.invalid/category/bitcoin/', 'Bitcoin'),
+                    (referrals['Binance'], 'Binance'), (referrals['CoinDesk'], 'CoinDesk'),
+                ],
+            )
+            self.article = PublicationArticle.from_mapping({
+                **ARTICLE_ROW, 'category': 'Bitcoin', 'schema_jsonld': None, 'full_text': content,
+            })
+            second, mocks, _connection, _events = self.publish_with_mocks()
+            self.assertTrue(second.success)
+            self.assertEqual(mocks[2].call_args.kwargs['json']['content'], content)
+
+    def test_invalid_optional_override_does_not_interrupt_publication(self) -> None:
+        with self.assertLogs(publisher.logger, level='WARNING'):
+            referrals = load_referrals({
+                'REFERRAL_URL_BINANCE': 'https://reader:private@partner.example.invalid/',
+                'REFERRAL_URL_COINDESK': 'https://partner.example.invalid/coindesk?ref=cc',
+            })
+        self.article = PublicationArticle.from_mapping({
+            **ARTICLE_ROW, 'full_text': '<p>Binance and CoinDesk.</p>', 'schema_jsonld': None,
+        })
+        with patch.object(publisher, 'MARKET_REFERRAL_URLS', referrals):
+            result, mocks, _connection, _events = self.publish_with_mocks()
+        self.assertTrue(result.success)
+        parsed = AnchorLabels()
+        parsed.feed(mocks[2].call_args.kwargs['json']['content'])
+        self.assertEqual(
+            [(attrs.get('href'), attrs.get('rel')) for attrs, _label in parsed.anchors],
+            [('https://www.binance.com', 'noopener'), (referrals['CoinDesk'], 'noopener sponsored')],
+        )
+
+    def test_homepage_override_is_sponsored_and_category_precedence_is_retained(self) -> None:
+        referrals = load_referrals({'REFERRAL_URL_BINANCE': 'https://www.binance.com'})
+        self.article = PublicationArticle.from_mapping({
+            **ARTICLE_ROW, 'category': 'Binance', 'full_text': '<p>Binance and Binance.</p>',
+            'schema_jsonld': None,
+        })
+        with patch.object(publisher, 'MARKET_REFERRAL_URLS', referrals):
+            result, mocks, _connection, _events = self.publish_with_mocks()
+        self.assertTrue(result.success)
+        parsed = AnchorLabels()
+        parsed.feed(mocks[2].call_args.kwargs['json']['content'])
+        self.assertEqual(
+            [(attrs.get('href'), attrs.get('rel')) for attrs, _label in parsed.anchors],
+            [('/category/binance/', None), ('https://www.binance.com', 'noopener sponsored')],
         )
 
     def test_link_decoration_preserves_citations_and_unrelated_html(self) -> None:
