@@ -100,6 +100,10 @@ def subject_article_lead(article: dict[str, Any]) -> str:
     return ''
 
 
+def subject_article_headline(article: dict[str, Any]) -> str:
+    return _visible_text(article.get('title'), limit=400)
+
+
 def _assets(text: str, *, tickers: frozenset[str] = frozenset()) -> set[str]:
     words = re.findall(r'[a-z0-9]+', text.lower())
     terms = set(words)
@@ -153,7 +157,7 @@ def assess_subject(article: dict[str, Any], candidate: SubjectCandidate) -> Subj
     image = _visible_text(candidate.subject_text, limit=1200)
     if not image:
         return SubjectAssessment()
-    headline = _visible_text(article.get('title'), limit=400)
+    headline = subject_article_headline(article)
     lead = subject_article_lead(article)
     lead_sentence = _SENTENCE_BREAK.split(lead, maxsplit=1)[0]
     tickers = frozenset(normalize_terms(str(article.get('tickers') or '')))
