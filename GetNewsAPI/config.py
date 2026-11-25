@@ -193,6 +193,13 @@ STOCK_IMAGE_SUBJECT_MODE = os.getenv('STOCK_IMAGE_SUBJECT_MODE', 'shadow').strip
 if STOCK_IMAGE_SUBJECT_MODE not in {'off', 'shadow', 'enforce'}:
     raise ValueError('STOCK_IMAGE_SUBJECT_MODE must be off, shadow, or enforce')
 
+STOCK_IMAGE_VISION_MODE = os.getenv('STOCK_IMAGE_VISION_MODE', 'off').strip().lower()
+GOOGLE_CLOUD_VISION_API_KEY = os.getenv('GOOGLE_CLOUD_VISION_API_KEY', '').strip()
+try:
+    STOCK_IMAGE_VISION_MONTHLY_UNIT_LIMIT = int(os.getenv('STOCK_IMAGE_VISION_MONTHLY_UNIT_LIMIT', '2000'))
+except ValueError:
+    STOCK_IMAGE_VISION_MONTHLY_UNIT_LIMIT = None
+
 IMAGE_SEARCH_PROVIDERS = tuple(
     provider.strip().lower()
     for provider in os.getenv(

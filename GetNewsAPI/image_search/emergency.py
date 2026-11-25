@@ -33,6 +33,7 @@ from .subject_policy import rejected_subject_assets, subject_rejection_reason
 
 
 logger = logging.getLogger(__name__)
+VISION_CONTEXT_MISMATCH = "vision_context_mismatch"
 SOFT_REASONS = frozenset({
     "score_below_threshold", "local_history_identity_reuse", "wordpress_history_reuse",
     "local_history_sha_reuse", "local_history_dhash_reuse",
@@ -42,7 +43,7 @@ VALIDATION_REASONS = frozenset({
     "attribution_too_large", "metadata_update_failed", "media_metadata_failed",
     "media_upload_failed", "license_rejected", "required_fields", "invalid_original_url",
     "unsupported_format", "invalid_size", "dimensions_rejected", "orientation_rejected",
-    "context_mismatch",
+    "context_mismatch", VISION_CONTEXT_MISMATCH,
 })
 # Same existing fail-closed publication bound; no attribution is truncated.
 MAX_REQUIRED_ATTRIBUTION_CHARS = 16_384
@@ -440,7 +441,10 @@ def rescue_images(
             except Exception:
                 accepted, reason = False, "conversion_failed"
             if not accepted:
-                hard_fail_transport(context, candidate, reason)
+                if reason == VISION_CONTEXT_MISMATCH:
+                    hard_fail_group(context, candidate, reason)
+                else:
+                    hard_fail_transport(context, candidate, reason)
                 logger.info(
                     "[IMG-RESCUE] rejected article=%s provider=%s asset_key=%s reason=%s",
                     context.article_correlation_id, candidate.provider, candidate.asset_key, reason,

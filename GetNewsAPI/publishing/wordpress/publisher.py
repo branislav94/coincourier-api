@@ -1,5 +1,5 @@
 import base64
-from collections.abc import Iterator, Mapping
+from collections.abc import Callable, Iterator, Mapping
 from html import escape, unescape
 import ipaddress
 import logging
@@ -10,6 +10,7 @@ import re
 import requests
 import mysql.connector
 import io, tempfile
+from time import monotonic
 from PIL import Image as PILImage
 from openai import OpenAI
 import hashlib, random
@@ -21,6 +22,7 @@ from urllib.parse import urlsplit
 from config import (
     DB_CONFIG,
     DUPLICATE_ENFORCEMENT_MODE,
+    GOOGLE_CLOUD_VISION_API_KEY,
     GROK_API_KEY,
     GROK_BASE_URL,
     GROK_IMAGE_ASPECT_RATIO,
@@ -47,19 +49,25 @@ from config import (
     PUBLISH_DAILY_HARD_CAP,
     PUBLIC_COPY_GATE_MODE,
     STOCK_IMAGE_TIMEOUT_SECONDS,
+    STOCK_IMAGE_VISION_MODE,
+    STOCK_IMAGE_VISION_MONTHLY_UNIT_LIMIT,
     USE_API_IMAGES,
     USE_SOURCE_IMAGES,
+    WRITABLE_STATE_DIR,
     WP_API_URL,
     WP_DB_CONFIG,
 )
 from stock_images import StockImageCandidate, find_stock_image
 from image_search import search_images
-from image_search.emergency import rescue_images
+from image_search.emergency import VISION_CONTEXT_MISMATCH, rescue_images
 from image_search.models import ImageSearchResult, RescueValidationResult
+from image_search.preparation import cover_bytes_to_1536x1024 as _cover_bytes_to_1536x1024
 from .attribution import build_public_attribution
 from image_search.license_policy import normalize_license_name
 from image_search.reuse import record_image_usage
 from image_search.subject_policy import article_correlation_id
+from image_search.vision import VisionCheck, VisionDecision
+from image_search.vision_policy import build_vision_conflict_rule, classify_vision_topic
 from duplicate_detection.enforcement import DUPLICATE_COUNTER_NAMES
 from duplicate_detection.publication import (
     PublicationDuplicateGuard, PublicationDuplicateRejected, PublicationDuplicateUnavailable,
@@ -624,56 +632,6 @@ def _heroize_to_1536x1024(raw_bytes: bytes) -> str | None:
         return tmp.name
     except Exception as e:
         print(f"⚠️  heroize failed: {e}")
-        return None
-
-
-def _cover_bytes_to_1536x1024(
-    raw_bytes: bytes,
-    *,
-    min_width: int = 640,
-    min_height: int = 360,
-) -> tuple[bytes, dict[str, Any]] | None:
-    """
-    Convert downloaded source/stock bytes into a 1536x1024 JPEG without distortion.
-    """
-    try:
-        img = PILImage.open(io.BytesIO(raw_bytes)).convert("RGB")
-        original_width, original_height = img.size
-        if original_width < min_width or original_height < min_height:
-            logger.info(
-                "[IMG] rejected tiny image dims=%sx%s min=%sx%s",
-                original_width,
-                original_height,
-                min_width,
-                min_height,
-            )
-            return None
-
-        ratio = original_width / max(original_height, 1)
-        if ratio < 1.0:
-            logger.info("[IMG] rejected portrait image dims=%sx%s", original_width, original_height)
-            return None
-
-        target_width, target_height = 1536, 1024
-        scale = max(target_width / original_width, target_height / original_height)
-        resized_width = max(target_width, int(round(original_width * scale)))
-        resized_height = max(target_height, int(round(original_height * scale)))
-        img = img.resize((resized_width, resized_height), PILImage.LANCZOS)
-
-        left = (resized_width - target_width) // 2
-        top = (resized_height - target_height) // 2
-        img = img.crop((left, top, left + target_width, top + target_height))
-
-        out = io.BytesIO()
-        img.save(out, format="JPEG", quality=90, optimize=True)
-        return out.getvalue(), {
-            "width": original_width,
-            "height": original_height,
-            "output_width": target_width,
-            "output_height": target_height,
-        }
-    except Exception:
-        logger.exception("[IMG] could not convert downloaded image to hero JPEG")
         return None
 
 
@@ -1498,6 +1456,8 @@ def _upload_v2_stock_route(
     """Complete strict stock, then safe emergency stock, before generation."""
     context: dict[str, Any] = {}
     ready: tuple[int | None, dict[str, Any]] | None = None
+    vision_check: VisionCheck | None = None
+    vision_rule = None
     summary: dict[str, Any] = {
         "strict_stock_selected": False,
         "emergency_stock_rescue_attempted": False,
@@ -1539,9 +1499,40 @@ def _upload_v2_stock_route(
         )
         return media_id, metadata
 
+    def reject_rescue_crop(content: bytes, metadata: dict[str, Any]) -> bool:
+        nonlocal vision_check
+        correlation = getattr(context.get("result"), "article_correlation_id", "") or article_correlation_id(article)
+        provider, asset_id = metadata["provider"], metadata["asset_id"] or metadata["asset_key"]
+        started_at = monotonic()
+        try:
+            if vision_check is None:
+                vision_check = VisionCheck(
+                    mode=STOCK_IMAGE_VISION_MODE,
+                    api_key=GOOGLE_CLOUD_VISION_API_KEY,
+                    monthly_limit=STOCK_IMAGE_VISION_MONTHLY_UNIT_LIMIT,
+                    state_dir=WRITABLE_STATE_DIR,
+                    conflict_rule=vision_rule,
+                    article_id=correlation,
+                )
+            decision = vision_check.check(content, provider=provider, asset_id=asset_id)
+        except Exception:
+            # An optional assessment failure must preserve this eligible candidate.
+            decision = VisionDecision(
+                mode=vision_check.mode if vision_check else "invalid",
+                decision="abstain", reason="unexpected_error", status="unknown", units_reserved=None,
+                latency_ms=round((monotonic() - started_at) * 1000),
+                checked_at_utc=datetime.now(timezone.utc).isoformat(timespec="milliseconds"),
+            )
+        decision.log(correlation, provider, asset_id)
+        return decision.rejected
+
     def persist_candidate(candidate: Any, downloaded: Any, converted: Any) -> RescueValidationResult:
         nonlocal ready
-        value = _upload_prepared_image(_candidate_stock_content(candidate, downloaded, converted), article, image_meta)
+        selected_image = _candidate_stock_content(candidate, downloaded, converted)
+        if vision_rule and selected_image[2].get("emergency_stock_rescue"):
+            value = _upload_prepared_image(selected_image, article, image_meta, reject_rescue_crop=reject_rescue_crop)
+        else:
+            value = _upload_prepared_image(selected_image, article, image_meta)
         if value[0]:
             ready = value
             return RescueValidationResult(True)
@@ -1573,6 +1564,10 @@ def _upload_v2_stock_route(
         image_meta["featured_image_rejected_reason"] = value[1].get("featured_image_rejected_reason") or "media_upload_failed"
 
     strict_result = context.get("result") or ImageSearchResult(all_available_providers_exhausted=exhausted)
+    if STOCK_IMAGE_VISION_MODE != "off" and IMAGE_EMERGENCY_STOCK_RESCUE_ENABLED:
+        topic = classify_vision_topic(article)
+        if topic in {"hardware_wallet", "financial_record"}:
+            vision_rule = build_vision_conflict_rule(topic)
     rescue_result = rescue_images(
         strict_result,
         post_download_validator=context.get("prepare_hero"),
@@ -1773,6 +1768,8 @@ def _upload_prepared_image(
     selected: tuple[bytes, str, dict[str, Any]],
     article_context: dict[str, Any],
     image_meta: dict[str, Any],
+    *,
+    reject_rescue_crop: Callable[[bytes, dict[str, Any]], bool] | None = None,
 ) -> tuple[int | None, dict[str, Any]]:
     content, filename, selected_meta = selected
     image_meta = dict(image_meta)
@@ -1799,6 +1796,10 @@ def _upload_prepared_image(
             return None, image_meta
         image_meta["credit_text"] = credit_text
         image_meta["attribution_text"] = credit_text
+
+    if reject_rescue_crop is not None and reject_rescue_crop(content, image_meta):
+        image_meta["featured_image_rejected_reason"] = VISION_CONTEXT_MISMATCH
+        return None, image_meta
 
     media_id: int | None = None
     try:
