@@ -109,6 +109,15 @@ def normalize_document_text(title: str | None, body: str | None) -> str:
     )
 
 
+def _hash_normalized_document(text: str) -> str:
+    return hashlib.sha256(text.encode('utf-8')).hexdigest()
+
+
+def document_content_hash(title: str | None, body: str | None) -> str:
+    '''Hash the same normalized title and body that embedding ingestion uses.'''
+    return _hash_normalized_document(normalize_document_text(title, body))
+
+
 def _split_oversized(text: str, *, starts_paragraph: bool) -> list[_Segment]:
     words = text.split()
     if not words:
@@ -203,7 +212,7 @@ def prepare_document(
     if chunker_version != CHUNKER_VERSION:
         raise ValueError(f"unsupported chunker version: {chunker_version}")
     text = normalize_document_text(title, body)
-    content_hash = hashlib.sha256(text.encode("utf-8")).hexdigest()
+    content_hash = _hash_normalized_document(text)
     return PreparedDocument(
         text=text,
         content_hash=content_hash,

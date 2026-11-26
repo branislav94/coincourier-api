@@ -8,6 +8,7 @@ from typing import Mapping
 
 DUPLICATE_MODE_FIELD = "DUPLICATE_ENFORCEMENT_MODE"
 PUBLIC_COPY_MODE_FIELD = "PUBLIC_COPY_GATE_MODE"
+RAG_CONTEXT_MODE_FIELD = 'RAG_CONTEXT_MODE'
 
 
 class EditorialModeError(ValueError):
@@ -26,10 +27,10 @@ class EditorialMode:
 
 
 def _read_mode(
-    environment: Mapping[str, str], field: str, allowed: tuple[str, ...]
+    environment: Mapping[str, str], field: str, allowed: tuple[str, ...], *, default: str = 'shadow'
 ) -> EditorialMode:
     supplied = field in environment
-    raw = environment.get(field, "shadow")
+    raw = environment.get(field, default)
     mode = raw.strip().lower() if isinstance(raw, str) else ""
     if mode not in allowed:
         raise EditorialModeError(field, "must be " + ", ".join(allowed[:-1]) + " or " + allowed[-1])
@@ -53,12 +54,20 @@ def public_copy_mode(environment: Mapping[str, str]) -> EditorialMode:
     return _read_mode(environment, PUBLIC_COPY_MODE_FIELD, ("off", "shadow"))
 
 
+def rag_context_mode(environment: Mapping[str, str]) -> EditorialMode:
+    '''Read the historical context rollout mode without accessing external services.'''
+    return _read_mode(environment, RAG_CONTEXT_MODE_FIELD, ('off', 'shadow', 'apply'), default='off')
+
+
 def editorial_mode_summary(environment: Mapping[str, str]) -> dict[str, str]:
     duplicate = duplicate_mode(environment)
     public_copy = public_copy_mode(environment)
+    rag_context = rag_context_mode(environment)
     return {
         "duplicate_enforcement_mode": duplicate.mode,
         "duplicate_mode_source": duplicate.source,
         "public_copy_gate_mode": public_copy.mode,
         "public_copy_mode_source": public_copy.source,
+        'rag_context_mode': rag_context.mode,
+        'rag_context_mode_source': rag_context.source,
     }

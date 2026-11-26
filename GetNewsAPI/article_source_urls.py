@@ -46,13 +46,14 @@ def _safe_hostname(hostname: str) -> bool:
     )
 
 
-def normalize_source_url(value: object) -> str | None:
+def normalize_source_url(value: object, *, allow_sensitive_query: bool = True) -> str | None:
     '''Validate HTTP(S), then remove only recognized tracking and fragments.
 
     Meaningful query segments retain their original bytes, order, duplicates,
     blanks and encoding. Signed/authenticated URLs retain their entire raw
     value, including tracking and fragments: guessing which bytes a signature
-    covers would risk breaking the destination. No network lookup is performed.
+    covers would risk breaking the destination. Set allow_sensitive_query=False
+    to reject such URLs for public citations. No network lookup is performed.
 
     Inputs are raw URLs, not HTML attribute values. Decode HTML entities exactly
     once at the attribute boundary, before calling this idempotent normalizer.
@@ -86,7 +87,7 @@ def normalize_source_url(value: object) -> str | None:
         key in _SENSITIVE_KEYS or key.startswith(('x-amz-', 'x-goog-'))
         for key in keys
     ):
-        return url
+        return url if allow_sensitive_query else None
 
     without_fragment = url.split('#', 1)[0]
     base, query_marker, query = without_fragment.partition('?')

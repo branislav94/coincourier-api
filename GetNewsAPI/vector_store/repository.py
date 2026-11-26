@@ -6,6 +6,7 @@ import hashlib
 import json
 import math
 import secrets
+from contextlib import closing
 from datetime import datetime
 from typing import Any, Callable, Sequence
 
@@ -16,6 +17,7 @@ from .models import (
     EmbeddingJobClaim,
     EmbeddingJobRecord,
     VECTOR_DIMENSIONS,
+    SourcePassage,
     SourceType,
     VectorChunkRecord,
     VectorDocumentDraft,
@@ -30,6 +32,7 @@ class VectorIdentityConflictError(RuntimeError):
 
 
 MARIADB_ER_LOCK_DEADLOCK = 1213
+MAX_SOURCE_PASSAGE_KEYS = 20
 
 
 def serialize_embedding(values: Sequence[float]) -> str:
@@ -259,6 +262,56 @@ class VectorRepository:
         finally:
             cursor.close()
             connection.close()
+
+    def get_source_passages(
+        self,
+        matches: Sequence[tuple[int, int]],
+        *,
+        embedding_version: str,
+    ) -> dict[tuple[int, int], SourcePassage]:
+        '''Read only the indexed passages for the requested document/chunk pairs.'''
+        if not matches:
+            return {}
+        if len(matches) > MAX_SOURCE_PASSAGE_KEYS:
+            raise ValueError('too many source passage matches')
+        if not embedding_version.strip():
+            raise ValueError('embedding_version is required')
+        if any(document_id <= 0 or chunk_index < 0 for document_id, chunk_index in matches):
+            raise ValueError('document_id must be positive and chunk_index nonnegative')
+
+        pairs = tuple(dict.fromkeys(matches))
+        placeholders = ', '.join('(%s, %s)' for _pair in pairs)
+        pair_params = tuple(value for pair in pairs for value in pair)
+        with closing(self._connect()) as connection, closing(
+            connection.cursor(dictionary=True)
+        ) as cursor:
+            cursor.execute(
+                f'''
+                SELECT d.id, d.document_key, d.source_type, d.source_article_id,
+                       d.rich_article_id, d.source_url, d.title, d.published_at,
+                       d.content_hash, d.content_version, c.id AS chunk_id,
+                       c.chunk_index, c.chunk_text, c.chunk_hash, c.embedding_version
+                FROM vector_chunks c
+                JOIN vector_documents d ON d.id = c.document_id
+                WHERE c.embedding_version = %s
+                  AND d.source_type = %s AND d.rich_article_id IS NULL
+                  AND (c.document_id, c.chunk_index) IN ({placeholders})
+                ''',
+                (embedding_version, SourceType.SOURCE_ARTICLE.value, *pair_params),
+            )
+            # The database collation allows case-insensitive version comparisons.
+            return {
+                (int(row['id']), int(row['chunk_index'])): SourcePassage(
+                    document=self._document_record(row),
+                    chunk_id=int(row['chunk_id']),
+                    chunk_index=int(row['chunk_index']),
+                    chunk_text=row['chunk_text'],
+                    chunk_hash=row['chunk_hash'],
+                    embedding_version=row['embedding_version'],
+                )
+                for row in cursor.fetchall()
+                if row['embedding_version'] == embedding_version
+            }
 
     def nearest_chunks(
         self,

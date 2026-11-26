@@ -79,6 +79,8 @@ class SemanticCandidate:
     published_at: datetime
     publication_delta_hours: float
     source_type: SourceType
+    best_candidate_chunk_id: int | None = None
+    best_candidate_chunk_hash: str | None = None
 
 
 @dataclass(frozen=True)

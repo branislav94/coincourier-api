@@ -14,7 +14,7 @@ from unittest.mock import patch
 
 from runtime.config_validation import format_config_issues, validate_runtime_config
 from runtime.editorial_modes import (
-    EditorialModeError, duplicate_mode, editorial_mode_summary, public_copy_mode,
+    EditorialModeError, duplicate_mode, editorial_mode_summary, public_copy_mode, rag_context_mode,
 )
 from tests.test_deployment import minimal_web_environment
 from tests.environment_isolation import isolated_subprocess_environment
@@ -26,6 +26,7 @@ class EditorialModeTests(unittest.TestCase):
         self.assertEqual(editorial_mode_summary({}), {
             "duplicate_enforcement_mode": "shadow", "duplicate_mode_source": "default",
             "public_copy_gate_mode": "shadow", "public_copy_mode_source": "default",
+            'rag_context_mode': 'off', 'rag_context_mode_source': 'default',
         })
 
     def test_canonical_mode_has_one_parser_for_config_and_preflight(self):
@@ -73,6 +74,23 @@ class EditorialModeTests(unittest.TestCase):
                 with self.assertRaises(EditorialModeError):
                     public_copy_mode({"PUBLIC_COPY_GATE_MODE": raw})
 
+    def test_rag_context_mode_uses_same_parser_for_config_and_preflight(self) -> None:
+        for value in ('off', ' SHADOW ', 'apply'):
+            with self.subTest(value=value):
+                env = {**minimal_web_environment(), 'RAG_CONTEXT_MODE': value}
+                self.assertEqual(rag_context_mode(env).mode, value.strip().lower())
+                self.assertEqual(validate_runtime_config(env), ())
+
+        for invalid in ('', 'enforce', 'canary-secret-value'):
+            with self.subTest(value=invalid):
+                env = {**minimal_web_environment(), 'RAG_CONTEXT_MODE': invalid}
+                with self.assertRaises(EditorialModeError):
+                    rag_context_mode(env)
+                self.assertEqual(
+                    format_config_issues(validate_runtime_config(env)),
+                    '- RAG_CONTEXT_MODE: must be off, shadow or apply',
+                )
+
     def test_config_check_reports_only_validated_modes_and_their_source(self):
         environment = minimal_web_environment()
         environment["DUPLICATE_ENFORCEMENT_MODE"] = "shadow"
@@ -86,6 +104,7 @@ class EditorialModeTests(unittest.TestCase):
         self.assertEqual(summary, {
             "duplicate_enforcement_mode": "shadow", "duplicate_mode_source": "environment",
             "public_copy_gate_mode": "off", "public_copy_mode_source": "environment",
+            'rag_context_mode': 'off', 'rag_context_mode_source': 'default',
         })
         self.assertNotIn("canary-secret-value", output.getvalue())
         self.assertNotIn(environment["DB_PASSWORD"], output.getvalue())

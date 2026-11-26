@@ -940,7 +940,7 @@ with chunk indexes, document/source IDs, publication delta, version, and source
 type retained as evidence. No full vectors or complete chunk text are returned.
 
 1. **Semantic duplicate retrieval:** Phase 6C1 implements source-only candidates and distance evidence; event-feature reranking and decisions remain planned.
-2. **Historical factual context:** retrieve raw-source chunks separately and label their source/time. Generated CoinCourier text can provide continuity but not corroboration.
+2. **Historical factual context:** verify the exact indexed source passage for an existing semantic match and optionally append one attributed sentence. See the [historical context rollout](GETNEWSAPI_HISTORICAL_CONTEXT.md).
 3. **Internal-link suggestions:** retrieve published CoinCourier chunks, require live WP IDs/URLs and topical relevance, and avoid self-links.
 4. **Repetitive-angle avoidance:** compare proposed rich summary/outline to recent published derivatives in the same event/topic, then prompt for genuinely new facts or framing.
 5. **Update classification:** compare fact signatures and source chunks to determine whether a new article contains material changes.
@@ -1252,12 +1252,9 @@ Each phase is intentionally deployable and reversible on its own.
 
 ### Phase 7: historical context and internal-link retrieval
 
-- Files: retrieval service, prompt/context builder, link validator, publisher integration, tests.
-- Migration: `rag_retrieval_audit`; published URL/status fields.
-- Tests: source/generated provenance separation, stale/deleted WP targets, self-link and hallucinated-link prevention.
-- Logs/metrics: accepted suggestions, click/quality review, retrieval provenance and latency.
-- Switch: separate `RAG_CONTEXT_MODE` and `INTERNAL_LINK_MODE`, both shadow/suggest first.
-- Rollback: disable context/link injection; articles continue without retrieval.
+- Historical context uses `RAG_CONTEXT_MODE=off|shadow|apply`. The first policy verifies the exact source passage for an earlier withdrawal pause at the same named vault.
+- The processor records suggestion and omission reasons with evidence identifiers and evaluation latency. See the [DEV pilot and rollback](GETNEWSAPI_HISTORICAL_CONTEXT.md).
+- Internal-link retrieval remains planned. It will require verified WordPress URLs and publication status, deduplication, and tests for self-links and stale targets.
 - Risk: medium.
 
 ### Phase 8: angle diversity and topic-saturation policy
