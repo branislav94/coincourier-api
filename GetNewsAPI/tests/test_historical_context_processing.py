@@ -376,6 +376,58 @@ class HistoricalContextProcessingTests(unittest.TestCase):
                     self.assertEqual(doc, off)
                     self.assertIn('decision=skipped reason=hypothetical_passage', logs)
 
+    def test_preceding_framing_survives_the_indexed_chunk_boundary(self) -> None:
+        raw = current_article()
+        off, _ = self.process('off', raw, None)
+        before = self.publish(off, raw)
+        title = 'Report on Meridian Vault operations'
+        pause = 'Meridian Vault paused withdrawals on November 24, 2026.'
+        for preceding, same_paragraph, hypothetical in (
+            ('The following scenario is hypothetical.', False, True),
+            ('This week, an unrelated team held a tabletop exercise.', False, False),
+            ('Operators introduced a hypothetical tabletop exercise.', True, True),
+        ):
+            padding_size = CHUNK_TARGET_TOKENS - sum(
+                estimate_tokens(text) for text in (title, preceding, 'record.')
+            )
+            padding = 'archive ' * padding_size
+            html_separator = ' ' if same_paragraph else '</p><p>'
+            archive_html = f'<p>{padding}record.</p><p>{preceding}{html_separator}{pause}</p>'
+            prepared = prepare_document(title, archive_html)
+            self.assertEqual(len(prepared.chunks), 2)
+            preceding_chunk, pause_chunk = prepared.chunks
+            self.assertTrue(preceding_chunk.text.endswith(preceding))
+            self.assertTrue(pause_chunk.text.startswith(pause))
+            text_separator = ' ' if same_paragraph else '\n\n'
+            self.assertIn(f'{preceding}{text_separator}{pause}', prepared.text)
+            match = indexed_passage(title=title, prepared=prepared, chunk_index=pause_chunk.index)
+            self.use_passages(match)
+            archived = self.source_snapshots[81]
+            assert archived is not None
+            self.source_snapshots[81] = replace(archived, full_text=archive_html)
+
+            for mode in ('shadow', 'apply'):
+                with self.subTest(mode=mode, preceding=preceding, same_paragraph=same_paragraph):
+                    self.raw_repository.get_source_article_snapshot.reset_mock()
+                    self.repository.get_source_passages.reset_mock()
+                    doc, logs = self.process(mode, raw, semantic_result(match[0]))
+                    self.raw_repository.get_source_article_snapshot.assert_called_once_with(81)
+                    self.repository.get_source_passages.assert_called_once_with(
+                        ((501, pause_chunk.index),), embedding_version=EMBEDDING_VERSION,
+                    )
+                    if mode == 'apply' and not hypothetical:
+                        body = self.publish(doc, raw)[0]['content']
+                        self.assertEqual(body.count(ARCHIVE_URL), 1)
+                        self.assertIn('had paused withdrawals on November 24, 2026', body)
+                        self.assertNotIn(preceding, body)
+                        self.assertIn('decision=applied reason=suggested', logs)
+                    else:
+                        self.assertEqual(self.publish(doc, raw), before)
+                        self.assertEqual(doc, off)
+                        reason = 'skipped reason=hypothetical_passage' if hypothetical else 'would_apply reason=suggested'
+                        self.assertIn(f'decision={reason}', logs)
+        self.repository.nearest_chunks.assert_not_called()
+
     def test_adjacent_context_applies_to_the_matched_occurrence_of_a_repeated_pause(self) -> None:
         raw = current_article()
         off, _ = self.process('off', raw, None)

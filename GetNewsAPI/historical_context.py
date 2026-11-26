@@ -117,6 +117,7 @@ class HistoricalContextFact:
     chunk_hash: str
     content_hash: str
     passage_body: str
+    pause_start_word: int
     pause_end_word: int
 
     @property
@@ -347,25 +348,47 @@ def _introduces_hypothetical(sentence: str) -> bool:
     return bool(_HYPOTHETICAL_FRAME.search(sentence) or _DRILL_INTRODUCTION.match(sentence))
 
 
+def _frames_following_scenario(sentence: str) -> bool:
+    '''Recognize a heading or an explicit introduction to the text that follows.'''
+    return bool(
+        _HYPOTHETICAL_HEADING.fullmatch(sentence)
+        or (
+            _introduces_hypothetical(sentence)
+            and (sentence.endswith(':') or _HYPOTHETICAL_FORWARD.search(sentence))
+        )
+    )
+
+
 def _is_hypothetical_followup(sentence: str) -> bool:
     return bool(_HYPOTHETICAL_FOLLOWUP.match(sentence) and _introduces_hypothetical(sentence))
 
 
 def _archive_pause_rejection(body: str, fact: HistoricalContextFact) -> str | None:
-    '''Check the next sentence after the selected pause in the verified source.'''
+    '''Check the sentences adjacent to the selected pause in the verified source.'''
     # Match the entire passage to anchor this occurrence of the pause. The
     # ingestion chunker can fold whitespace when it packs sentences together.
     words = [re.escape(word) for word in fact.passage_body.split()]
-    through_pause = r'\s+'.join(words[:fact.pause_end_word])
-    rest_of_passage = ''.join(r'\s+' + word for word in words[fact.pause_end_word:])
-    pattern = re.compile(rf'(?<!\S)({through_pause}){rest_of_passage}(?!\S)')
+    before_pause = ''.join(word + r'\s+' for word in words[:fact.pause_start_word])
+    pause = r'\s+'.join(words[fact.pause_start_word:fact.pause_end_word])
+    after_pause = ''.join(r'\s+' + word for word in words[fact.pause_end_word:])
+    pattern = re.compile(rf'(?<!\S){before_pause}(?P<pause>{pause}){after_pause}(?!\S)')
     passage = pattern.search(body)
     if passage is None or pattern.search(body, passage.start() + 1) is not None:
         return 'candidate_source_unverified'
 
-    remaining = body[passage.end(1):].lstrip()
+    before = body[:passage.start('pause')]
+    preceding_text = before.rstrip()
+    preceding = _SENTENCE_BREAK.split(preceding_text)[-1]
+    same_paragraph = '\n\n' not in before[len(preceding_text):]
+    preceding_frame = _frames_following_scenario(preceding) or (
+        same_paragraph and _introduces_hypothetical(preceding)
+    )
+
+    remaining = body[passage.end('pause'):].lstrip()
     following = _SENTENCE_BREAK.split(remaining, maxsplit=1)[0]
-    return 'hypothetical_passage' if _is_hypothetical_followup(following) else None
+    if preceding_frame or _is_hypothetical_followup(following):
+        return 'hypothetical_passage'
+    return None
 
 
 def _pause_statements(body: str, title: str) -> Iterator[tuple[re.Match[str], bool, int]]:
@@ -375,13 +398,7 @@ def _pause_statements(body: str, title: str) -> Iterator[tuple[re.Match[str], bo
     for paragraph in body.split('\n\n'):
         # A new paragraph starts a new context unless the preceding text
         # explicitly introduces a scenario that follows.
-        preceding_frame = bool(
-            _HYPOTHETICAL_HEADING.fullmatch(previous)
-            or (
-                _introduces_hypothetical(previous)
-                and (previous.endswith(':') or _HYPOTHETICAL_FORWARD.search(previous))
-            )
-        )
+        preceding_frame = _frames_following_scenario(previous)
         sentences = [sentence.strip() for sentence in _SENTENCE_BREAK.split(paragraph.strip())]
         for index, sentence in enumerate(sentences):
             word_count += len(sentence.split())
@@ -454,9 +471,11 @@ def _inspect_passage(
         source_url = normalize_historical_source_url(document.source_url)
         if source_url is None:
             return _reject(candidate, 'unsafe_source_url')
+        pause_start_word = pause_end_word - len(match.group(0).split())
         return HistoricalContextFact(
             source_url, report_time, match.group('vault'), event_date,
-            passage.chunk_id, passage.chunk_hash, document.content_hash, body, pause_end_word,
+            passage.chunk_id, passage.chunk_hash, document.content_hash, body,
+            pause_start_word, pause_end_word,
         )
     return _reject(candidate, 'hypothetical_passage' if hypothetical_pause else 'unsupported_passage')
 
