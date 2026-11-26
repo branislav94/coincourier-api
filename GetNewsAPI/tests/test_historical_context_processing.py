@@ -4,7 +4,6 @@ from __future__ import annotations
 
 from dataclasses import replace
 from datetime import UTC, datetime, timedelta, tzinfo
-from hashlib import sha256
 import json
 from pathlib import Path
 import sys
@@ -25,12 +24,14 @@ import gpt_processor as gp
 import historical_context
 from duplicate_detection.enforcement import DuplicateDecision
 from duplicate_detection.policy import AssessmentType, assess_relationship
+from embeddings.chunking import prepare_document
 from publishing.models import PublicationArticle, PublicationContext
 from publishing.wordpress import publisher
-from repositories.raw_news import RawNewsRepository
-from semantic_retrieval.models import SemanticCandidate, SemanticRetrievalStatus
+from repositories.raw_news import RawNewsRepository, SourceArticleSnapshot
+from semantic_retrieval.models import SemanticCandidate, SemanticRetrievalSettings, SemanticRetrievalStatus
+from semantic_retrieval.service import SemanticRetrievalService
 from semantic_retrieval.shadow import SemanticShadowRunResult
-from vector_store.models import SourcePassage, SourceType, VectorDocumentRecord
+from vector_store.models import SourcePassage, SourceType, VectorDocumentRecord, VectorMatch
 from vector_store.repository import VectorRepository
 from vector_store.semantic_assessments import SemanticAssessmentStatus
 
@@ -52,6 +53,7 @@ REPORT_TIME = datetime(2026, 11, 25, 8)
 EMBEDDING_VERSION = 'offline-fixture-v1'
 LEAD = '<p>Meridian Vault resumed withdrawals after operators completed a review.</p>'
 PAUSE_PASSAGE = 'Meridian Vault paused withdrawals on November 24, 2026 after a pricing oracle malfunctioned.'
+CORRECTED_PASSAGE = 'Correction: Meridian Vault never paused withdrawals on November 24, 2026.'
 RESEARCH = '- Coinbase described its own withdrawal review process in a separate statement.'
 
 
@@ -91,6 +93,13 @@ def writer_document(raw: dict[str, Any], *, lead: str = LEAD) -> dict[str, Any]:
     }
 
 
+def archive_body(matched_text: str) -> str:
+    '''Put the matched passage after two chunks of unrelated archival copy.'''
+    first = 'archive entry ' * 270
+    second = 'publication record ' * 270
+    return f'{first.rstrip()}\n\n{second.rstrip()}\n\n{matched_text}'
+
+
 def indexed_passage(
     *, document_id: int = 501, source_id: int = 81,
     title: str = 'Meridian Vault paused withdrawals', text: str = PAUSE_PASSAGE,
@@ -101,26 +110,27 @@ def indexed_passage(
     '''Build a matching candidate and a passage row for the vector repository boundary.'''
     current = current_article() if raw is None else raw
     source_key = f'{source_type.value}:{source_id}'
-    text_hash = sha256(text.encode('utf-8')).hexdigest()
+    prepared = prepare_document(title, archive_body(text))
+    chunk = prepared.chunks[-1]
     document = VectorDocumentRecord(
         id=document_id, document_key=source_key, source_type=source_type, source_article_id=source_id,
         rich_article_id=None if source_type is SourceType.SOURCE_ARTICLE else source_id,
         source_url=url, title=title, published_at=published,
-        content_hash=text_hash, content_version='source-v1',
+        content_hash=prepared.content_hash, content_version=prepared.content_version,
     )
     candidate = SemanticCandidate(
         query_document_id=700, query_source_article_id=current['id'],
         candidate_document_id=document_id, candidate_source_article_id=source_id,
         candidate_document_key=source_key, candidate_source_url=url, candidate_title=title,
         native_distance=distance, embedding_version=EMBEDDING_VERSION, best_query_chunk_index=0,
-        best_candidate_chunk_index=2, best_candidate_chunk_id=document_id + 1,
-        best_candidate_chunk_hash=text_hash, matched_query_chunk_count=1, published_at=published,
+        best_candidate_chunk_index=chunk.index, best_candidate_chunk_id=document_id + 1,
+        best_candidate_chunk_hash=chunk.sha256, matched_query_chunk_count=1, published_at=published,
         publication_delta_hours=(current['publish_date'] - published).total_seconds() / 3600,
         source_type=source_type,
     )
     passage = SourcePassage(
-        document=document, chunk_index=2, chunk_text=text, embedding_version=EMBEDDING_VERSION,
-        chunk_id=document_id + 1, chunk_hash=text_hash,
+        document=document, chunk_index=chunk.index, chunk_text=chunk.text, embedding_version=EMBEDDING_VERSION,
+        chunk_id=document_id + 1, chunk_hash=chunk.sha256,
     )
     return candidate, passage
 
@@ -149,9 +159,8 @@ class HistoricalContextProcessingTests(unittest.TestCase):
         self.repository.get_source_passages.return_value = {}
         self.vector = self.enterContext(patch.object(historical_context, 'VectorRepository', return_value=self.repository))
         self.raw_repository = Mock(spec_set=RawNewsRepository)
-        self.raw_repository.get_source_publication_times.return_value = (
-            REPORT_TIME, REPORT_TIME + timedelta(minutes=1),
-        )
+        self.source_snapshots: dict[int, SourceArticleSnapshot | None] = {}
+        self.raw_repository.get_source_article_snapshot.side_effect = self.source_snapshots.get
         self.enterContext(patch.object(gp, 'RawNewsRepository', return_value=self.raw_repository))
         self.semantic = self.enterContext(patch.object(gp, '_run_semantic_shadow_fail_open'))
         self.writer = self.enterContext(patch.object(gp, '_call_text_provider'))
@@ -175,6 +184,15 @@ class HistoricalContextProcessingTests(unittest.TestCase):
             (candidate.candidate_document_id, candidate.best_candidate_chunk_index): passage
             for candidate, passage in matches
         }
+        self.source_snapshots = {
+            passage.document.source_article_id: SourceArticleSnapshot(
+                title=passage.document.title, full_text=archive_body(passage.chunk_text),
+                news_url=passage.document.source_url, published_at=passage.document.published_at,
+                inserted_at=candidate.published_at + timedelta(minutes=1),
+            )
+            for candidate, passage in matches
+        }
+        self.raw_repository.get_source_article_snapshot.side_effect = self.source_snapshots.get
 
     def process(
         self, mode: str, raw: dict[str, Any],
@@ -236,7 +254,7 @@ class HistoricalContextProcessingTests(unittest.TestCase):
         off, off_log = self.process('off', raw, retrieval)
         self.vector.assert_not_called()
         self.repository.get_source_passages.assert_not_called()
-        self.raw_repository.get_source_publication_times.assert_not_called()
+        self.raw_repository.get_source_article_snapshot.assert_not_called()
         self.semantic.assert_called_once_with(raw)
         self.assertEqual(off_log, '')
         off_calls = self.writer.call_args_list.copy()
@@ -250,7 +268,7 @@ class HistoricalContextProcessingTests(unittest.TestCase):
         self.assertEqual(self.semantic.call_count, 2)
         self.vector.assert_called_once()
         self.repository.get_source_passages.assert_called_once_with(((501, 2),), embedding_version=EMBEDDING_VERSION)
-        self.raw_repository.get_source_publication_times.assert_called_once_with(81)
+        self.raw_repository.get_source_article_snapshot.assert_called_once_with(81)
         self.repository.nearest_chunks.assert_not_called()
         self.assertIn('embeddings_ready=True', shadow_log)
         self.assertIn('decision=would_apply', shadow_log)
@@ -262,6 +280,13 @@ class HistoricalContextProcessingTests(unittest.TestCase):
         raw = current_article()
         match = indexed_passage()
         self.use_passages(match)
+        snapshot = self.source_snapshots[81]
+        assert snapshot is not None and snapshot.full_text is not None
+        paragraphs = snapshot.full_text.split('\n\n')
+        equivalent_html = ''.join(
+            f'<p>{paragraph}</p>' for paragraph in paragraphs
+        ).replace(' ', '  ')
+        self.source_snapshots[81] = replace(snapshot, full_text=equivalent_html)
         retrieval = semantic_result(match[0])
         off, _ = self.process('off', raw, retrieval)
         before, seo_before = self.publish(off, raw)
@@ -290,6 +315,102 @@ class HistoricalContextProcessingTests(unittest.TestCase):
         self.assertEqual(seo_after, seo_before)
         self.assertIn(f'<a href="{SOURCE_URL}">Current report</a>', after['content'])
         self.assertIn(f'<a href="{REFERRAL_URL}" target="_blank" rel="noopener sponsored">Coinbase</a>', after['content'])
+
+    def test_hypothetical_pause_is_omitted_in_shadow_and_final_wordpress_payload(self) -> None:
+        raw = current_article()
+        off, _ = self.process('off', raw, None)
+        before = self.publish(off, raw)
+        pause = 'Meridian Vault paused withdrawals on November 24, 2026.'
+        for hypothetical in (
+            f'The following scenario is part of a hypothetical tabletop exercise. {pause}',
+            f'The following hypothetical tabletop exercise describes an emergency response scenario:\n\n{pause}',
+            f'The following scenario is hypothetical.\n\n{pause}',
+            f'{pause} That pause was part of a tabletop exercise.',
+        ):
+            match = indexed_passage(title='Meridian Vault tabletop exercise', text=hypothetical)
+            self.use_passages(match)
+            for mode in ('shadow', 'apply'):
+                with self.subTest(mode=mode, hypothetical=hypothetical):
+                    doc, logs = self.process(mode, raw, semantic_result(match[0]))
+                    self.assertEqual(doc, off)
+                    self.assertEqual(self.publish(doc, raw), before)
+                    self.assertIn('decision=skipped reason=hypothetical_passage', logs)
+        self.raw_repository.get_source_article_snapshot.assert_not_called()
+
+    def test_real_pause_near_an_unrelated_drill_is_still_eligible(self) -> None:
+        raw = current_article()
+        off, _ = self.process('off', raw, None)
+        for text in (
+            f'An unrelated hypothetical tabletop exercise took place at another venue.\n\n{PAUSE_PASSAGE}',
+            f'{PAUSE_PASSAGE} This week, an unrelated team held a tabletop exercise.',
+        ):
+            with self.subTest(text=text):
+                match = indexed_passage(text=text)
+                self.use_passages(match)
+                retrieval = semantic_result(match[0])
+                shadow, shadow_logs = self.process('shadow', raw, retrieval)
+                self.assertEqual(shadow, off)
+                self.assertIn('decision=would_apply reason=suggested', shadow_logs)
+
+                applied, apply_logs = self.process('apply', raw, retrieval)
+                body = self.publish(applied, raw)[0]['content']
+                self.assertIn('decision=applied reason=suggested', apply_logs)
+                self.assertEqual(body.count(ARCHIVE_URL), 1)
+                self.assertIn('had paused withdrawals on November 24, 2026', body)
+                self.assertNotIn('tabletop exercise', body)
+
+    def test_superseded_passage_is_omitted_with_or_without_corrected_embedding(self) -> None:
+        raw = current_article()
+        old = indexed_passage()
+        corrected = indexed_passage(document_id=502, text=CORRECTED_PASSAGE, distance=0.5)
+        off, _ = self.process('off', raw, None)
+        before = self.publish(off, raw)
+        self.assertNotEqual(old[1].document.content_hash, corrected[1].document.content_hash)
+        self.assertEqual(old[1].document.document_key, corrected[1].document.document_key)
+        query = replace(
+            old[1].document, id=700, document_key='source_article:101',
+            source_article_id=raw['id'], title=raw['title'], source_url=raw['news_url'],
+            published_at=raw['publish_date'],
+        )
+        self.repository.get_latest_source_document.return_value = query
+        self.repository.get_document_embedding_job.return_value = SimpleNamespace(status='completed')
+        self.repository.get_chunks.return_value = [
+            SimpleNamespace(id=701, chunk_index=0, embedding_version=EMBEDDING_VERSION, embedding=(1.0,)),
+        ]
+        service = SemanticRetrievalService(
+            repository=self.repository,
+            settings=SemanticRetrievalSettings(True, True, EMBEDDING_VERSION),
+        )
+
+        for corrected_indexed in (False, True):
+            stored = (old, corrected) if corrected_indexed else (old,)
+            self.use_passages(*stored)
+            archived = self.source_snapshots[81]
+            assert archived is not None
+            self.source_snapshots[81] = replace(archived, full_text=archive_body(CORRECTED_PASSAGE))
+            self.repository.nearest_chunks.return_value = [
+                VectorMatch(
+                    distance=candidate.native_distance, document_id=passage.document.id,
+                    document_key=passage.document.document_key, source_type=passage.document.source_type,
+                    source_article_id=passage.document.source_article_id, rich_article_id=None,
+                    source_url=passage.document.source_url, title=passage.document.title,
+                    published_at=passage.document.published_at, chunk_id=passage.chunk_id,
+                    chunk_index=passage.chunk_index, chunk_text=passage.chunk_text,
+                    chunk_hash=passage.chunk_hash, embedding_model='fixture',
+                    embedding_version=passage.embedding_version,
+                )
+                for candidate, passage in stored
+            ]
+            ranked = service.retrieve_source_neighbors(raw['id'])
+            self.assertEqual(ranked.candidates, (old[0],))
+            retrieval = semantic_result(*ranked.candidates)
+            for mode in ('shadow', 'apply'):
+                with self.subTest(mode=mode, corrected_indexed=corrected_indexed):
+                    doc, logs = self.process(mode, raw, retrieval)
+                    self.assertEqual(doc, off)
+                    self.assertEqual(self.publish(doc, raw), before)
+                    self.assertIn('decision=skipped reason=candidate_source_superseded', logs)
+        self.assertEqual(self.repository.nearest_chunks.call_count, 2)
 
     def test_incompatible_liquidation_totals_and_shared_ticker_do_not_add_context(self) -> None:
         raw = {
@@ -509,30 +630,35 @@ class HistoricalContextProcessingTests(unittest.TestCase):
                 self.assertEqual(doc, writer_document(raw))
                 self.assertIn('reason=query_publication_unverified', logs)
         self.repository.get_source_passages.assert_not_called()
-        self.raw_repository.get_source_publication_times.assert_not_called()
+        self.raw_repository.get_source_article_snapshot.assert_not_called()
 
     def test_archive_requires_matching_publication_before_ingestion(self) -> None:
         raw = current_article()
         match = indexed_passage()
         self.use_passages(match)
-        ingested_at = REPORT_TIME + timedelta(minutes=1)
-        for stored_times in (
-            None,
-            (None, ingested_at),
-            (REPORT_TIME, REPORT_TIME),
-            (REPORT_TIME, REPORT_TIME - timedelta(seconds=1)),
-            (REPORT_TIME - timedelta(seconds=1), ingested_at),
+        archived = self.source_snapshots[81]
+        assert archived is not None
+        for dates in (
+            {'published_at': None},
+            {'inserted_at': REPORT_TIME},
+            {'inserted_at': REPORT_TIME - timedelta(seconds=1)},
+            {'published_at': REPORT_TIME - timedelta(seconds=1)},
         ):
-            with self.subTest(stored_times=stored_times):
-                self.raw_repository.get_source_publication_times.return_value = stored_times
+            with self.subTest(dates=dates):
+                self.source_snapshots[81] = replace(archived, **dates)
                 doc, logs = self.process('apply', raw, semantic_result(match[0]))
                 self.assertEqual(doc, writer_document(raw))
                 self.assertIn('reason=candidate_publication_unverified', logs)
 
-        self.raw_repository.get_source_publication_times.side_effect = OSError('private-ingest-error')
+        self.source_snapshots[81] = None
         doc, logs = self.process('apply', raw, semantic_result(match[0]))
         self.assertEqual(doc, writer_document(raw))
-        self.assertIn('reason=candidate_publication_read_unavailable', logs)
+        self.assertIn('reason=candidate_source_unverified', logs)
+
+        self.raw_repository.get_source_article_snapshot.side_effect = OSError('private-ingest-error')
+        doc, logs = self.process('apply', raw, semantic_result(match[0]))
+        self.assertEqual(doc, writer_document(raw))
+        self.assertIn('reason=candidate_source_read_unavailable', logs)
         self.assertNotIn('private-ingest-error', logs)
 
     def test_context_that_would_overflow_the_text_column_is_discarded(self) -> None:

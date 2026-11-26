@@ -13,18 +13,21 @@ The check runs after duplicate screening and writer repair. It uses the existing
 semantic shortlist and embedding version. It makes one bounded passage read when
 there are eligible candidates. It requires an original source article published
 strictly before the current source and verifies the exact matched chunk. For a
-proposed sentence, it confirms the archived article's publication and ingestion
-timestamps by source ID. A publication timestamp at or after ingestion can be
-the fetcher's fallback for an undated report. The check skips those dates for
-both the current and earlier source. A late embedding, failed read, or
-unverifiable passage leaves article processing able to continue. The check
-uses zero model calls.
+proposed sentence, a source-ID lookup verifies the current raw article's URL,
+publication time, and normalized title and body hash against the indexed
+document. A correction can invalidate a passage before its new embedding is
+ready. A publication timestamp at or after ingestion can be the fetcher's
+fallback for an undated report. The check skips those dates for both the
+current and earlier source. A late embedding, failed read, or unverifiable
+passage leaves article processing able to continue. The check uses zero
+model calls.
 
 The first policy covers a report that withdrawals resumed for a specific named
 vault when a prior indexed report documents that vault's withdrawal pause and
 the draft still lacks that background. The citation date labels the report.
 Semantic distance orders candidates. The passage and the current development
-establish the connection.
+establish the connection. The check also reads the surrounding passage to
+distinguish a reported pause from an exercise scenario.
 
 ## DEV shadow pilot
 

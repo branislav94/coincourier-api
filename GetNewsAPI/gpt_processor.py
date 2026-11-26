@@ -36,8 +36,8 @@ from duplicate_detection.enforcement import DUPLICATE_COUNTER_NAMES, assess_dupl
 from semantic_retrieval.models import SemanticRetrievalStatus
 from semantic_retrieval.shadow import run_semantic_shadow, SemanticShadowRunResult
 from historical_context import (
-    HistoricalContextDecision, normalize_historical_source_url, select_historical_context,
-    verified_source_publication_time,
+    HistoricalContextDecision, archive_source_rejection, normalize_historical_source_url,
+    select_historical_context,
 )
 from repositories.raw_news import RawNewsRepository
 from repositories.publication_capacity import CapacityRepository
@@ -2364,18 +2364,19 @@ def _historical_context_fail_open(
                 elif len(contextual_body.encode('utf-8')) > RICH_ARTICLE_TEXT_MAX_BYTES:
                     reason = 'draft_storage_limit'
                 elif decision.candidate_source_article_id is None:
-                    reason = 'candidate_publication_unverified'
+                    reason = 'candidate_source_unverified'
                 else:
                     try:
-                        times = RawNewsRepository().get_source_publication_times(
+                        snapshot = RawNewsRepository().get_source_article_snapshot(
                             decision.candidate_source_article_id,
                         )
                     except Exception as error:
-                        reason = 'candidate_publication_read_unavailable'
+                        reason = 'candidate_source_read_unavailable'
                         error_type = type(error).__name__
                     else:
-                        if times is None or verified_source_publication_time(*times) != fact.report_time:
-                            reason = 'candidate_publication_unverified'
+                        rejection = archive_source_rejection(snapshot, fact)
+                        if rejection is not None:
+                            reason = rejection
                         elif mode == 'apply':
                             updated = contextual_doc
                             outcome = 'applied'

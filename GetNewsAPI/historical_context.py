@@ -6,7 +6,7 @@ import hashlib
 import math
 import re
 from collections import Counter
-from collections.abc import Mapping, Sequence
+from collections.abc import Iterator, Mapping, Sequence
 from dataclasses import dataclass
 from datetime import UTC, date, datetime
 from html import escape
@@ -19,7 +19,8 @@ from article_source_urls import normalize_source_url
 from duplicate_detection.identities import canonicalize_url, normalize_source_content
 from duplicate_detection.lexical import token_set_jaccard
 from duplicate_detection.policy import AssessmentType, assess_relationship
-from embeddings.chunking import normalize_text
+from embeddings.chunking import document_content_hash, normalize_text
+from repositories.raw_news import SourceArticleSnapshot
 from semantic_retrieval.models import MAX_SEMANTIC_TOP_K, SemanticCandidate, SemanticRetrievalStatus
 from semantic_retrieval.shadow import SemanticShadowRunResult
 from vector_store.models import SourcePassage, SourceType
@@ -64,6 +65,30 @@ _UNCERTAIN_PASSAGE = re.compile(
     r'withdrawals? (?:remained|stayed|continued to be) open)\b',
     re.IGNORECASE,
 )
+_HYPOTHETICAL_FRAME = re.compile(
+    r'\b(?:hypothetical(?:ly)?|fictional|table[ -]?top exercises?|'
+    r'(?:simulated|imagined) (?:scenario|incident)|(?:drill|exercise|simulation) scenario)\b',
+    re.IGNORECASE,
+)
+_DRILL_INTRODUCTION = re.compile(
+    r'^(?:in|during|for|as part of) (?:a|the|this) (?:[a-z-]+ ){0,2}(?:drill|simulation)\b',
+    re.IGNORECASE,
+)
+_HYPOTHETICAL_HEADING = re.compile(
+    r'^(?:hypothetical(?: tabletop)? exercise|hypothetical scenario|table[ -]?top exercise|'
+    r'drill scenario|simulated scenario):?$',
+    re.IGNORECASE,
+)
+_HYPOTHETICAL_FORWARD = re.compile(
+    r'\b(?:the following (?:hypothetical |simulated |fictional )?(?:scenario|exercise|example|account)'
+    r'|(?:scenario|exercise|example) below)\b',
+    re.IGNORECASE,
+)
+_HYPOTHETICAL_FOLLOWUP = re.compile(
+    r'^(?:(?:it|this|that) (?:is|was)|(?:the|this|that) '
+    r'(?:pause|event|incident|scenario|withdrawal freeze|statement|sentence|preceding account))\b',
+    re.IGNORECASE,
+)
 _PUBLIC_HOST = re.compile(r'[a-z0-9-]+(?:\.[a-z0-9-]+)*\.(?:[a-z]{2,}|xn--[a-z0-9-]+)')
 _MONTHS = (
     'January', 'February', 'March', 'April', 'May', 'June', 'July', 'August',
@@ -90,6 +115,7 @@ class HistoricalContextFact:
     event_date: date | None
     chunk_id: int
     chunk_hash: str
+    content_hash: str
 
     @property
     def report_date(self) -> date:
@@ -198,6 +224,34 @@ def verified_source_publication_time(published: object, ingested: object) -> dat
     return publication
 
 
+def archive_source_rejection(
+    snapshot: SourceArticleSnapshot | None,
+    fact: HistoricalContextFact,
+) -> str | None:
+    '''Verify the matched archive version against the current raw source.'''
+    if (
+        snapshot is None
+        or normalize_historical_source_url(snapshot.news_url) != fact.source_url
+        or not isinstance(snapshot.title, str)
+        or not snapshot.title.strip()
+        or not isinstance(snapshot.full_text, str)
+        or not isinstance(fact.content_hash, str)
+        or re.fullmatch(r'[0-9a-f]{64}', fact.content_hash) is None
+    ):
+        return 'candidate_source_unverified'
+    if verified_source_publication_time(snapshot.published_at, snapshot.inserted_at) != fact.report_time:
+        return 'candidate_publication_unverified'
+    try:
+        if not normalize_text(snapshot.full_text):
+            return 'candidate_source_unverified'
+        current_hash = document_content_hash(snapshot.title, snapshot.full_text)
+    except (AssertionError, ValueError):
+        return 'candidate_source_unverified'
+    if current_hash != fact.content_hash:
+        return 'candidate_source_superseded'
+    return None
+
+
 def _current_vault(article: Mapping[str, Any]) -> str | None:
     body = normalize_text(str(article.get('text') or article.get('full_text') or ''))
     lead = _SENTENCE_BREAK.split(body, maxsplit=1)[0]
@@ -285,6 +339,38 @@ def _passage_body(passage: SourcePassage) -> str:
     return passage.chunk_text.removeprefix(f'{title}\n\n') if title else passage.chunk_text
 
 
+def _introduces_hypothetical(sentence: str) -> bool:
+    '''Detect explicit framing of a drill, simulation or fictional scenario.'''
+    return bool(_HYPOTHETICAL_FRAME.search(sentence) or _DRILL_INTRODUCTION.match(sentence))
+
+
+def _pause_statements(body: str, title: str) -> Iterator[tuple[re.Match[str], bool]]:
+    '''Identify withdrawal statements and whether their local context is hypothetical.'''
+    previous = title.strip()
+    for paragraph in body.split('\n\n'):
+        # A new paragraph starts a new context unless the preceding text
+        # explicitly introduces a scenario that follows.
+        preceding_frame = bool(
+            _HYPOTHETICAL_HEADING.fullmatch(previous)
+            or (
+                _introduces_hypothetical(previous)
+                and (previous.endswith(':') or _HYPOTHETICAL_FORWARD.search(previous))
+            )
+        )
+        sentences = [sentence.strip() for sentence in _SENTENCE_BREAK.split(paragraph.strip())]
+        for index, sentence in enumerate(sentences):
+            preceding_frame = preceding_frame or _introduces_hypothetical(sentence)
+            match = _PAUSE.fullmatch(sentence)
+            if match is None:
+                continue
+            following = sentences[index + 1] if index + 1 < len(sentences) else ''
+            following_frame = bool(
+                _HYPOTHETICAL_FOLLOWUP.match(following) and _introduces_hypothetical(following)
+            )
+            yield match, preceding_frame or following_frame
+        previous = sentences[-1]
+
+
 def _inspect_passage(
     candidate: SemanticCandidate,
     passage: SourcePassage,
@@ -326,10 +412,12 @@ def _inspect_passage(
     if document.published_at is None:
         return _reject(candidate, 'candidate_date_missing')
     report_time = _utc(document.published_at)
-    for sentence in _SENTENCE_BREAK.split(_passage_body(passage)):
-        sentence = sentence.strip()
-        match = _PAUSE.fullmatch(sentence)
-        if match is None or match.group('vault').lower() != vault:
+    hypothetical_pause = False
+    for match, hypothetical in _pause_statements(_passage_body(passage), document.title):
+        if match.group('vault').lower() != vault:
+            continue
+        if hypothetical:
+            hypothetical_pause = True
             continue
         date_text = match.group('event_date')
         event_date = _parse_event_date(date_text) if date_text else None
@@ -344,9 +432,9 @@ def _inspect_passage(
             return _reject(candidate, 'unsafe_source_url')
         return HistoricalContextFact(
             source_url, report_time, match.group('vault'), event_date,
-            passage.chunk_id, passage.chunk_hash,
+            passage.chunk_id, passage.chunk_hash, document.content_hash,
         )
-    return _reject(candidate, 'unsupported_passage')
+    return _reject(candidate, 'hypothetical_passage' if hypothetical_pause else 'unsupported_passage')
 
 
 def select_historical_context(

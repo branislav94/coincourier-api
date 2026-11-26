@@ -587,22 +587,41 @@ class RepositoryIntegrationTests(MariaDBIntegrationCase):
             cursor.close()
             connection.close()
 
-    def test_source_publication_times_preserve_exact_and_missing_dates(self) -> None:
-        '''Read both original timestamp fields from the disposable application schema.'''
+    def test_source_snapshot_reads_corrections_with_unchanged_timestamps(self) -> None:
+        '''Read a source update by primary key with the original provenance fields.'''
+        from repositories.raw_news import SourceArticleSnapshot
+
         published_at = datetime(2026, 11, 24, 12, 34, 56)
         inserted_at = datetime(2026, 11, 25, 1, 2, 3)
-        for source_id, report_time in ((1, published_at), (2, inserted_at), (3, None)):
-            self.insert_raw(source_id, f'https://repository.example.test/source-{source_id}')
-            self.execute(
-                'UPDATE cryptonewsapi SET publish_date=%s, insertDate=%s WHERE id=%s',
-                (report_time, inserted_at, source_id),
-            )
-
+        url = 'https://repository.example.test/source-1'
+        title = 'Meridian Vault withdrawal status'
+        body = '<p>Meridian Vault paused withdrawals.</p>'
+        self.insert_raw(1, url)
+        self.execute(
+            'UPDATE cryptonewsapi SET title=%s, full_text=%s, publish_date=%s, insertDate=%s WHERE id=%s',
+            (title, body, published_at, inserted_at, 1),
+        )
         repository = self.RawNewsRepository(connect=self.repository_connect)
-        self.assertEqual(repository.get_source_publication_times(1), (published_at, inserted_at))
-        self.assertEqual(repository.get_source_publication_times(2), (inserted_at, inserted_at))
-        self.assertEqual(repository.get_source_publication_times(3), (None, inserted_at))
-        self.assertIsNone(repository.get_source_publication_times(4))
+        self.assertEqual(
+            repository.get_source_article_snapshot(1),
+            SourceArticleSnapshot(title, body, url, published_at, inserted_at),
+        )
+
+        corrected_body = '<p>Correction: Meridian Vault never paused withdrawals.</p>'
+        self.execute('UPDATE cryptonewsapi SET full_text=%s WHERE id=%s', (corrected_body, 1))
+        self.assertEqual(
+            repository.get_source_article_snapshot(1),
+            SourceArticleSnapshot(title, corrected_body, url, published_at, inserted_at),
+        )
+
+        for report_time in (inserted_at, None):
+            with self.subTest(report_time=report_time):
+                self.execute('UPDATE cryptonewsapi SET publish_date=%s, full_text=NULL WHERE id=%s', (report_time, 1))
+                self.assertEqual(
+                    repository.get_source_article_snapshot(1),
+                    SourceArticleSnapshot(title, None, url, report_time, inserted_at),
+                )
+        self.assertIsNone(repository.get_source_article_snapshot(2))
 
     def test_two_real_processing_workers_claim_one_row_once(self) -> None:
         self.insert_raw(1, "https://repository.example.test/raw-race")
