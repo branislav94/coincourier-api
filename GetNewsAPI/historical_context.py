@@ -116,6 +116,8 @@ class HistoricalContextFact:
     chunk_id: int
     chunk_hash: str
     content_hash: str
+    passage_body: str
+    pause_end_word: int
 
     @property
     def report_date(self) -> date:
@@ -242,14 +244,15 @@ def archive_source_rejection(
     if verified_source_publication_time(snapshot.published_at, snapshot.inserted_at) != fact.report_time:
         return 'candidate_publication_unverified'
     try:
-        if not normalize_text(snapshot.full_text):
+        body = normalize_text(snapshot.full_text)
+        if not body:
             return 'candidate_source_unverified'
         current_hash = document_content_hash(snapshot.title, snapshot.full_text)
     except (AssertionError, ValueError):
         return 'candidate_source_unverified'
     if current_hash != fact.content_hash:
         return 'candidate_source_superseded'
-    return None
+    return _archive_pause_rejection(body, fact)
 
 
 def _current_vault(article: Mapping[str, Any]) -> str | None:
@@ -344,9 +347,31 @@ def _introduces_hypothetical(sentence: str) -> bool:
     return bool(_HYPOTHETICAL_FRAME.search(sentence) or _DRILL_INTRODUCTION.match(sentence))
 
 
-def _pause_statements(body: str, title: str) -> Iterator[tuple[re.Match[str], bool]]:
-    '''Identify withdrawal statements and whether their local context is hypothetical.'''
+def _is_hypothetical_followup(sentence: str) -> bool:
+    return bool(_HYPOTHETICAL_FOLLOWUP.match(sentence) and _introduces_hypothetical(sentence))
+
+
+def _archive_pause_rejection(body: str, fact: HistoricalContextFact) -> str | None:
+    '''Check the next sentence after the selected pause in the verified source.'''
+    # Match the entire passage to anchor this occurrence of the pause. The
+    # ingestion chunker can fold whitespace when it packs sentences together.
+    words = [re.escape(word) for word in fact.passage_body.split()]
+    through_pause = r'\s+'.join(words[:fact.pause_end_word])
+    rest_of_passage = ''.join(r'\s+' + word for word in words[fact.pause_end_word:])
+    pattern = re.compile(rf'(?<!\S)({through_pause}){rest_of_passage}(?!\S)')
+    passage = pattern.search(body)
+    if passage is None or pattern.search(body, passage.start() + 1) is not None:
+        return 'candidate_source_unverified'
+
+    remaining = body[passage.end(1):].lstrip()
+    following = _SENTENCE_BREAK.split(remaining, maxsplit=1)[0]
+    return 'hypothetical_passage' if _is_hypothetical_followup(following) else None
+
+
+def _pause_statements(body: str, title: str) -> Iterator[tuple[re.Match[str], bool, int]]:
+    '''Yield each pause, its local framing, and its end as a passage word count.'''
     previous = title.strip()
+    word_count = 0
     for paragraph in body.split('\n\n'):
         # A new paragraph starts a new context unless the preceding text
         # explicitly introduces a scenario that follows.
@@ -359,15 +384,13 @@ def _pause_statements(body: str, title: str) -> Iterator[tuple[re.Match[str], bo
         )
         sentences = [sentence.strip() for sentence in _SENTENCE_BREAK.split(paragraph.strip())]
         for index, sentence in enumerate(sentences):
+            word_count += len(sentence.split())
             preceding_frame = preceding_frame or _introduces_hypothetical(sentence)
             match = _PAUSE.fullmatch(sentence)
             if match is None:
                 continue
             following = sentences[index + 1] if index + 1 < len(sentences) else ''
-            following_frame = bool(
-                _HYPOTHETICAL_FOLLOWUP.match(following) and _introduces_hypothetical(following)
-            )
-            yield match, preceding_frame or following_frame
+            yield match, preceding_frame or _is_hypothetical_followup(following), word_count
         previous = sentences[-1]
 
 
@@ -413,7 +436,8 @@ def _inspect_passage(
         return _reject(candidate, 'candidate_date_missing')
     report_time = _utc(document.published_at)
     hypothetical_pause = False
-    for match, hypothetical in _pause_statements(_passage_body(passage), document.title):
+    body = _passage_body(passage)
+    for match, hypothetical, pause_end_word in _pause_statements(body, document.title):
         if match.group('vault').lower() != vault:
             continue
         if hypothetical:
@@ -432,7 +456,7 @@ def _inspect_passage(
             return _reject(candidate, 'unsafe_source_url')
         return HistoricalContextFact(
             source_url, report_time, match.group('vault'), event_date,
-            passage.chunk_id, passage.chunk_hash, document.content_hash,
+            passage.chunk_id, passage.chunk_hash, document.content_hash, body, pause_end_word,
         )
     return _reject(candidate, 'hypothetical_passage' if hypothetical_pause else 'unsupported_passage')
 

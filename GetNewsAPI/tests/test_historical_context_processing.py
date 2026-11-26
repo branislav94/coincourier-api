@@ -24,7 +24,8 @@ import gpt_processor as gp
 import historical_context
 from duplicate_detection.enforcement import DuplicateDecision
 from duplicate_detection.policy import AssessmentType, assess_relationship
-from embeddings.chunking import prepare_document
+from embeddings.chunking import CHUNK_TARGET_TOKENS, estimate_tokens, prepare_document
+from embeddings.models import PreparedDocument
 from publishing.models import PublicationArticle, PublicationContext
 from publishing.wordpress import publisher
 from repositories.raw_news import RawNewsRepository, SourceArticleSnapshot
@@ -106,12 +107,13 @@ def indexed_passage(
     url: str | None = ARCHIVE_URL, published: datetime = REPORT_TIME,
     source_type: SourceType = SourceType.SOURCE_ARTICLE, distance: float = 0.02,
     raw: dict[str, Any] | None = None,
+    prepared: PreparedDocument | None = None, chunk_index: int = -1,
 ) -> tuple[SemanticCandidate, SourcePassage]:
     '''Build a matching candidate and a passage row for the vector repository boundary.'''
     current = current_article() if raw is None else raw
     source_key = f'{source_type.value}:{source_id}'
-    prepared = prepare_document(title, archive_body(text))
-    chunk = prepared.chunks[-1]
+    prepared = prepared if prepared is not None else prepare_document(title, archive_body(text))
+    chunk = prepared.chunks[chunk_index]
     document = VectorDocumentRecord(
         id=document_id, document_key=source_key, source_type=source_type, source_article_id=source_id,
         rich_article_id=None if source_type is SourceType.SOURCE_ARTICLE else source_id,
@@ -336,6 +338,83 @@ class HistoricalContextProcessingTests(unittest.TestCase):
                     self.assertEqual(self.publish(doc, raw), before)
                     self.assertIn('decision=skipped reason=hypothetical_passage', logs)
         self.raw_repository.get_source_article_snapshot.assert_not_called()
+
+    def test_pause_reframed_in_next_html_paragraph_is_not_used(self) -> None:
+        raw = current_article()
+        off, _ = self.process('off', raw, None)
+        before = self.publish(off, raw)
+        title = 'Report on Meridian Vault operations'
+        pause = 'Meridian Vault paused withdrawals on November 24, 2026.'
+        qualifier = 'That pause was part of a tabletop exercise.'
+        prefix_size = (
+            CHUNK_TARGET_TOKENS - estimate_tokens(title) - estimate_tokens(pause) - estimate_tokens('record.')
+        )
+        for separate_chunks in (False, True):
+            prefix = f'<p>{"archive " * prefix_size}record.</p>' if separate_chunks else ''
+            archive_html = f'{prefix}<p>{pause}</p><p>{qualifier}</p>'
+            prepared = prepare_document(title, archive_html)
+            pause_chunk = next(chunk for chunk in prepared.chunks if pause in chunk.text)
+            qualifier_chunk = next(chunk for chunk in prepared.chunks if qualifier in chunk.text)
+            self.assertIn(f'{pause}\n\n{qualifier}', prepared.text)
+            if separate_chunks:
+                self.assertEqual(qualifier_chunk.index, pause_chunk.index + 1)
+                self.assertTrue(pause_chunk.text.endswith(pause))
+                self.assertTrue(qualifier_chunk.text.startswith(qualifier))
+            else:
+                self.assertEqual(qualifier_chunk.index, pause_chunk.index)
+                self.assertIn(f'{pause}\n\n{qualifier}', pause_chunk.text)
+
+            match = indexed_passage(title=title, prepared=prepared, chunk_index=pause_chunk.index)
+            self.use_passages(match)
+            archived = self.source_snapshots[81]
+            assert archived is not None
+            self.source_snapshots[81] = replace(archived, full_text=archive_html)
+            for mode in ('shadow', 'apply'):
+                with self.subTest(mode=mode, separate_chunks=separate_chunks):
+                    doc, logs = self.process(mode, raw, semantic_result(match[0]))
+                    self.assertEqual(self.publish(doc, raw), before)
+                    self.assertEqual(doc, off)
+                    self.assertIn('decision=skipped reason=hypothetical_passage', logs)
+
+    def test_adjacent_context_applies_to_the_matched_occurrence_of_a_repeated_pause(self) -> None:
+        raw = current_article()
+        off, _ = self.process('off', raw, None)
+        before, _ = self.publish(off, raw)
+        title = 'Report on Meridian Vault operations'
+        pause = 'Meridian Vault paused withdrawals on November 24, 2026.'
+        correction = 'That pause was part of a tabletop exercise.'
+        unrelated = 'This week, an unrelated team held a tabletop exercise.'
+        padding_budget = CHUNK_TARGET_TOKENS - estimate_tokens(pause) - estimate_tokens('record.')
+        first_padding = 'archive ' * (padding_budget - estimate_tokens(title))
+        second_padding = 'registry ' * (padding_budget - estimate_tokens(correction))
+        archive_html = (
+            f'<p>{first_padding}record.</p><p>{pause}</p><p>{correction}</p>'
+            f'<p>{second_padding}record.</p><p>{pause}</p><p>{unrelated}</p>'
+        )
+        prepared = prepare_document(title, archive_html)
+        self.assertEqual(prepared.text.count(pause), 2)
+        self.assertEqual(len(prepared.chunks), 3)
+        first, second, third = prepared.chunks
+        self.assertTrue(first.text.endswith(pause))
+        self.assertTrue(second.text.startswith(correction))
+        self.assertTrue(second.text.endswith(pause))
+        self.assertTrue(third.text.startswith(unrelated))
+
+        for chunk, expected in ((first, 'skipped reason=hypothetical_passage'), (second, 'applied reason=suggested')):
+            with self.subTest(chunk_index=chunk.index):
+                match = indexed_passage(title=title, prepared=prepared, chunk_index=chunk.index)
+                self.use_passages(match)
+                archived = self.source_snapshots[81]
+                assert archived is not None
+                self.source_snapshots[81] = replace(archived, full_text=archive_html)
+                doc, logs = self.process('apply', raw, semantic_result(match[0]))
+                after, _ = self.publish(doc, raw)
+                if chunk is first:
+                    self.assertEqual(after, before)
+                else:
+                    self.assertEqual(after['content'].count(ARCHIVE_URL), 1)
+                    self.assertNotIn('tabletop exercise', after['content'])
+                self.assertIn(f'decision={expected}', logs)
 
     def test_real_pause_near_an_unrelated_drill_is_still_eligible(self) -> None:
         raw = current_article()
