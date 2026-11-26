@@ -315,6 +315,8 @@ class SemanticRetrievalService:
                 6,
             ),
             source_type=best_match.source_type,
+            best_candidate_chunk_id=best_match.chunk_id,
+            best_candidate_chunk_hash=best_match.chunk_hash,
         )
 
     def _result(

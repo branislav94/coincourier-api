@@ -2,7 +2,9 @@
 
 from __future__ import annotations
 
+from contextlib import closing
 from dataclasses import dataclass
+from datetime import datetime
 from typing import Any, Callable, Collection
 
 import mysql.connector
@@ -25,6 +27,21 @@ class RawNewsRepository:
 
     def __init__(self, connect: Callable[[], Any] | None = None) -> None:
         self._connect = connect or (lambda: mysql.connector.connect(**DB_CONFIG))
+
+    def get_source_publication_times(
+        self,
+        source_article_id: int,
+    ) -> tuple[datetime | None, datetime | None] | None:
+        '''Read the source publication time and ingest time without article content.'''
+        if source_article_id <= 0:
+            raise ValueError('source_article_id must be positive')
+        with closing(self._connect()) as connection, closing(connection.cursor()) as cursor:
+            cursor.execute(
+                'SELECT publish_date, insertDate FROM cryptonewsapi WHERE id=%s',
+                (source_article_id,),
+            )
+            row = cursor.fetchone()
+            return (row[0], row[1]) if row else None
 
     def claim_next(
         self,

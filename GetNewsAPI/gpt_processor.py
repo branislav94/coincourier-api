@@ -16,6 +16,7 @@ from config import (
     DUPLICATE_SHADOW_ENABLED,
     DUPLICATE_ENFORCEMENT_MODE,
     SEMANTIC_SHADOW_ENABLED,
+    RAG_CONTEXT_MODE,
     VECTOR_ENABLED,
     OPENAI_API_KEY,
     OPENAI_MAX_OUTPUT_TOKENS,
@@ -32,7 +33,12 @@ from config import (
 )
 from duplicate_detection.shadow import analyze_duplicates_in_shadow
 from duplicate_detection.enforcement import DUPLICATE_COUNTER_NAMES, assess_duplicate_enforcement
-from semantic_retrieval.shadow import run_semantic_shadow
+from semantic_retrieval.models import SemanticRetrievalStatus
+from semantic_retrieval.shadow import run_semantic_shadow, SemanticShadowRunResult
+from historical_context import (
+    HistoricalContextDecision, normalize_historical_source_url, select_historical_context,
+    verified_source_publication_time,
+)
 from repositories.raw_news import RawNewsRepository
 from repositories.publication_capacity import CapacityRepository
 from repositories.state import claim_prefix, safe_error_message
@@ -74,6 +80,7 @@ _session.headers.update({
 
 MAX_RETRIES   = 7
 BASE_SLEEP    = 2 
+RICH_ARTICLE_TEXT_MAX_BYTES = 65_535  # rich_crpytonews.full_text is a MariaDB TEXT column.
 
 TRANSITION_WORDS = {
     "however","therefore","moreover","furthermore","meanwhile","instead",
@@ -2217,7 +2224,7 @@ def _run_duplicate_shadow_fail_open(raw: dict) -> None:
         )
 
 
-def _run_semantic_shadow_fail_open(raw: dict) -> Any:
+def _run_semantic_shadow_fail_open(raw: dict) -> SemanticShadowRunResult | None:
     article_id = raw.get("id")
     if not VECTOR_ENABLED:
         logging.info(
@@ -2313,6 +2320,95 @@ def _processing_duplicate(raw: dict, decision: Any, *, mark_complete: bool) -> P
     return ProcessingDuplicate(decision)
 
 
+def _historical_context_fail_open(
+    doc: dict[str, Any],
+    raw: dict[str, Any],
+    semantic: SemanticShadowRunResult | None,
+    *,
+    mode: str,
+) -> dict[str, Any]:
+    '''Evaluate and validate the optional paragraph without changing the base draft.'''
+    started = time.monotonic()
+    decision = HistoricalContextDecision(reason='evaluation_failed')
+    outcome = 'skipped'
+    error_type = None
+    updated = doc
+    try:
+        body = doc.get('full_text')
+        if not isinstance(body, str):
+            reason = 'invalid_draft_body'
+        elif semantic is None and not VECTOR_ENABLED:
+            reason = 'vector_disabled'
+        elif semantic is None and not SEMANTIC_SHADOW_ENABLED:
+            reason = 'semantic_disabled'
+        else:
+            decision = select_historical_context(raw, body, semantic)
+            reason = decision.reason
+            if decision.fact is not None:
+                fact = decision.fact
+                sentence = fact.sentence_html()
+                contextual_body = f'{body}\n<p>{sentence}</p>'
+                contextual_doc = {**doc, 'full_text': contextual_body}
+                if (
+                    normalize_historical_source_url(fact.source_url) != fact.source_url
+                    or _normalized_source_urls(sentence) != [fact.source_url]
+                    or fact.source_url in _normalized_source_urls(body)
+                    or fact.source_url not in _normalized_source_urls(contextual_body)
+                ):
+                    reason = 'citation_insertion_invalid'
+                elif (
+                    hard_article_validation_failures(doc, raw)
+                    or hard_article_validation_failures(contextual_doc, raw)
+                ):
+                    reason = 'draft_validation_failed'
+                elif len(contextual_body.encode('utf-8')) > RICH_ARTICLE_TEXT_MAX_BYTES:
+                    reason = 'draft_storage_limit'
+                elif decision.candidate_source_article_id is None:
+                    reason = 'candidate_publication_unverified'
+                else:
+                    try:
+                        times = RawNewsRepository().get_source_publication_times(
+                            decision.candidate_source_article_id,
+                        )
+                    except Exception as error:
+                        reason = 'candidate_publication_read_unavailable'
+                        error_type = type(error).__name__
+                    else:
+                        if times is None or verified_source_publication_time(*times) != fact.report_time:
+                            reason = 'candidate_publication_unverified'
+                        elif mode == 'apply':
+                            updated = contextual_doc
+                            outcome = 'applied'
+                        else:
+                            outcome = 'would_apply'
+    except Exception as error:
+        # An optional context error must never fall into writer retries or log source text.
+        reason = 'evaluation_failed'
+        error_type = type(error).__name__
+    for rejected in decision.rejections:
+        logging.info(
+            '[RAG-CONTEXT] mode=%s event=candidate_skipped article_id=%s '
+            'candidate_source_article_id=%s candidate_document_id=%s chunk_index=%s reason=%s details=%s',
+            mode, raw.get('id'), rejected.candidate_source_article_id,
+            rejected.candidate_document_id, rejected.chunk_index, rejected.reason,
+            ','.join(rejected.details) or '-',
+        )
+    logging.info(
+        '[RAG-CONTEXT] mode=%s event=decision article_id=%s '
+        'query_document_id=%s embedding_version=%s candidate_source_article_id=%s '
+        'candidate_document_id=%s chunk_index=%s chunk_id=%s chunk_hash=%s '
+        'report_date=%s decision=%s reason=%s error_type=%s latency_ms=%.1f',
+        mode, raw.get('id'), semantic.query_document_id if semantic is not None else None,
+        semantic.embedding_version if semantic is not None else None,
+        decision.candidate_source_article_id, decision.candidate_document_id, decision.chunk_index,
+        decision.fact.chunk_id if decision.fact else None,
+        decision.fact.chunk_hash if decision.fact else None,
+        decision.fact.report_date if decision.fact else None, outcome, reason, error_type,
+        (time.monotonic() - started) * 1000,
+    )
+    return updated
+
+
 @research_citation_scope()
 def process_one(raw, *, mark_complete=True, on_error=None, duplicate_counters=None):
     """
@@ -2327,6 +2423,7 @@ def process_one(raw, *, mark_complete=True, on_error=None, duplicate_counters=No
         - Repair if needed (repair_if_needed)
         - Add schema_jsonld if missing (build_news_schema_jsonld)
         - Ensure video URL is embedded if applicable
+        - Evaluate optional historical context from the existing semantic matches
         - Store into rich_crpytonews (store_rich_news)
         - Mark original row processed (mark_processed)
 
@@ -2369,6 +2466,19 @@ def process_one(raw, *, mark_complete=True, on_error=None, duplicate_counters=No
                     duplicate_counters["fail_open_unavailable_embeddings"] = 1
         extra = enrich_with_search(raw)
         video_url = _maybe_video_url(raw)
+        if RAG_CONTEXT_MODE != 'off':
+            status = semantic.retrieval_status if semantic is not None else None
+            embeddings_ready = semantic.query_embeddings_ready if semantic is not None else None
+            if embeddings_ready is None:
+                embeddings_ready = status in {SemanticRetrievalStatus.RETRIEVED, SemanticRetrievalStatus.NO_CANDIDATES}
+            logging.info(
+                '[RAG-CONTEXT] mode=%s event=generation_started article_id=%s '
+                'query_document_id=%s embeddings_ready=%s retrieval_status=%s',
+                RAG_CONTEXT_MODE, raw.get('id'),
+                semantic.query_document_id if semantic is not None else None,
+                embeddings_ready,
+                status.value if status is not None else None,
+            )
         draft, text_provider = classify_and_rewrite(raw, extra, video_url)
         final_doc = repair_if_needed(raw, extra, draft, text_provider)
 
@@ -2381,6 +2491,8 @@ def process_one(raw, *, mark_complete=True, on_error=None, duplicate_counters=No
             final_doc["full_text"] = re.sub(r"</p>", f"</p>\n<p>{video_url}</p>", final_doc["full_text"], count=1, flags=re.I)
 
         final_doc = _clean_final_article_links(final_doc, raw)
+        if RAG_CONTEXT_MODE != 'off':
+            final_doc = _historical_context_fail_open(final_doc, raw, semantic, mode=RAG_CONTEXT_MODE)
         _capture_quality_stage(
             'article.post_cleanup', article_context=raw, provider=text_provider,
             model=_provider_model(text_provider, REWRITE_MODEL), document=final_doc,

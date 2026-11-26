@@ -193,6 +193,80 @@ class VectorMariaDBIntegrationTests(unittest.TestCase):
             cursor.close()
             connection.close()
 
+    def test_source_passages_read_only_exact_source_pairs_and_version(self) -> None:
+        '''Read matched passages on the native vector schema with provenance.'''
+        version = 'synthetic:test:1536:chunk-v1'
+        published_at = datetime(2026, 9, 1, 12)
+        first = self.repository.upsert_document(
+            self.source_document(100, title='First source', published_at=published_at)
+        )
+        second = self.repository.upsert_document(
+            self.source_document(101, title='Second source', published_at=published_at)
+        )
+        alternate_document = self.repository.upsert_document(
+            self.source_document(
+                100,
+                title='Different source revision',
+                published_at=published_at,
+                content_version='source-v2',
+            )
+        )
+        generated = self.repository.upsert_document(
+            VectorDocumentDraft(
+                source_type=SourceType.COINCOURIER_GENERATED,
+                source_article_id=100,
+                rich_article_id=1000,
+                source_url='https://coincourier.example.test/1000',
+                title='Generated copy',
+                published_at=published_at,
+                content_hash=digest('Generated copy'),
+                content_version='generated-v1',
+            )
+        )
+        for document_id, index, text in (
+            (first, 0, 'Unmatched first passage'),
+            (first, 1, 'Matched first passage'),
+            (second, 0, 'Matched second passage'),
+            (second, 1, 'Unmatched second passage'),
+            (alternate_document, 1, 'Unmatched source revision'),
+            (generated, 0, 'Generated passage'),
+        ):
+            self.add_chunk(
+                document_id,
+                vector=fake_vector(1.0),
+                text=text,
+                chunk_index=index,
+                version=version,
+            )
+        self.add_chunk(
+            first,
+            vector=fake_vector(1.0),
+            text='Unmatched embedding version',
+            chunk_index=1,
+            version='synthetic:test:1536:chunk-v2',
+        )
+
+        passages = self.repository.get_source_passages(
+            [(first, 1), (second, 0), (generated, 0), (first, 2), (first, 1)],
+            embedding_version=version,
+        )
+
+        self.assertEqual(set(passages), {(first, 1), (second, 0)})
+        passage = passages[(first, 1)]
+        self.assertEqual(passage.document, self.repository.get_document(first))
+        self.assertEqual(passage.document.source_url, 'https://source.example.test/100')
+        self.assertEqual(passage.document.published_at, published_at)
+        self.assertEqual(passage.chunk_index, 1)
+        self.assertGreater(passage.chunk_id, 0)
+        self.assertEqual(passage.chunk_text, 'Matched first passage')
+        self.assertEqual(passage.chunk_hash, digest('Matched first passage'))
+        self.assertEqual(passage.embedding_version, version)
+        self.assertEqual(passages[(second, 0)].chunk_text, 'Matched second passage')
+        self.assertEqual(
+            self.repository.get_source_passages([(first, 1)], embedding_version=version.upper()),
+            {},
+        )
+
     def test_001_clean_migrations_schema_and_rerun(self) -> None:
         connection = _connect()
         try:

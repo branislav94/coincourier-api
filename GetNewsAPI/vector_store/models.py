@@ -67,6 +67,18 @@ class VectorDocumentRecord:
 
 
 @dataclass(frozen=True)
+class SourcePassage:
+    '''Indexed text and provenance for one matched source chunk.'''
+
+    document: VectorDocumentRecord
+    chunk_id: int
+    chunk_index: int
+    chunk_text: str
+    chunk_hash: str
+    embedding_version: str
+
+
+@dataclass(frozen=True)
 class VectorChunkRecord:
     id: int
     document_id: int

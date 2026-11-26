@@ -12,7 +12,7 @@ from datetime import datetime, timezone
 import os
 from typing import Mapping
 
-from .editorial_modes import EditorialModeError, duplicate_mode, public_copy_mode
+from .editorial_modes import EditorialModeError, duplicate_mode, public_copy_mode, rag_context_mode
 
 
 TRUE_VALUES = frozenset({"1", "true", "yes", "y", "on"})
@@ -291,7 +291,7 @@ def validate_runtime_config(
     vector_enabled = _boolean(env, "VECTOR_ENABLED", False, issues)
     embedding_enabled = _boolean(env, "EMBEDDING_ENABLED", False, issues)
     semantic_enabled = _boolean(env, "SEMANTIC_SHADOW_ENABLED", False, issues)
-    for parse_mode in (duplicate_mode, public_copy_mode):
+    for parse_mode in (duplicate_mode, public_copy_mode, rag_context_mode):
         try:
             parse_mode(env)
         except EditorialModeError as error:

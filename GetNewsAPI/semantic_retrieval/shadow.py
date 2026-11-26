@@ -8,7 +8,7 @@ from dataclasses import dataclass, replace
 from datetime import UTC, datetime
 from typing import Protocol
 
-from vector_store.models import SourceType
+from vector_store.models import SourceType, VectorChunkRecord
 from vector_store.repository import VectorRepository
 from vector_store.semantic_assessments import (
     SemanticAssessmentDraft,
@@ -41,11 +41,23 @@ class _TrackingRepository:
     def __init__(self, repository: SemanticVectorRepository) -> None:
         self._repository = repository
         self.query_document_id: int | None = None
+        self.query_embeddings_ready = False
 
     def get_latest_source_document(self, source_article_id: int):
         document = self._repository.get_latest_source_document(source_article_id)
         self.query_document_id = document.id if document is not None else None
         return document
+
+    def get_chunks(
+        self,
+        document_id: int,
+        *,
+        embedding_version: str | None = None,
+    ) -> list[VectorChunkRecord]:
+        '''Retain readiness when the subsequent similarity lookup is unavailable.'''
+        chunks = self._repository.get_chunks(document_id, embedding_version=embedding_version)
+        self.query_embeddings_ready = any(chunk.embedding_version == embedding_version for chunk in chunks)
+        return chunks
 
     def __getattr__(self, name: str):
         return getattr(self._repository, name)
@@ -73,6 +85,8 @@ class SemanticShadowRunResult:
     rollback_failed: bool = False
     cursor_close_failed: bool = False
     connection_close_failed: bool = False
+    query_published_at: datetime | None = None
+    query_embeddings_ready: bool | None = None
 
 
 def _configured_defaults() -> tuple[bool, bool, str]:
@@ -347,6 +361,8 @@ def run_semantic_shadow(
             best_native_distance=draft.best_native_distance,
             error_type=error_type,
             candidates=validated_candidates,
+            query_published_at=retrieval.query_published_at if retrieval else None,
+            query_embeddings_ready=tracking_repository.query_embeddings_ready,
             persistence_operation=diagnostic.operation if diagnostic else None,
             database_errno=diagnostic.errno if diagnostic else None,
             database_sqlstate=diagnostic.sqlstate if diagnostic else None,
@@ -391,6 +407,8 @@ def run_semantic_shadow(
         error_type=(type(retrieval_error).__name__ if retrieval_error else None),
         candidates=validated_candidates,
         transaction_outcome="committed",
+        query_published_at=retrieval.query_published_at if retrieval else None,
+        query_embeddings_ready=tracking_repository.query_embeddings_ready,
     )
     _log_result(result)
     return result

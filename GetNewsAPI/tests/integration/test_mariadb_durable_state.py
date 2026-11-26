@@ -14,6 +14,7 @@ import threading
 import time
 import unittest
 from concurrent.futures import ThreadPoolExecutor
+from datetime import datetime
 from pathlib import Path
 from typing import Any
 
@@ -585,6 +586,23 @@ class RepositoryIntegrationTests(MariaDBIntegrationCase):
         finally:
             cursor.close()
             connection.close()
+
+    def test_source_publication_times_preserve_exact_and_missing_dates(self) -> None:
+        '''Read both original timestamp fields from the disposable application schema.'''
+        published_at = datetime(2026, 11, 24, 12, 34, 56)
+        inserted_at = datetime(2026, 11, 25, 1, 2, 3)
+        for source_id, report_time in ((1, published_at), (2, inserted_at), (3, None)):
+            self.insert_raw(source_id, f'https://repository.example.test/source-{source_id}')
+            self.execute(
+                'UPDATE cryptonewsapi SET publish_date=%s, insertDate=%s WHERE id=%s',
+                (report_time, inserted_at, source_id),
+            )
+
+        repository = self.RawNewsRepository(connect=self.repository_connect)
+        self.assertEqual(repository.get_source_publication_times(1), (published_at, inserted_at))
+        self.assertEqual(repository.get_source_publication_times(2), (inserted_at, inserted_at))
+        self.assertEqual(repository.get_source_publication_times(3), (None, inserted_at))
+        self.assertIsNone(repository.get_source_publication_times(4))
 
     def test_two_real_processing_workers_claim_one_row_once(self) -> None:
         self.insert_raw(1, "https://repository.example.test/raw-race")

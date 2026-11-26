@@ -14,7 +14,7 @@ All values are sourced from environment variables to avoid hardcoding secrets.
 import os
 from datetime import datetime, timezone
 from dotenv import load_dotenv
-from runtime.editorial_modes import duplicate_mode, public_copy_mode
+from runtime.editorial_modes import duplicate_mode, public_copy_mode, rag_context_mode
 
 load_dotenv()  # Load environment variables from .env file
 
@@ -363,6 +363,8 @@ SEMANTIC_EVIDENCE_VERSION = (
     os.getenv("SEMANTIC_EVIDENCE_VERSION", "semantic-shadow-v1").strip()
     or "semantic-shadow-v1"
 )
+
+RAG_CONTEXT_MODE = rag_context_mode(os.environ).mode
 
 # WordPress REST API credentials
 WP_API_URL = os.getenv("WP_API_URL")
