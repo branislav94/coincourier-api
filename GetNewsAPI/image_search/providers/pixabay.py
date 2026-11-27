@@ -13,6 +13,7 @@ from config import (
 
 from ..cache import CachedHttpClient
 from ..models import ImageCandidate
+from ..photo_description import photo_subject_from_tags
 from ..provider import ImageSearchProvider
 
 
@@ -90,4 +91,5 @@ class PixabayProvider(ImageSearchProvider):
                 "likes": raw.get("likes"),
             },
             subject_text=tags if isinstance(tags, str) else '',
+            photo_description=photo_subject_from_tags(tags),
         )

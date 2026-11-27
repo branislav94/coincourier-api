@@ -61,6 +61,7 @@ from stock_images import StockImageCandidate, find_stock_image
 from image_search import search_images
 from image_search.emergency import VISION_CONTEXT_MISMATCH, rescue_images
 from image_search.models import ImageSearchResult, RescueValidationResult
+from image_search.photo_description import normalize_photo_description
 from image_search.preparation import cover_bytes_to_1536x1024 as _cover_bytes_to_1536x1024
 from .attribution import build_public_attribution
 from image_search.license_policy import normalize_license_name
@@ -1318,6 +1319,7 @@ def _stock_image_content_v1(article: dict[str, Any]) -> tuple[bytes, str, dict[s
         "credit_url": candidate.credit_url,
         "provider_asset_id": candidate.provider_asset_id,
         "asset_key": candidate.asset_key,
+        'photo_description': candidate.photo_description,
         "image_url_hash": hashlib.sha256(candidate.image_url.encode("utf-8")).hexdigest(),
         "openai_fallback_used": False,
         "width": dims.get("width"),
@@ -1367,6 +1369,7 @@ def _candidate_stock_content(candidate: Any, downloaded: Any, converted: Any) ->
         "provider": candidate.provider,
         "asset_id": candidate.asset_id,
         "asset_key": candidate.asset_key,
+        'photo_description': candidate.photo_description,
         "image_url": candidate.usable_url,
         "image_url_hash": candidate.url_hash,
         "canonical_source": candidate.canonical_source,
@@ -1817,9 +1820,12 @@ def _upload_prepared_image(
             image_meta.get("score"),
             image_meta.get("openai_fallback_used"),
         )
+        alt_text = article_context.get('seo_focus') or article_context.get('title') or ''
+        if required_attribution:
+            alt_text = normalize_photo_description(selected_meta.get('photo_description'))
         metadata_saved = set_media_details(
             media_id,
-            article_context.get("seo_focus") or article_context.get("title") or "",
+            alt_text,
             caption=public_caption or None,
             description=attachment_description or None,
             required_attribution=required_attribution,

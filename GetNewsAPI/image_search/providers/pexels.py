@@ -77,4 +77,5 @@ class PexelsProvider(ImageSearchProvider):
             provider_threshold=self.candidate_threshold,
             metadata={"metadata_text": metadata_text, "liked": bool(raw.get("liked"))},
             subject_text=alt if isinstance(alt, str) else '',
+            photo_description=alt if isinstance(alt, str) else '',
         )

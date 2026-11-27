@@ -40,6 +40,8 @@ class ImageCandidate:
     identity_aliases: list[str] = field(default_factory=list)
     # Provider-supplied descriptions of the image, separate from ranking metadata.
     subject_text: str = ''
+    # Photo-specific provider copy for public alt text.
+    photo_description: str = ''
 
     def __post_init__(self) -> None:
         self.provider = (self.provider or "").strip().lower()

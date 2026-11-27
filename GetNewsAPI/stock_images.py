@@ -33,6 +33,7 @@ from config import (
     STOCK_IMAGE_USAGE_PATH,
     WP_DB_CONFIG,
 )
+from image_search.photo_description import normalize_photo_description, photo_subject_from_tags
 from image_search.subject_policy import article_correlation_id, rejected_subject_assets
 
 
@@ -126,6 +127,7 @@ class StockImageCandidate:
     metadata_text: str = ""
     score_parts: dict[str, float] = field(default_factory=dict)
     subject_text: str = ''
+    photo_description: str = ''
 
     def __post_init__(self) -> None:
         if self.asset_key:
@@ -598,6 +600,7 @@ def _pexels_candidates(query: str, article: dict[str, Any]) -> list[StockImageCa
                 metadata_text=metadata_text,
                 score_parts=parts,
                 subject_text=subject_text if isinstance(subject_text, str) else '',
+                photo_description=normalize_photo_description(subject_text),
             )
         )
     return candidates
@@ -655,6 +658,7 @@ def _pixabay_candidates(query: str, article: dict[str, Any]) -> list[StockImageC
                 metadata_text=metadata_text,
                 score_parts=parts,
                 subject_text=subject_text if isinstance(subject_text, str) else '',
+                photo_description=photo_subject_from_tags(subject_text),
             )
         )
     return candidates

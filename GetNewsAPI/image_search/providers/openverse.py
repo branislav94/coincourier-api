@@ -307,4 +307,5 @@ class OpenverseProvider(ImageSearchProvider):
                 "attribution_complete": bool(authoritative_complete or (attribution and can_generate_attribution)),
             },
             subject_text=' '.join(subject_parts),
+            photo_description=raw_title if isinstance(raw_title, str) else '',
         )

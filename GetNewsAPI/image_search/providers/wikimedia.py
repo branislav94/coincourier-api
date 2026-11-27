@@ -13,6 +13,7 @@ from ..cache import CachedHttpClient
 from ..commons_identity import COMMONS_PAGE_HOSTS, commons_identities, commons_identity_conflict, normalize_commons_identity
 from ..downloader import IMAGE_SEARCH_USER_AGENT, MAX_IMAGE_BYTES
 from ..models import ImageCandidate
+from ..photo_description import normalize_photo_description
 from ..provider import ImageSearchProvider, ProviderUnavailable
 
 
@@ -332,11 +333,17 @@ class WikimediaProvider(ImageSearchProvider):
         parts.extend(f"{name}: {value}." for name, value in (("Artist", artist), ("Credit", credit), ("Attribution", custom)) if value)
         parts.extend((f"Source: {source_page}.", f"License: {label} {license_version} ({license_url})."))
         subject_fields = (metadata.get(key) for key in ('ObjectName', 'ImageDescription'))
-        subject_text = ' '.join(
+        subject_parts = [
             _text(field['value'], preserve_links=False)[:4000]
             for field in subject_fields
             if isinstance(field, dict) and isinstance(field.get('value'), str)
-        ).strip()
+        ]
+        subject_text = ' '.join(subject_parts).strip()
+        # Selection keeps ObjectName first. Alt gives ImageDescription priority.
+        photo_description = next(
+            (description for part in reversed(subject_parts) if (description := normalize_photo_description(part))),
+            '',
+        )
         return ImageCandidate(
             provider=self.provider_name, asset_id=str(pageid), asset_key=f"wikimedia:{pageid}",
             image_url=image_url, source_page_url=source_page, canonical_source=canonical,
@@ -353,4 +360,5 @@ class WikimediaProvider(ImageSearchProvider):
                 "attribution_authoritative": False,
             },
             subject_text=subject_text,
+            photo_description=photo_description,
         )
