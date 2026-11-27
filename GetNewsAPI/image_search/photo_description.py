@@ -11,8 +11,13 @@ _PLACEHOLDERS = frozenset({
     'image', 'stock image', 'photo', 'stock photo', 'photograph', 'picture',
     'untitled', 'untitled work', 'no description', 'no alt text', 'n/a', 'none', 'unknown',
 })
+_COMPOSITION_TAGS = frozenset({
+    'copy space', 'negative space', 'horizontal', 'vertical',
+    'landscape orientation', 'portrait orientation',
+})
 _CAMERA_FILENAME = re.compile(
-    r'(?:dscf?|img|pxl|sam|dji)[_ -]?\d+(?:[_ -]\d+)*(?:\.(?:jpe?g|png|heic|webp|tiff?))?',
+    r'(?:dscf?|img|pxl|sam|dji)[_ -]?\d+(?:[_ -]\d+)*'
+    r'(?:\s*\(cropped\))?(?:\.(?:jpe?g|png|heic|webp|tiff?))?',
     re.IGNORECASE,
 )
 _ATTRIBUTION = re.compile(
@@ -45,13 +50,14 @@ def normalize_photo_description(value: object) -> str:
 
 
 def photo_subject_from_tags(value: object) -> str:
-    '''Pick one provider tag, preferring a subject phrase over a single word.'''
+    '''Pick one subject tag, preferring phrases after filtering composition labels.'''
     if not isinstance(value, str):
         return ''
     first_tag = ''
     for tag in value[:4096].split(','):
         description = normalize_photo_description(tag)
-        if ',' in description:
+        tag_key = description.casefold().rstrip('.!?').replace('-', ' ')
+        if ',' in description or tag_key in _COMPOSITION_TAGS:
             continue
         if ' ' in description:
             return description

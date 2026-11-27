@@ -339,8 +339,9 @@ class WikimediaProvider(ImageSearchProvider):
             if isinstance(field, dict) and isinstance(field.get('value'), str)
         ]
         subject_text = ' '.join(subject_parts).strip()
+        # Selection keeps ObjectName first. Alt gives ImageDescription priority.
         photo_description = next(
-            (description for part in subject_parts if (description := normalize_photo_description(part))),
+            (description for part in reversed(subject_parts) if (description := normalize_photo_description(part))),
             '',
         )
         return ImageCandidate(

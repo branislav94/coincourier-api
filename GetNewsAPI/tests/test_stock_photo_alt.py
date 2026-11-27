@@ -10,6 +10,7 @@ import sys
 from typing import Any
 import unittest
 from unittest.mock import Mock, patch
+from urllib.parse import quote
 
 from GetNewsAPI.tests.environment_isolation import install_test_environment
 
@@ -24,9 +25,11 @@ from image_search.downloader import ImageDownloader
 from image_search.models import DownloadedImage
 from image_search.providers.pexels import PexelsProvider
 from image_search.providers.pixabay import PixabayProvider
+from image_search.providers.wikimedia import WikimediaProvider
 from publishing.wordpress import publisher
 from GetNewsAPI.tests.test_stock_image_vision import fixture_jpeg
 from GetNewsAPI.tests.test_stock_subject_selection import FixtureResponses, pexels_photo, pixabay_hit
+from GetNewsAPI.tests.test_wikimedia_provider import PayloadClient, page as wikimedia_page
 
 
 ARTICLE = {
@@ -40,6 +43,8 @@ ARTICLE = {
 BRIDGE_PAGE = 'https://pixabay.com/photos/szechenyi-chain-bridge-1758196/'
 BRIDGE_TAG = 'Szechenyi Chain Bridge'
 CREATOR = 'Fixture Contributor'
+WIKIMEDIA_FILENAME = 'DSC_0421 (cropped).jpg'
+WIKIMEDIA_DESCRIPTION = 'A suspension bridge spanning the Danube at night.'
 MEDIA_ID = 6658
 BASELINE_QUERIES = [
     'bnb chain new layer', 'bnb chain publishes litepaper new', 'blockchain finance',
@@ -53,6 +58,26 @@ def bridge_hit() -> dict[str, Any]:
         **pixabay_hit(1758196, f'{BRIDGE_TAG}, Budapest, bridge'),
         'pageURL': BRIDGE_PAGE,
     }
+
+
+def wikimedia_hit(object_name: str, description: str | None) -> dict[str, Any]:
+    '''Supply normal Commons search metadata for a consistent file identity.'''
+    raw = wikimedia_page()
+    raw['title'] = f'File:{WIKIMEDIA_FILENAME}'
+    filename = quote(WIKIMEDIA_FILENAME.replace(' ', '_'), safe='()')
+    info = raw['imageinfo'][0]
+    info.update(
+        canonicaltitle=raw['title'],
+        url=f'https://upload.wikimedia.org/wikipedia/commons/a/ab/{filename}',
+        descriptionurl=f'https://commons.wikimedia.org/wiki/File:{filename}',
+    )
+    fields = info['extmetadata']
+    fields['ObjectName']['value'] = object_name
+    if description is None:
+        fields.pop('ImageDescription')
+    else:
+        fields['ImageDescription']['value'] = description
+    return raw
 
 
 class StockPhotoAltTests(unittest.TestCase):
@@ -80,9 +105,12 @@ class StockPhotoAltTests(unittest.TestCase):
     def publish_stock(
         self, item: dict[str, Any], *, provider: str = 'pixabay', engine: str = 'v2',
         threshold: float = 0.0,
-    ) -> tuple[dict[str, Any], dict[str, str], FixtureResponses, Mock]:
+    ) -> tuple[dict[str, Any], dict[str, str], FixtureResponses | PayloadClient, Mock]:
         '''Run stock adapters, selection, hero cropping, and media POSTs offline.'''
-        client = FixtureResponses({'pixabay': 'hits', 'pexels': 'photos'}[provider], [item])
+        client = (
+            PayloadClient({'query': {'pages': [item]}}) if provider == 'wikimedia'
+            else FixtureResponses({'pixabay': 'hits', 'pexels': 'photos'}[provider], [item])
+        )
         jpeg = fixture_jpeg('green')
         digest = hashlib.sha256(jpeg).hexdigest()
         with ExitStack() as stack:
@@ -97,14 +125,17 @@ class StockPhotoAltTests(unittest.TestCase):
             ))
 
             if engine == 'v2':
-                adapter = {'pixabay': PixabayProvider, 'pexels': PexelsProvider}[provider]
+                adapter = {
+                    'pixabay': PixabayProvider, 'pexels': PexelsProvider, 'wikimedia': WikimediaProvider,
+                }[provider]
+                credentials = {} if provider == 'wikimedia' else {'api_key': 'fixture'}
                 stack.enter_context(patch.object(selection, 'STOCK_IMAGE_SUBJECT_MODE', 'shadow'))
                 stack.enter_context(patch.object(emergency, 'STOCK_IMAGE_SUBJECT_MODE', 'shadow'))
                 stack.enter_context(patch.object(selection, 'load_image_usage', return_value=[]))
                 stack.enter_context(patch.object(selection, 'load_recent_wp_image_usage', return_value=[]))
                 stack.enter_context(patch.object(
                     registry, adapter.__name__,
-                    partial(adapter, enabled=True, api_key='fixture', threshold=threshold),
+                    partial(adapter, enabled=True, threshold=threshold, **credentials),
                 ))
                 stack.enter_context(patch.object(
                     selection, 'build_provider_registry',
@@ -162,6 +193,52 @@ class StockPhotoAltTests(unittest.TestCase):
                 self.assertEqual(details['alt_text'], expected)
                 self.assertEqual(client.calls, [('pixabay', query) for query in BASELINE_QUERIES])
                 download.assert_called_once()
+
+    def test_pixabay_composition_tags_do_not_displace_a_subject_or_fill_empty_alt(self) -> None:
+        for tags, expected in (
+            ('Bitcoin, copy space, finance', 'Bitcoin'),
+            ('copy space, horizontal', ''),
+            ('Horizontal bands of rock, landscape', 'Horizontal bands of rock'),
+        ):
+            for engine in ('v1', 'v2'):
+                with self.subTest(engine=engine, tags=tags):
+                    metadata, details, _client, download = self.publish_stock(
+                        pixabay_hit(88883, tags), engine=engine,
+                    )
+                    self.assertEqual(metadata['asset_key'], 'pixabay:88883')
+                    download.assert_called_once()
+                    if engine == 'v2':
+                        self.assertEqual(download.call_args.args[1].subject_text, tags)
+                    self.assertEqual(details['alt_text'], expected)
+
+    def test_wikimedia_description_and_object_name_are_separate_from_attribution_and_ranking(self) -> None:
+        for object_name, description, expected in (
+            (WIKIMEDIA_FILENAME, WIKIMEDIA_DESCRIPTION, WIKIMEDIA_DESCRIPTION),
+            (WIKIMEDIA_FILENAME, None, ''),
+            ('Danube suspension bridge by moonlight.', None, 'Danube suspension bridge by moonlight.'),
+            ('Danube at night', WIKIMEDIA_DESCRIPTION, WIKIMEDIA_DESCRIPTION),
+            ('Danube at night', 'Untitled work', 'Danube at night'),
+        ):
+            with self.subTest(object_name=object_name, description=description):
+                raw = wikimedia_hit(object_name, description)
+                metadata, details, client, download = self.publish_stock(raw, provider='wikimedia')
+                self.assertEqual(metadata['asset_key'], 'wikimedia:123')
+                self.assertTrue(metadata['strict_stock_selected'])
+                self.assertEqual([args[:2] for args, _ in client.calls], [
+                    ('wikimedia', query) for query in BASELINE_QUERIES
+                ])
+                download.assert_called_once()
+                candidate = download.call_args.args[1]
+                self.assertEqual(candidate.subject_text, ' '.join(filter(None, (object_name, description))))
+                self.assertEqual(
+                    candidate.metadata['metadata_text'],
+                    ' '.join((raw['title'], object_name, description or '')),
+                )
+                self.assertEqual(candidate.metadata['work_title'], object_name)
+                self.assertEqual(metadata['work_title'], object_name)
+                self.assertIn(object_name, details['caption'])
+                self.assertIn('CC BY 4.0', details['description'])
+                self.assertEqual(details['alt_text'], expected)
 
     def test_pexels_supplied_alt_reaches_wordpress_in_both_engines(self) -> None:
         long_description = 'White lighthouse on a cliff overlooking the sea. ' * 4
